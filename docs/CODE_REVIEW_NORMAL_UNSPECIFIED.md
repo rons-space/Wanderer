@@ -1081,3 +1081,186 @@ A `rev` pin, not a branch, and the same rev for both crates. That is the right w
 There is no Sentry or equivalent on either side. Observability is 50 `println!` calls in Rust that the Windows release subsystem discards, plus 77 `console.*` calls in the frontend that nobody can see in a packaged desktop app. `componentDidCatch` only calls `console.error` (6.7), so a crash in a shipped build is unreportable, which combined with 7.2 means you cannot learn about a problem *or* fix it for users.
 
 `vite build` emits a single **876.57 kB** JavaScript chunk (255.52 kB gzipped) with no code splitting, and Vite says so explicitly. Four declared dependencies (`react-window`, `react-window-infinite-loader`, `react-virtualized-auto-sizer`, and their types) are **never imported**, yet `vite.config.ts:16-18` pre-bundles three of them in `optimizeDeps`, because `MediaGrid` hand-rolls its own virtualizer instead (Section 8). For a local desktop app the bundle size costs startup time rather than bandwidth, so this is Low, but deleting four unused deps and the stale `optimizeDeps` block is free.
+
+---
+
+## 8. What is already good
+
+A review that lists only defects gives a false picture, and here it would give a badly false one. This project gets the hardest part right, and several findings above are fixed by copying a pattern that already exists a few files away. These are load-bearing strengths, not consolation.
+
+**The cryptography is correct, and I checked specifically for the ways it usually is not.**
+
+*Argon2id with strong, deliberate parameters.* 64 MiB memory cost, 3 iterations, 32-byte output, comfortably above the OWASP floor, with the algorithm and version pinned explicitly:
+
+```rust
+// src-tauri/src/security/mod.rs:189-193
+fn argon2id_params() -> Result<Argon2<'static>> {
+    let params = Params::new(65_536, 3, 1, Some(32))
+        .map_err(|e| anyhow!("Failed to build Argon2 params: {}", e))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+```
+
+No PBKDF2, no raw SHA or blake3 used as a KDF, no fast hash on any passphrase path, and the same parameters used consistently for wrapping, verification and hashing.
+
+*No nonce reuse anywhere.* This was the finding I expected to make and could not. Every nonce and salt comes fresh from `OsRng`, including on re-encryption paths and on the fixed-filename temp upload path. There is no constant nonce, no nonce derived from content or file ID, and no key-plus-nonce pair used twice on any code path I could find. Finding 1.6 is about entropy *width*, not reuse, and I flagged it as Medium precisely for that reason.
+
+*Authenticated encryption everywhere, with no unauthenticated mode available.* AES-256-GCM is the only cipher in the codebase. No CBC, no CTR, no hand-rolled MAC. Tags are always verified, and failures map to opaque errors that leak no oracle detail (`security/mod.rs:431-433`).
+
+*Chunk index bound into both the nonce and the AAD*, which defeats chunk reordering, duplication and mid-file deletion, the three attacks most often missed in hand-rolled chunked-AEAD formats:
+
+```rust
+// src-tauri/src/security/mod.rs:343-348
+let nonce = derive_chunk_nonce(&base_nonce, chunk_idx);
+let aad = chunk_idx.to_le_bytes();
+let payload = Payload { msg: &chunk_buf[..n], aad: &aad };
+```
+
+Streaming through `BufReader`/`BufWriter` also means multi-GB videos are never fully loaded into memory, and counter overflow is explicitly checked on both paths.
+
+*A 160-bit recovery key from a CSPRNG* (`security/mod.rs:278-287`), hex-encoded and grouped for transcription, making brute force infeasible regardless of the KDF. *`OsRng` exclusively* for all key material across all nine RNG call sites. *Per-wrap random 16-byte salts*, so the passphrase wrap and the recovery wrap of the same master key get different salts and nonces. *Strict length validation on every decoded field* before use. *Constant-time credential comparison* via `argon2::verify_password`.
+
+**Encryption fails closed in the paths that check the key, and it does so thoughtfully.** Uploads are deferred rather than sent in the clear when the vault is locked (`upload_worker.rs:126-136`). And the watcher deliberately destroys a plaintext thumbnail rather than leaving it on disk:
+
+```rust
+// src-tauri/src/watcher.rs:248-252
+} else {
+    // Avoid leaving plaintext thumbnail when vault is locked.
+    let _ = fs::remove_file(&thumb_path);
+    thumbnail_path = None;
+}
+```
+
+That is not the obvious thing to write. Someone thought about residue. Which is what makes 1.2 frustrating rather than damning: the instinct is present, it just was not applied to the temp directory.
+
+**The vault starts locked and never auto-unlocks.** No passphrase caching, no key on disk, no "remember me" (`lib.rs:931-938`). **Encryption downgrade is blocked in the backend**, not just the UI (`lib.rs:303-309`), and `initialize_encryption` refuses to clobber an existing bundle (`lib.rs:324-328`), which prevents the catastrophic "overwrite the wrap and lose every key" scenario. **DPAPI is real, not aspirational**, and correctly called with user scope and proper `LocalFree` cleanup.
+
+**The generic `set_config` command refuses to touch security keys.** This is the mitigation that keeps 3.2 from also being a write primitive:
+
+```rust
+// src-tauri/src/lib.rs:1686-1690
+async fn set_config(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+    if key.starts_with("security_") {
+        return Err("Security settings are managed by dedicated security commands".to_string());
+    }
+```
+
+All five security-relevant keys are correctly `security_`-prefixed, so the guard covers all of them.
+
+**Parameter binding is the default, including the tricky case.** 87 of roughly 90 SQL statements bind everything, and the dynamic-arity `IN (...)` pattern is textbook-correct with `params_from_iter` (`database.rs:1262-1277`). No dynamic table or column names, no interpolated `ORDER BY` or `LIMIT`, and **no SQL outside `database.rs` at all**. Most query methods also clamp inputs defensively (`limit.max(0).min(1000)`), and `set_rating` clamps its domain.
+
+**The std connection mutex never crosses an `await`.** All 89 methods acquire and release inside synchronous bodies, and several commands explicitly `drop(db_guard)` before awaiting with a comment saying why. This is the single most important thing to get right with `Mutex<Connection>` in an async app, and it is right everywhere.
+
+**No arbitrary-file-delete command exists.** I looked for this specifically. Every `remove_file` operates on a path read from the database or generated by the app, never on IPC input, and no `fs:allow-write*` or `fs:allow-remove` capability is granted. **No shell injection either**: the three process spawns all pass arguments as arrays with no shell, and ffmpeg availability is probed first with graceful degradation.
+
+**A real versioned migration system**, keyed on `PRAGMA user_version`, with each step in its own transaction. Migrations 13, 14 and 16 correctly implement the full SQLite table-rebuild dance (`foreign_keys = OFF`, create `_new`, `INSERT ... SELECT`, `DROP`, `RENAME`, re-enable) to repair foreign keys that cannot be altered in place, and migration 16 detects and repairs a legacy schema shape by probing `pragma_table_info`. That is careful work.
+
+**Real transactions where they matter most**: `add_faces`, `add_tags`, `merge_persons` and `bulk_add_to_album` are all correctly atomic, and `add_tags` scopes its prepared statements in an inner block so they drop before commit.
+
+**Graceful degradation and cooperative cancellation.** The face detector is `Option`al and the app runs without it. Workers take a `CancellationToken` and check it each iteration. The upload worker honours Telegram's own `FLOOD_WAIT` hint rather than blindly retrying. `resolve_app_data_dir` has a real fallback path. `clip.rs` tries multiple model candidates and gives an actionable error naming the Settings screen when all fail.
+
+**The frontend's type discipline is genuinely strong for a project this young.** `strict`, `noUnusedLocals`, `noUnusedParameters` and `noFallthroughCasesInSwitch` are all on, and, unusually, **the codebase honours them**: zero `@ts-ignore`, zero `@ts-expect-error`, zero `@ts-nocheck`, and two `as any` in 10,915 lines, one of which is the canonical documented Leaflet workaround. `npm run build` is `tsc && vite build`, so this is enforced at build time rather than aspirational.
+
+**`lib/api.ts` is a properly typed IPC boundary, and it is accurate.** Every wrapper declares a concrete return type and no `invoke` in it returns bare `any`. I mechanically diffed the frontend command names against the Rust `#[tauri::command]` attributes: **every single frontend invoke resolves to a real backend command**, with no typos and no drift, and the only unwired backend command is `debug_reset_faces`. The camelCase and snake_case split is also deliberate rather than accidental, with each side verified against its `serde` derive.
+
+**The onboarding recovery-key flow gets the hard parts right.** It forces verification before proceeding, and, the detail most implementations miss, it actively purges the secret from state once verified:
+
+```tsx
+// src/components/Onboarding.tsx:185-194
+const handleConfirmRecoveryStep = () => {
+    if (!recoveryVerified) {
+        toast.error("Verify the recovery key first.");
+        return;
+    }
+    // Show once only in onboarding session.
+    setRecoveryKey(null);
+    setRecoverySegments([]);
+    setStep("byok");
+};
+```
+
+It also states the tradeoffs of each mode honestly to the user, requires an explicit risk acknowledgement for unencrypted mode, and includes a genuinely helpful inline tutorial for obtaining Telegram API credentials. And I verified three separate ways that **no secret is written to `localStorage`, `sessionStorage`, a log, or an error message anywhere in the application**. The 17 storage writes are all theme preferences and search history.
+
+**`withBusy` and `toErrorMessage` are the right small abstractions** (`Onboarding.tsx:70-87`): the `finally` in `withBusy` makes a stuck spinner structurally impossible, and `toErrorMessage` types its input as `unknown` rather than `any`. They belong in `lib/utils.ts`, because every `catch (e: any)` elsewhere is a place they were needed and missing.
+
+**`MediaGrid`'s hand-rolled virtualizer is competent**, with a `ResizeObserver` hook, a variable-height row model, a binary search for the row at a given scroll offset, and a configured overscan window. Finding 6.4 is about memoization around it, not about the virtualization itself.
+
+**Honest inline documentation of known limits.** `lib.rs:2452-2453` notes that semantic search needs a real index for large datasets. `database.rs:809-810` flags a suspected transaction interaction. The README does the same at the product level. This is more useful than silence, and it is a good habit to keep.
+
+---
+
+## 9. Remediation plan
+
+Ordered by risk reduction per unit of effort, not by section number. Two dependencies worth noting: **2.1 must ship before you tell anyone the backup works**, and **7.1 (CI) is what stops the rest of this list from silently regressing**, so it should land early despite not being a bug.
+
+### Stage 0: stop the bleeding (hours, ship immediately)
+
+| # | Change | Finding |
+|---|---|---|
+| 1 | Gate `tauri_plugin_mcp_bridge::init()` behind `#[cfg(debug_assertions)]`, or delete it. Read the plugin's source and confirm what it binds | 3.1 |
+| 2 | Export the `SecurityBundle` unencrypted alongside the encrypted backup (or as a plaintext header), so the passphrase and recovery key actually work | 2.1 |
+| 3 | Tell existing encrypted-mode users to keep a copy of `library.db`, and treat prior "encrypted backup" guidance as withdrawn | 2.1 |
+| 4 | Derive `should_encrypt` from `SecurityBundle.mode`, fail closed on read error, and assert `WBENC1` on the artifact before upload | 1.1 |
+| 5 | Filter `security_*` keys out of `get_all_config` | 3.2 |
+| 6 | Drop `'unsafe-eval'` and `'unsafe-inline'` from `script-src`; narrow `assetProtocol.scope` and the `fs` scopes off `**` and `C:\**` | 3.3 |
+| 7 | Guard `import_files` sources against arbitrary paths; confine `export_media` and `backup_database` destinations | 3.4 |
+| 8 | Bound `ct_len` by the header's `chunk_size` | 3.6 |
+| 9 | Fix the README download URLs and the in-app About link; bump all three versions to `0.1.0` | 5.2, 7.6 |
+
+Items 1 and 2 are the two that change the risk profile of the product. Everything else in this stage is additive and low-risk.
+
+### Stage 1: make regression impossible (days)
+
+| # | Change | Finding |
+|---|---|---|
+| 10 | Add `.github/workflows/ci.yml`: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `npm ci && npm run build` | 7.1 |
+| 11 | Add ESLint 9 flat config with `react-hooks` and `jsx-a11y`, plus `rustfmt.toml` and `clippy.toml`; add a `lint` script | 7.3 |
+| 12 | Add `WBENC1` round-trip, truncation and tamper tests; add a 0-to-19 migration chain test; add a backup-and-restore test | 7.4 |
+| 13 | Correct the two false README claims; document the `%TEMP%` residue and the `library.db` dependency | 5.3, 5.4 |
+| 14 | Add code signing and `tauri-plugin-updater` with a `pubkey`; pin `bundle.targets` to `["nsis"]`; add `release.yml` | 7.2 |
+| 15 | Fix the `version` assignments in migrations 5, 7 through 13; guard migration 15 against wiping all persons | 2.4 |
+| 16 | Delete one lockfile; `git rm` the 3 stray files and the unused 1.2 MB model; add `LICENSE` and `SECURITY.md`; gitignore `.env` | 7.5 |
+
+Item 15 belongs here rather than later because it is currently a latent hard-startup-failure waiting for the next migration anyone writes.
+
+### Stage 2: correctness and durability (1 to 2 weeks)
+
+| # | Change | Finding |
+|---|---|---|
+| 17 | Purge `%TEMP%\wanderer-*` on `lock_encryption`, on exit, and on startup; prefer serving decrypted bytes from memory | 1.2 |
+| 18 | v2 file format: authenticate the header plus `key_id`, add a terminator chunk, require the magic when the bundle says encrypted | 1.4 |
+| 19 | Protect `session.db` with DPAPI-plus-entropy or the master key | 1.3 |
+| 20 | Add `zeroize`; make the master key a non-`Copy` `ZeroizeOnDrop` newtype | 1.5 |
+| 21 | Move filesystem deletions out of the transaction in `empty_trash`; wrap `permanent_delete` | 2.2 |
+| 22 | Set `journal_mode = WAL` and `busy_timeout`; use the online backup API instead of `fs::copy` | 2.3 |
+| 23 | Convert `media_fts` to external-content FTS5 with triggers | 2.5 |
+| 24 | Add the 7 missing indexes; switch to `prepare_cached` | 2.6 |
+| 25 | Add `UNIQUE` on `upload_queue(file_path)`; make `toggle_favorite` a single `RETURNING`; add a stale-`uploading` reaper | 2.7 |
+| 26 | Fix the poisoned-mutex handling with `into_inner()`; delete the per-face DEBUG `PRAGMA` block | 4.1 |
+| 27 | Move ONNX inference and the 39 `std::fs` calls off the async runtime; drop the DB guard before per-item work | 4.2 |
+| 28 | Wire up `AppError` and remove the string-matching retry in `App.tsx` | 4.5, 6.3 |
+| 29 | Verify and retry Telegram plaintext deletion during migration; record un-purged IDs | 3.8 |
+| 30 | Bind `camera_make`; clamp the 2 unclamped paginations; fix the negative `limit as usize` cast | 3.5, 3.7 |
+| 31 | Commit a generated `schema.sql` | 2.4 |
+
+### Stage 3: quality and maintainability (ongoing)
+
+| # | Change | Finding |
+|---|---|---|
+| 32 | Extract one `<EnableEncryption>` component with the verification gate, used by both Onboarding and Settings | 6.1 |
+| 33 | Close the print window, handle the clipboard rejection, defer the blob revoke | 6.2 |
+| 34 | Hoist the inline `ItemWrapper`s; `memo()` the `Cell`; `useCallback` the handlers; key by `item.id` | 6.4 |
+| 35 | Add `aria-label` to 26 icon buttons; make the grid keyboard-navigable; give `MediaViewer` a list and arrow keys | 6.5 |
+| 36 | Delete `LoginView.tsx`, `Sidebar.tsx`, `ThemeSwitcher.tsx`; extract one `<TelegramLogin>` and one `useMediaPagination` | 6.6 |
+| 37 | Apply the existing `map_media_row` at the other 17 sites (about 500 lines deleted, no behaviour change) | 4.6 |
+| 38 | Move `ErrorBoundary` outermost in `main.tsx`; add a reload button; report crashes | 6.7 |
+| 39 | Fix the two broken Tauri listener cleanups; remove the prop-mirroring state; clear the scroll timeout | 6.7 |
+| 40 | Parse phashes once and bucket by prefix in `find_duplicates`; fix the 4 N+1 patterns | 4.3 |
+| 41 | Decide the map tile question: vendor Leaflet assets and allow `https:` in `img-src`, or remove the map | 6.7 |
+| 42 | Rotate the recovery key on use; add `change_passphrase`; hoist the 8-char check into a shared validator | 1.7, 1.8 |
+| 43 | Widen the nonce to full width via a per-file `file_id` and derived subkey | 1.6 |
+| 44 | Delete the 4 unused deps and the stale `optimizeDeps`; add code splitting | 7.8 |
+| 45 | Add error reporting on both sides; replace `println!` with `log::`; audit for PII | 7.8, 4.7 |
+| 46 | Fix `escape_like_pattern` (add `ESCAPE '\'`) or delete it with its dead caller; delete `Database::get_persons` | 4.7 |
+| 47 | Add `[profile.release]` with `lto` and `strip`; target-gate `windows-sys` | 7.6, 4.7 |
+| 48 | Split `database.rs` and `lib.rs` along domain lines; split `Settings.tsx` into per-tab components | 4.6, 6.6 |
