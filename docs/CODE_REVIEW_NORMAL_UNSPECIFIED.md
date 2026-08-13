@@ -1264,3 +1264,219 @@ Item 15 belongs here rather than later because it is currently a latent hard-sta
 | 46 | Fix `escape_like_pattern` (add `ESCAPE '\'`) or delete it with its dead caller; delete `Database::get_persons` | 4.7 |
 | 47 | Add `[profile.release]` with `lto` and `strip`; target-gate `windows-sys` | 7.6, 4.7 |
 | 48 | Split `database.rs` and `lib.rs` along domain lines; split `Settings.tsx` into per-tab components | 4.6, 6.6 |
+
+---
+
+## Appendix A: reproducing every measurement
+
+Every number in this review came from a command run against commit `a9d7439` in a clean checkout. They are listed so you can re-run them, and so a future reader can tell whether a count has moved.
+
+**Toolchain results (executed)**
+
+```bash
+npm ci
+npx tsc --noEmit          # 0 errors, exit 0, strict: true
+npx vite build            # succeeds; dist/assets/index-*.js = 876.57 kB (gzip 255.52 kB)
+npm audit                 # 7 vulnerabilities: 5 high, 1 moderate, 1 low
+cd src-tauri && cargo fmt --check   # drift in 7 files
+# NOT run: cargo build, cargo test, cargo clippy, cargo audit (see limitations)
+```
+
+**Size and shape**
+
+```bash
+# rust: 21 files, 10,752 LOC; database.rs 3,264, lib.rs 2,545
+find src-tauri/src -name '*.rs' | wc -l
+find src-tauri/src -name '*.rs' | xargs wc -l | sort -rn
+
+# frontend: 62 files, 10,915 LOC; Settings.tsx 1,302, MediaGrid.tsx 914
+find src -name '*.ts*' | wc -l
+find src -name '*.tsx' -o -name '*.ts' | xargs wc -l | sort -rn
+
+# 74 Tauri commands (both counts agree, and `comm` of the two lists is empty both ways)
+rg -c '^#\[tauri::command\]' src-tauri/src/lib.rs
+
+# 89 public methods in database.rs, across 3 impl blocks
+rg -c '^\s{4}pub fn ' src-tauri/src/database.rs
+```
+
+**Rust counts**
+
+```bash
+# 7 non-test unwrap(), 2 non-test expect(), 0 panic!/todo!/unimplemented!
+rg -n '\.unwrap\(\)' src-tauri/src/
+rg -n 'panic!|unreachable!\(|todo!\(|unimplemented!\(' src-tauri/src/
+
+# 80 discarded results, 32 .ok(), 50 println!
+rg -o 'let _ = ' src-tauri/src/ --no-filename | wc -l
+rg -o '\.ok\(\)' src-tauri/src/ --no-filename | wc -l
+rg -o 'println!' src-tauri/src/ --no-filename | wc -l
+
+# 8 tests in 7 test modules; 0 frontend tests
+grep -rn '#\[test\]' src-tauri/src | wc -l
+grep -rln '#\[cfg(test)\]' src-tauri/src
+
+# 19 migrations, 0 committed .sql files, 7 CREATE INDEX, 6 transactions
+rg -n 'PRAGMA user_version =' src-tauri/src/database.rs | wc -l
+find . -name '*.sql' -not -path './node_modules/*' | wc -l
+rg -c 'CREATE INDEX' src-tauri/src/database.rs
+
+# 41 conn.prepare(, 0 prepare_cached
+rg -o 'conn\.prepare\(' src-tauri/src/database.rs | wc -l
+rg -o 'prepare_cached' src-tauri/src/ | wc -l
+
+# duplication: 17 inline row mappings, 15 duplicated column lists, helper used 3 times
+rg -c 'file_hash: row.get\(2\)\?' src-tauri/src/database.rs
+rg -c 'SELECT id, file_path, file_hash' src-tauri/src/database.rs
+
+# 39 std::fs:: calls in lib.rs, nearly all inside async fn with no spawn_blocking
+rg -c 'std::fs::' src-tauri/src/lib.rs
+
+# no journal_mode / busy_timeout / synchronous pragma anywhere
+rg -n 'journal_mode|busy_timeout|synchronous|WAL' src-tauri/src/   # no matches
+
+# no SQL outside database.rs
+rg -n 'execute\(|query_row|prepare\(' src-tauri/src/ --glob '!database.rs'   # no matches
+```
+
+**Frontend counts**
+
+```bash
+# 2 as any, 0 @ts-ignore, 0 @ts-expect-error, 0 @ts-nocheck
+grep -rn "as any" src --include=*.ts --include=*.tsx | wc -l
+grep -rn "@ts-ignore\|@ts-expect-error\|@ts-nocheck" src | wc -l
+
+# 77 console.* (6 log, 66 error, 3 warn)
+grep -rn "console\." src --include=*.ts --include=*.tsx | wc -l
+
+# 0 aria-label in app code (2 total, both generated), vs 26 size="icon"
+grep -rn "aria-label" src --include=*.tsx | grep -v "^src/components/ui/" | wc -l
+grep -rn 'size="icon"' src --include=*.tsx | grep -v "^src/components/ui/" | wc -l
+
+# 2 total occurrences of onKeyDown / tabIndex / role= in app code
+grep -rn "onKeyDown\|tabIndex\|role=" src --include=*.tsx | grep -v "^src/components/ui/" | wc -l
+
+# 0 React.memo, 0 imports of the 4 declared virtualization deps
+grep -rn "memo(" src --include=*.tsx | grep -v "^src/components/ui/" | wc -l
+grep -rn "react-window\|react-virtualized" src --include=*.ts --include=*.tsx | wc -l
+
+# LoginView / Sidebar / ThemeSwitcher are never imported (1 hit each: their own definition)
+grep -rn "LoginView\|from \"./Sidebar\"\|ThemeSwitcher" src | grep -v "^src/components/\(LoginView\|Sidebar\|ThemeSwitcher\).tsx"
+
+# every frontend invoke resolves to a real backend command
+grep -oP 'invoke(<[^>]*>)?\("\K[^"]+' src/lib/api.ts | sort -u > /tmp/fe.txt
+grep -rA3 "#\[tauri::command\]" src-tauri/src --include=*.rs | grep -oP "fn \K\w+" | sort -u > /tmp/be.txt
+comm -23 /tmp/fe.txt /tmp/be.txt    # empty: no frontend call without a backend command
+```
+
+**Configuration and hygiene**
+
+```bash
+# no CI, no lint/format config
+ls -a .github                       # No such file or directory
+ls -a | grep -iE "eslint|prettier"  # nothing
+ls src-tauri | grep -iE "rustfmt|clippy"  # nothing
+
+# CSP allows unsafe-inline and unsafe-eval; asset scope is **
+python3 -c "import json;d=json.load(open('src-tauri/tauri.conf.json'));print(d['app']['security'])"
+
+# grammers is pinned to an immutable rev, not a branch
+grep -n 'git =' src-tauri/Cargo.toml
+
+# no [profile.release]; version 0.0.0 in all three manifests
+grep -n 'profile' src-tauri/Cargo.toml            # no matches
+grep -n '"version"' package.json src-tauri/tauri.conf.json
+
+# largest tracked files: the unused model is 1,244 KB
+git ls-files -z | xargs -0 du -k | sort -rn | head -8
+grep -rn "version-RFB-320" src-tauri/src --include=*.rs   # only _simplified is used
+
+# both lockfiles tracked; no LICENSE, no SECURITY.md
+ls -la package-lock.json pnpm-lock.yaml
+ls LICENSE* SECURITY*                # No such file or directory
+```
+
+**Note on `grep -c` versus occurrence counts.** Several counts above are occurrence counts (`rg -o ... | wc -l`), not matching-line counts, so a line with two `let _ =` contributes 2. This is deliberate where the unit of work is the occurrence. Where the unit is a file, `-l` is used instead. The frontend `console.*` and `aria-label` figures are line counts.
+
+---
+
+## Appendix B: finding index by severity
+
+**Critical (4).** Permanent data loss, or a silent defeat of the product's central promise.
+
+| ID | Finding |
+|---|---|
+| 2.1 | The encrypted database backup and the entire Telegram archive are undecryptable if `library.db` is lost, because the wrapped master key lives only inside `library.db` |
+| 1.1 | Encryption enforcement reads a duplicated `security_mode` row and fails open to plaintext upload, while the UI reports "encrypted" from a different source |
+| 3.1 | `tauri-plugin-mcp-bridge` is registered unconditionally in release builds, in a process holding the decrypted master key |
+| 3.2 | `get_all_config` hands the wrapped master key and the DPAPI credential blob to the webview, under a CSP permitting `unsafe-inline` and `unsafe-eval` |
+
+**High (18).** Data loss or security degradation under realistic conditions, or unrecoverable/unmaintainable state.
+
+| ID | Finding |
+|---|---|
+| 1.2 | Decrypted plaintext accumulates in `%TEMP%` forever and survives `lock_encryption` |
+| 1.3 | `session.db`, a full Telegram account credential, is stored with no protection |
+| 1.4 | The file format authenticates chunks but not the file: truncation and substitution are undetectable, and plaintext is silently accepted |
+| 1.5 | No zeroization; the master key is `Copy` and is moved into a spawned task that outlives lock |
+| 2.2 | Filesystem deletions happen inside a transaction that can roll back |
+| 2.3 | No WAL or busy timeout; the backup is a raw `fs::copy` of a live database |
+| 2.4 | Migration `version` variable not updated in 8 steps (latent hard failure); migration 15 can delete every named person; no committed schema |
+| 2.5 | The full-text index is insert-only, never deleted from, and never populated by the sync path |
+| 3.3 | CSP allows inline script and eval; asset and `fs` scopes cover the whole filesystem |
+| 3.4 | `import_files` is an arbitrary file read that auto-uploads the file to Telegram |
+| 3.5 | `camera_make` is string-interpolated into the WHERE clause (LIKE-pattern injection today, structural injection risk) |
+| 4.1 | A single panic permanently poisons the DB mutex; a DEBUG block with `unwrap()` runs per face while holding the lock |
+| 4.2 | The global lock is held across ONNX inference and 39 blocking `std::fs` calls on the async runtime |
+| 4.3 | Duplicate detection is O(n squared) with 2 allocations per comparison, under the global lock |
+| 5.2 | README download links point at a different GitHub owner, for an unsigned installer |
+| 6.1 | The Settings path to enable encryption has no verification and no save affordance, silently destroying recoverability |
+| 6.2 | Recovery-key print window never closes and fails silently; clipboard rejection unhandled |
+| 6.3 | Startup retries forever by string-matching a Rust error message, with no cap and no cleanup |
+| 6.4 | Inline `ItemWrapper` components remount every visible grid cell on every parent render; index-based keys reuse wrong nodes |
+| 6.5 | Zero `aria-label` in app code against 26 icon buttons; the photo grid is unreachable by keyboard |
+| 7.1 | No CI: nothing builds, formats, lints, tests or type-checks on push |
+| 7.2 | The installer is unsigned and there is no updater, so fixes cannot reach existing users |
+| 7.3 | No ESLint, Prettier, rustfmt or clippy configuration exists |
+
+**Medium (21).**
+
+| ID | Finding |
+|---|---|
+| 1.6 | Nonce carries 64 bits of entropy rather than 96; master key never rotated |
+| 1.7 | A used recovery key is never invalidated; no change-passphrase command exists |
+| 1.8 | 8-character passphrase floor, trim inconsistency, no policy, no unlock throttling, and no check at all on the reset path |
+| 1.9 | DPAPI called without secondary entropy |
+| 1.10 | Metadata, including GPS coordinates, is never encrypted |
+| 2.6 | Missing indexes on 7 hot columns; zero `prepare_cached` |
+| 2.7 | Non-atomic read-modify-write; no `UNIQUE` on `upload_queue`; stranded `uploading` rows |
+| 3.6 | Unbounded allocation from an attacker-controlled chunk length |
+| 3.7 | Two unclamped paginations; negative `limit as usize` becomes `usize::MAX` |
+| 3.8 | Migration leaves plaintext copies in Telegram and reports success anyway |
+| 4.4 | 80 discarded results, several hiding real state corruption and false success reports |
+| 4.5 | `errors.rs` is dead code; all 74 commands return `Result<T, String>` |
+| 4.6 | `database.rs` is 3,264 lines with 17 copy-pasted row mappings and an unused helper |
+| 5.3 | README documents `npm run build` as the production build; it builds only the frontend |
+| 5.4 | Four README claims are true but materially incomplete |
+| 6.6 | Three login implementations, three dead files, a hand-rolled `window` event bus, pagination copy-pasted 7 times in 2 incompatible variants |
+| 6.7 | Error boundary not outermost and unrecoverable; 2 broken listener cleanups; prop-mirroring state; uncleared timeout; swallowed errors |
+| 7.4 | 8 Rust tests, 0 frontend tests, and none covering truncation, tampering, migrations or backup restore |
+| 7.5 | Committed debris, an unused 1.2 MB model, two lockfiles, no `LICENSE`, no `SECURITY.md` |
+| 7.6 | Version `0.0.0` everywhere, `name: "tauri-app"`, no `[profile.release]` |
+| 7.7 | 7 npm audit findings (build tooling only) |
+| 7.8 | No error tracking on either side; 876 kB single chunk; 4 unused deps still pre-bundled |
+
+**Low (10).**
+
+| ID | Finding |
+|---|---|
+| 4.7 | `try_lock().unwrap()` on the upload hot path |
+| 4.7 | `escape_like_pattern` does not work (no `ESCAPE` clause), and its only caller is dead code |
+| 4.7 | FTS5 query construction can emit a syntax error on ordinary input |
+| 4.7 | `.unwrap()` on a path conversion inside a spawned sync worker |
+| 4.7 | `unchecked_transaction` used once inconsistently |
+| 4.7 | 50 `println!` bypass the initialized logger and are discarded in release |
+| 4.7 | A timestamp-seeded non-cryptographic RNG sits next to the crypto module (used only for device id) |
+| 4.7 | Dead `.env` machinery, and `.env` is not gitignored |
+| 4.7 | `windows-sys` not target-gated while `bundle.targets` is `"all"` |
+| 6.7 | Dead and duplicated UI, three confirmation idioms, stale `index.html` title, a disarmed `ts-expect-error` |
