@@ -988,3 +988,96 @@ The `loadNextPage` pagination block is copy-pasted across **seven** components i
 - **The map cannot render.** `MapView.tsx:91-92` loads OpenStreetMap tiles over `https:`, and `MapView.tsx:15-17` loads Leaflet marker icons from `unpkg.com`, but the CSP's `img-src` is `'self' asset: http://asset.localhost blob: data:` with no `https:`. So the map view shows markers and tiles blocked. Silver lining: this also means photo GPS coordinates are **not** currently leaking to a third-party tile server. Decide which behaviour you want, and if you want tiles, vendor the marker assets locally and document the privacy tradeoff.
 - **Dead and duplicated UI**: a doubled `<ContextMenuSeparator />` (`MediaGrid.tsx:576-578`), a `theme` prop threaded through two components only to be explicitly ignored (`MediaGrid.tsx:158`), a permanently disabled "Log Out (Not Implemented)" button directly beneath a working "Disconnect Account" (`Settings.tsx:469-475`), three hardcoded fake tags with no `onClick` while a real tag system exists (`AppSidebar.tsx:371-388`), three separate controls navigating to the same timeline view, and a fabricated display email (`{(user || "guest") + "@wander.app"}`).
 - **Cosmetics:** `index.html:7` still reads `<title>Tauri + React + Typescript</title>`, `package.json` still declares `"name": "tauri-app"`, and `vite.config.ts:5` has a **disarmed** suppression comment (`// ts-expect-error`, missing the `@`) so it does nothing. Two debug banners log on every launch (`main.tsx:7-8`).
+
+---
+
+## 7. Operational readiness
+
+### 7.1 No CI of any kind (High)
+
+There is **no `.github/` directory**. Nothing runs on push or pull request: not `cargo build`, not `cargo clippy`, not `cargo fmt --check`, not `cargo test`, not `tsc`, not a lint, not a bundle.
+
+The consequences are visible throughout this report rather than hypothetical. A job that ran only the commands the README documents would have caught the false build claim (5.3) immediately. `cargo fmt --check` in CI would have kept 7 files formatted. `cargo clippy -D warnings` would very likely have flagged the held-lock-across-blocking-work in 4.2 and several of the 80 discarded results in 4.4. And a job that ran the 8 existing Rust tests would at least prove the crate compiles, which is something neither I nor, as far as the repository shows, any automated system has verified for this commit.
+
+This is the highest-leverage single item in the report. It is roughly 40 lines of YAML and it converts most of the other findings from "will drift again" to "cannot drift again".
+
+**Fix:** add `.github/workflows/ci.yml` running `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, and `npm ci && npm run build` on pull requests to `main`. Then add a migration test that runs the chain from version 0 to 19 (2.4d), which is the one test this codebase most needs and does not have.
+
+### 7.2 The installer is unsigned and there is no updater (High)
+
+`tauri.conf.json` has no `plugins.updater` block, no `pubkey`, and no code-signing configuration, while `bundle.targets` is `"all"`. So the artifact the README tells users to download is an **unsigned Windows executable** that triggers a SmartScreen warning, and there is **no mechanism to ship any of the fixes in this report to anyone who has already installed it**.
+
+That interacts badly with 2.1 and 3.1. If the backup defect and the shipped MCP bridge are real in a distributed build, there is currently no push channel to remediate them; the only option is asking users to notice a new release and manually reinstall. For a security-sensitive application handling a Telegram account credential, an update channel is not a nice-to-have.
+
+Also, `targets: "all"` emits an MSI alongside the NSIS installer, and the README documents only the `.exe`, so users may encounter an artifact the documentation does not mention.
+
+**Fix:** add `tauri-plugin-updater` with a signing `pubkey`, set up Authenticode signing, pin `targets` to `["nsis"]`, and add a `release.yml` workflow so releases are reproducible rather than hand-built.
+
+### 7.3 No linting or formatting configuration exists (High)
+
+There are **zero** ESLint, Prettier, `rustfmt.toml` and `clippy.toml` files, and `package.json` has no `lint` or `test` script. Linting has never run in this project.
+
+This is not a style complaint. It is the direct explanation for a specific cluster of findings in Section 6: `eslint-plugin-react-hooks` would have flagged the missing `useEffect` dependencies in 6.7 and `Search.tsx:82-94`, the exhaustive-deps rule plus a components-in-render rule would have flagged the remount bug in 6.4, `jsx-a11y` would have flagged most of 6.5 mechanically, and `no-unused-vars` at module scope would have surfaced the three dead files in 6.6. The frontend has strong *type* discipline (`strict`, zero `@ts-ignore`) and no *lint* discipline, and the defects that survived are precisely the ones types cannot catch.
+
+**Fix:** add ESLint 9 flat config with `react-hooks`, `jsx-a11y` and `@typescript-eslint`, add a `lint` script, add `rustfmt.toml` and `clippy.toml`, and wire all of it into 7.1. Expect a large first-pass backlog.
+
+### 7.4 Test coverage is thin and structurally misplaced (Medium)
+
+There are **8** Rust unit tests across **7** `#[cfg(test)]` modules, and **0** frontend tests. The Rust tests that exist are reasonable, and the crypto ones are genuinely valuable: `security/mod.rs:577-594` covers recovery-key verification round-trip and asserts that a wrong passphrase fails.
+
+But the coverage does not point at the risk. There is **no test that**: encrypts a file and then decrypts it byte-for-byte; detects a **truncated** `.wbenc` file (1.4, which is exactly why truncation is undetectable); rejects a tampered chunk; runs the 19-migration chain and asserts the resulting schema (2.4); or round-trips a database backup through the documented recovery procedure, which is the test that would have caught 2.1 the day it was written.
+
+**Fix:** add `WBENC1` round-trip, tamper and boundary tests; add the migration chain test; and add one end-to-end test of the backup-and-restore procedure as documented in the README.
+
+### 7.5 Committed debris, a dead 1.2 MB model, and two lockfiles (Medium)
+
+Tracked in git and serving no purpose:
+
+```
+src-tauri/2                 140 bytes   (a file literally named "2")
+src-tauri/build_log.txt     106 bytes
+src-tauri/output.txt         84 bytes
+```
+
+More significantly, **both ONNX models are committed but only one is used**:
+
+```
+1244 KB  src-tauri/src/ai/version-RFB-320.onnx             <- never referenced
+1088 KB  src-tauri/src/ai/version-RFB-320_simplified.onnx  <- include_bytes! at ai/mod.rs:12
+```
+
+So 1.24 MB of binary is in every clone forever, and it is the two largest tracked files in the repository. Committing the *used* model is defensible for a face detector that must work offline; committing the unused one is not.
+
+**Two lockfiles are committed**: `package-lock.json` (204 KB) and `pnpm-lock.yaml` (132 KB). They will drift, and contributors will resolve dependencies differently depending on which package manager they reach for, which is a reproducibility problem for a project that ships signed-installer-shaped artifacts. Pick one, delete the other.
+
+Also missing: **no `LICENSE`** and **no `SECURITY.md`**. For a security-sensitive application distributing binaries, the absence of a `SECURITY.md` means a researcher who finds something has no disclosure channel, and the absence of a license means nobody can legally fork or contribute.
+
+**Fix:** `git rm` the three stray files and the unused model, delete one lockfile, add `.env` and `*.txt` to `.gitignore`, and add `LICENSE` and `SECURITY.md`.
+
+### 7.6 Version and release metadata (Medium)
+
+All three manifests declare version `0.0.0`, and `package.json` still declares `"name": "tauri-app"`. `Cargo.toml` has no `[profile.release]` section at all, so the release build gets no LTO, no `strip`, and default codegen units; for a Rust binary shipping ONNX Runtime, `lto = true` and `strip = true` are typically worth several MB and a measurable startup improvement.
+
+A version of `0.0.0` also means the updater in 7.2, once added, has no meaningful version to compare against, and users cannot report "which build" they are on. Bump to `0.1.0` across all three manifests as part of the first fix release.
+
+### 7.7 Dependency supply chain (Medium)
+
+`npm audit` reports **7 vulnerabilities: 5 High, 1 Moderate, 1 Low**, in `vite`, `rollup`, `postcss`, `picomatch`, `nanoid`, `yaml` and `@babel/core`.
+
+To be accurate about severity: **every one of these is build tooling, not shipped runtime code.** The Vite dev-server path-traversal and `server.fs.deny` bypass issues affect a developer running `npm run dev`, not an end user running the installer. They are still worth fixing, since a compromised dev machine is how supply-chain attacks on signed releases begin, but they are not user-facing and should not be reported as such.
+
+On the Rust side I want to correct a concern that would be reasonable to raise and is not warranted here. The `grammers` Telegram client is a git dependency, which is often a supply-chain risk, but it is **correctly pinned to an immutable commit**:
+
+```toml
+# src-tauri/Cargo.toml:25-26
+grammers-client = { git = "https://github.com/Lonami/grammers", rev = "b595a8c4fdfa5c3a8abcb5766c959ecfe30e9f6e", ... }
+grammers-session = { git = "https://github.com/Lonami/grammers", rev = "b595a8c4fdfa5c3a8abcb5766c959ecfe30e9f6e", ... }
+```
+
+A `rev` pin, not a branch, and the same rev for both crates. That is the right way to do it. The crypto crates are all current and none are RUSTSEC-flagged (`aes-gcm 0.10.3`, `argon2 0.5.3`, `rand 0.8.5`, `blake3 1.8.3`). There are no path dependencies outside the repository, no wildcard versions, and no vendored code. `cargo audit` was not run, since that requires a full dependency resolution, and it belongs in CI.
+
+### 7.8 No error tracking, and 876 kB in a single chunk (Medium / Low)
+
+There is no Sentry or equivalent on either side. Observability is 50 `println!` calls in Rust that the Windows release subsystem discards, plus 77 `console.*` calls in the frontend that nobody can see in a packaged desktop app. `componentDidCatch` only calls `console.error` (6.7), so a crash in a shipped build is unreportable, which combined with 7.2 means you cannot learn about a problem *or* fix it for users.
+
+`vite build` emits a single **876.57 kB** JavaScript chunk (255.52 kB gzipped) with no code splitting, and Vite says so explicitly. Four declared dependencies (`react-window`, `react-window-infinite-loader`, `react-virtualized-auto-sizer`, and their types) are **never imported**, yet `vite.config.ts:16-18` pre-bundles three of them in `optimizeDeps`, because `MediaGrid` hand-rolls its own virtualizer instead (Section 8). For a local desktop app the bundle size costs startup time rather than bandwidth, so this is Low, but deleting four unused deps and the stale `optimizeDeps` block is free.
