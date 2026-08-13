@@ -1411,7 +1411,7 @@ ls LICENSE* SECURITY*                # No such file or directory
 | 3.1 | `tauri-plugin-mcp-bridge` is registered unconditionally in release builds, in a process holding the decrypted master key |
 | 3.2 | `get_all_config` hands the wrapped master key and the DPAPI credential blob to the webview, under a CSP permitting `unsafe-inline` and `unsafe-eval` |
 
-**High (18).** Data loss or security degradation under realistic conditions, or unrecoverable/unmaintainable state.
+**High (23).** Data loss or security degradation under realistic conditions, or unrecoverable/unmaintainable state.
 
 | ID | Finding |
 |---|---|
@@ -1439,7 +1439,7 @@ ls LICENSE* SECURITY*                # No such file or directory
 | 7.2 | The installer is unsigned and there is no updater, so fixes cannot reach existing users |
 | 7.3 | No ESLint, Prettier, rustfmt or clippy configuration exists |
 
-**Medium (21).**
+**Medium (22).**
 
 | ID | Finding |
 |---|---|
