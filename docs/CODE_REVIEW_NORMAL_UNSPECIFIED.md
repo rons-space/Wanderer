@@ -661,3 +661,119 @@ if let Ok(old_id) = previous_tg_id.parse::<i32>() {
 `let _ =` swallows rate limits, network errors and partial deletes, and `delete_messages` itself only reports `pts_count`, which can be lower than requested. The migration is then marked `succeeded` regardless (`lib.rs:622-623`). So plaintext originals can remain in Telegram cloud storage forever, with no record of which ones, while the app reports the library as fully migrated to encrypted. For a user who enabled encryption specifically to remove plaintext from Telegram, this silently fails to deliver the thing they asked for.
 
 **Fix:** verify the deletion, retry on `FLOOD_WAIT`, and record un-deleted message IDs in a durable pending-purge list surfaced in the UI.
+
+---
+
+## 4. Rust code quality
+
+### 4.1 A single panic bricks the database for the process lifetime (High)
+
+The doc comment and the log message both claim recovery. The code does not recover:
+
+```rust
+// src-tauri/src/database.rs:138-148
+    /// Get a connection, recovering from poisoned mutex if needed.
+    pub fn get_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|e| {
+            // Recover from poisoned mutex - the previous holder panicked
+            log::warn!("Recovering from poisoned database mutex");
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!("Mutex poisoned: {}", e)),
+            )
+        })
+    }
+```
+
+This maps poison to `Err` and returns it. `std::sync::Mutex` poisoning is **permanent**, so after one panic anywhere in a DB call, all 89 database methods fail forever with "Mutex poisoned" and all 74 commands degrade to error strings until the app is restarted. The honest fix is one call: `.unwrap_or_else(|e| e.into_inner())`, which is what "recovering" actually means. At absolute minimum, correct the comment so the next reader is not misled.
+
+The most likely trigger is debug code left in a production write path:
+
+```rust
+// src-tauri/src/database.rs:696-708
+            // DEBUG: Check FK definition
+            let mut stmt = conn.prepare("PRAGMA foreign_key_list('faces')")?;
+            let fks = stmt.query_map([], |row| { /* ... */ })?;
+            for fk in fks {
+                println!("DEBUG FK: faces -> {}", fk.unwrap());
+            }
+```
+
+That `fk.unwrap()` runs **while the connection guard is held**, so any row-decode error panics with the lock held and poisons it permanently. The whole block also executes on every single face embedding stored, running an extra `PRAGMA` query and printing to stdout per face.
+
+### 4.2 The global lock is held across blocking work and CPU-bound inference (High)
+
+There are two lock layers: `AppState.db: Mutex<Option<Arc<Database>>>` (a **tokio** mutex) wrapping `Database.conn: Mutex<Connection>` (a **std** mutex).
+
+The std guard never crosses an `await`. Every one of the 89 methods acquires and releases inside a synchronous body. **That is the single most important thing to get right with `Mutex<Connection>` in an async application, and it is right everywhere**, which is why this is High rather than Critical.
+
+The tokio guard is the problem:
+
+```rust
+// src-tauri/src/lib.rs:2513-2542  (index_pending_clip)
+    let db_guard = state.db.lock().await;
+    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let pending = db.get_pending_clip_items(limit).map_err(|e| e.to_string())?;
+    for (id, path_str) in pending {
+        // ...
+        match clip::encode_image(path) {
+```
+
+`clip::encode_image` is synchronous ONNX inference. This holds the global DB lock for the entire batch **and** blocks an executor thread, so no other command can touch the database and no other task on that thread progresses. `detect_faces` gets this right using `spawn_blocking` (`lib.rs:811-814`); this does not.
+
+The per-request equivalent is `materialize_media_items_for_response` (`lib.rs:193-202`), which loops over items and, per item, does a blocking `is_encrypted_file` read, a **fresh async lock acquisition**, `create_dir_all`, two `metadata` calls, and a full `decrypt_file`. For a 200-item gallery page that is 200 async lock round-trips and up to 200 synchronous AES-GCM file decryptions on a runtime thread, and it runs on the return path of about a dozen commands. `lib.rs` contains **39** `std::fs::` calls, nearly all inside `async fn` bodies with no `spawn_blocking`.
+
+No deadlock is reachable today, but the lock *ordering* is inconsistent: `lib.rs:511` takes `security_runtime` and then the DB lock, while `sync_worker.rs:60-68` takes the DB lock and then `security_runtime`. That inversion is currently harmless only because the locks are held so briefly. Making any DB method hold its guard longer would turn it into a deadlock.
+
+### 4.3 Duplicate detection is O(n squared) with two allocations per comparison, under the global lock (High)
+
+```rust
+// src-tauri/src/database.rs:2653-2660
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let distance = hamming_distance(&candidates[i].1, &candidates[j].1);
+```
+
+and `hamming_distance` re-parses **both** hashes from base64 into an `ImageHash` on every call (`database.rs:113-131`). At 10,000 photos that is roughly 50M iterations with about 100M heap allocations, all while holding the connection guard taken at `database.rs:2567` for the entire function, so the UI and every background worker stall. The function also loads every candidate row with all 24 columns into memory first.
+
+**Fix:** parse each hash once into a `Vec<u64>` up front, and bucket by phash prefix instead of comparing all pairs.
+
+Related performance findings: **four N+1 query patterns** (`export_sync_manifest` at `lib.rs:2291-2302` runs two correlated subqueries per photo over the whole library; `scan_duplicates` at `lib.rs:1562-1573` and `find_duplicates` at `lib.rs:1504-1514` both reacquire the global lock *inside* the loop with one implicit transaction and one fsync per photo; `reconcile_cloud_only_flags` at `database.rs:2436-2441` does a blocking `Path::exists()` plus an individual `UPDATE` per candidate **at startup**). And `semantic_search` loads every CLIP embedding in the library into memory on each search, which the author flagged honestly in a comment at `lib.rs:2452-2453`.
+
+### 4.4 Eighty discarded results, several hiding real state corruption (Medium)
+
+There are **80** `let _ =` and **32** `.ok()` sites. Most are legitimately fire-and-forget, such as `app.emit` and temp-file cleanup. These are not:
+
+- `database.rs:1069`: the FTS insert, which silently loses searchability (2.5).
+- `lib.rs:2349-2356`: the entire `import_sync_manifest` merge writes through discarded results, and `updated_count` increments regardless, so the command reports `"Synced N items"` after failing all N of them.
+- `upload_worker.rs`: seven discarded `update_queue_status` calls, which can strand items in `"uploading"` forever (2.7).
+- `sync_worker.rs:356`: a discarded `mark_media_encrypted_by_path`, after which the item is treated as unencrypted forever and the migration will re-upload it.
+- `database.rs` has **eight** `filter_map(|r| r.ok())` sites that silently drop unreadable rows mid-iteration. At `2274` in `empty_trash` that means a trashed item is skipped and never deleted; at `2920` in `get_all_media_for_sync` it means an item silently vanishes from the sync manifest.
+
+### 4.5 `errors.rs` is dead code and all 74 commands return `Result<T, String>` (Medium)
+
+`errors.rs` defines a well-structured `AppError` with `#[derive(Error, Serialize)]`, a `#[serde(tag = "type", content = "message")]` representation, seven variants, and `From` impls for `rusqlite::Error` and `std::io::Error`. It is referenced **zero** times outside its own file. Every command instead does `.map_err(|e| e.to_string())`, which flattens typed errors into opaque strings the frontend cannot branch on and leaks raw SQL and IO error text, including absolute filesystem paths, into the UI.
+
+This has a concrete downstream cost: `App.tsx:50` retries startup by **string-matching** `message.includes("Database not initialized")`, a contract that breaks the moment the Rust error text changes (6.3). Wiring up the type that already exists would fix both ends.
+
+### 4.6 Structure and duplication in `database.rs` (Medium)
+
+`database.rs` is 3,264 lines with **89 public methods** across **three separate `impl Database` blocks** (lines 137, 2820, 2872) with no module boundary between them, two of which are unlabelled continuations. It mixes schema migration, media CRUD, queue management, albums, tags, face clustering, CLIP vector storage, config storage and duplicate detection, and it embeds two clustering *algorithms* (union-find at `2626-2683`, greedy face matching at `2743-2822`) in the data-access layer.
+
+The duplication is measurable and the fix is unusually cheap. The 24-field `MediaItem` row mapping is written out inline **17 times**, and the long `SELECT id, file_path, file_hash, ...` column list is duplicated **15 times**. A `map_media_row` helper **already exists** at `database.rs:1401-1434` and is used exactly **3 times**. Applying the existing helper at the other 17 sites would delete roughly 500 lines with no behaviour change, and it is the single highest-value, lowest-risk refactor available in this codebase. Because the column list is manual and positional, adding a column today means editing 15 strings and 17 mappings in lockstep; the defensive `row.get::<_, Option<i32>>(21)?` pattern on the newer columns reads like scar tissue from that exact failure.
+
+`lib.rs` at 2,545 lines holds all 74 command handlers plus startup wiring in one file, and would split cleanly along the same domain lines.
+
+### 4.7 Smaller Rust findings (Low)
+
+- **`progress_stream.rs:66`**: `self.bytes_read.try_lock().unwrap()` inside `poll_read`, on the upload hot path. It should never contend, but the panic would land inside an in-flight Telegram upload. It is also unnecessary: the method takes `Pin<&mut Self>`, so a plain `u64` field removes both the `Arc<Mutex<_>>` and the panic.
+- **`escape_like_pattern` does not work.** `media_utils.rs:252-256` escapes `%` and `_` with backslashes, but no query anywhere uses an `ESCAPE '\'` clause, and SQLite only honours a backslash escape when one is specified. So the function fails to neutralize wildcards *and* inserts literal backslashes that make a search for `my_photo` fail to match `my_photo`. Its unit tests assert the string transformation rather than the SQL behaviour, so they pass while the feature is broken. Mitigating: the only caller, `Database::search_media`, is dead code, since the `search_media` command routes to `search_fts` instead. `Database::get_persons` is likewise dead.
+- **FTS5 query construction can produce syntax errors on ordinary input.** `database.rs:1606-1610` maps each token to `"\"{}\"*"`, so a token consisting only of `"` becomes `""*`, an FTS5 syntax error surfaced raw to the user. Correctly bound as a parameter, so not injection.
+- **`sync_worker.rs:148`**: `.unwrap()` on `to_str()` of a path, inside a spawned worker, where a panic silently kills sync for the session. Every other path conversion in the codebase uses `to_string_lossy()`.
+- **The remaining 6 non-test `unwrap()`s are safe by invariant**, and I want to be fair about that: `database.rs:778` and `920` are guarded by preceding length checks, `793` is reachable only when a preceding comparison assigned the value, and `ai/worker.rs:48` unwraps a runtime build inside a dedicated thread, which is conventional.
+- **`unchecked_transaction` used once inconsistently** (`database.rs:3224`) where the other five transactions use the checked `conn.transaction()`, apparently only to avoid a `mut` binding.
+- **50 `println!` calls** bypass the initialized `env_logger` entirely and go to a stdout that the `windows_subsystem = "windows"` release attribute discards. Several log user file paths and IDs.
+- **`cargo fmt --check` reports drift in 7 files**: `ai/object_detection.rs`, `ai/worker.rs`, `clip.rs`, `database.rs`, `lib.rs`, `security/mod.rs`, `upload_worker.rs`.
+- **A non-cryptographic RNG exists in the tree.** `sync_manifest.rs:212-231` seeds an unkeyed `DefaultHasher` from a timestamp. I traced every use: it feeds only `generate_device_id()` and touches **no** key, nonce, salt or recovery key. Harmless today, but it is a foot-gun sitting next to a crypto module.
+- **Dead `.env` machinery.** `dotenvy::dotenv().ok()` is called at `lib.rs:840` and `.env.example` advertises `TG_ID` and `TG_HASH`, but neither is ever read; credentials come exclusively from the DPAPI-protected config. Meanwhile **`.env` is not gitignored** in either `.gitignore`, so a developer following `.env.example` would have real credentials staged by default, for no functional benefit.
+- **`windows-sys` is not target-gated** (`Cargo.toml:63`), and the non-Windows DPAPI stubs hard-error, so onboarding cannot complete on Linux or macOS while `bundle.targets` is `"all"`. The stubs correctly **fail closed** with no plaintext fallback, which is the right behaviour; the packaging is what is wrong.
