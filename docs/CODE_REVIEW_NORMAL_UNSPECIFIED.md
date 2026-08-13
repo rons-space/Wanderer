@@ -498,3 +498,166 @@ Separately, there are **41** `conn.prepare(` calls and **zero** `prepare_cached`
 That comment is wrong. The result is duplicate uploads of the same photo. `upload_worker.rs:80-98` adds a third defensive hash check at upload time, which reads like scar tissue from exactly this bug.
 
 Relatedly, `upload_worker.rs` discards **seven** `update_queue_status` results. A dropped reset to `"pending"` leaves an item stuck in `"uploading"` forever, invisible both to `get_next_pending_item` and to the retry path, which only resets rows with `status = 'failed'`. There is no reaper for stale `uploading` rows.
+
+---
+
+## 3. Attack surface
+
+### 3.1 A remote-control plugin is registered unconditionally in release builds (Critical)
+
+```rust
+// src-tauri/src/lib.rs:859-863
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_mcp_bridge::init())
+```
+
+```toml
+# src-tauri/Cargo.toml:43
+tauri-plugin-mcp-bridge = "0.7.0"
+```
+
+There is no `#[cfg(debug_assertions)]` gate and no feature flag. An MCP bridge exists to let an external agent process drive the application, and such plugins conventionally open a local listener. This ships, always on, in a process that holds the decrypted master key in memory and has commands that read arbitrary files and upload them to Telegram (3.4).
+
+*Partially inferred:* the plugin is a crates.io dependency and I did not read its source, so I have not confirmed what it binds or whether it authenticates. What is **verified** is that it is registered in every build with no gate, and that it is conspicuously absent from `capabilities/default.json`, which suggests it was added during development and never removed. Capabilities gate frontend-to-Rust IPC; they do not gate a plugin's own listener.
+
+**Fix:** gate it behind `#[cfg(debug_assertions)]` or delete it, then cut a new release. Until you have read the plugin's source and confirmed its bind address and auth model, treat this as the highest-priority item alongside 2.1.
+
+### 3.2 The wrapped master key is handed to the JavaScript context (Critical)
+
+The write path is guarded. The read path is not.
+
+```rust
+// src-tauri/src/lib.rs:1686-1690
+async fn set_config(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
+    if key.starts_with("security_") {
+        return Err("Security settings are managed by dedicated security commands".to_string());
+    }
+```
+
+```rust
+// src-tauri/src/lib.rs:1677-1684
+async fn get_all_config(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let db_guard = state.db.lock().await;
+    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    db.get_all_config().map_err(|e| e.to_string())
+}
+```
+
+`get_all_config` returns every row of the `config` table with no filter (`database.rs:2856-2858`). That table holds `security_bundle_v1`, which is the Argon2 salts plus the AES-GCM-wrapped master key for **both** the passphrase and the recovery wraps, and `security_telegram_credentials`, the DPAPI blob. This is not a corner case: it is called from `src/lib/api.ts:211`, which is called from `Settings.tsx:164` and `MediaGrid.tsx:661`, so **every mount of the photo grid pulls the key material into JavaScript**.
+
+That the `security_` prefix guard exists on the write path, and that all five security keys are correctly prefixed, is strong evidence the author understood this boundary. It was simply applied in one direction.
+
+### 3.3 CSP allows inline script and eval, and the asset scope is the whole filesystem (High)
+
+```json
+// src-tauri/tauri.conf.json (app.security)
+"csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline';",
+"assetProtocol": { "enable": true, "scope": ["**", "C:\\**", "C:/**", "$APPDATA/**", "$LOCALAPPDATA/**"] }
+```
+
+`script-src 'unsafe-eval' 'unsafe-inline'` removes the main structural defence against script injection in a webview. `assetProtocol.scope` of `"**"` is unrestricted: the asset protocol will serve **any file the process can open** to the webview, on any platform. `capabilities/default.json:13-40` separately grants `fs:allow-read` and `fs:allow-exists` over `C:\**`, the entire system drive.
+
+Individually each of these is a configuration smell. Together with 3.2 they compose into a real chain: any script injection, whether from a crafted EXIF field rendered unsafely or a compromised npm dependency, becomes arbitrary local file read **plus** exfiltration of the wrapped key material for offline Argon2 cracking, **plus** theft of the Telegram `api_hash`.
+
+Mitigating, and worth stating: no `fs:allow-write*` and no `fs:allow-remove` are granted, and there is no `shell:` permission at all, so the plugin surface cannot write or delete. The write primitives live in custom commands instead (3.4).
+
+**Fix:** drop `'unsafe-eval'` and `'unsafe-inline'`, narrow `assetProtocol.scope` and the `fs` scopes to `$LOCALAPPDATA/com.wanderer.desktop/**` plus the configured backup directory, and filter `security_*` out of `get_all_config`.
+
+### 3.4 `import_files` is an arbitrary file read that auto-uploads to Telegram (High)
+
+Of the 74 commands, five accept a caller-supplied filesystem path. The one that matters:
+
+```rust
+// src-tauri/src/lib.rs:1216-1244
+async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize, String> {
+    for file_path in files {
+        let path = std::path::Path::new(&file_path);
+        if let Some(file_name) = path.file_name() {
+            let dest_path = backup_dir.join(file_name);
+            // ...
+            if let Err(e) = std::fs::copy(&path, &dest_path) {
+```
+
+No validation, no extension filter, no allowlist, no confinement to paths the user actually picked in a dialog. Any file the process can read is copied into the watched `backup` directory, where `watcher.rs:271-282` immediately ingests it and queues it for **upload to Telegram**. So one `invoke('import_files', { files: ['C:\\Users\\x\\.ssh\\id_rsa'] })` from injected script both reads the file and ships it off the machine. `dest_path` uses only `file_name()`, so there is no traversal on the write side; the read side is the problem.
+
+Also unvalidated: `export_media` will `create_dir_all` and write into any destination (`lib.rs:1385-1387`), `backup_database` writes a DB copy anywhere, and `import_sync_manifest` reads and JSON-parses any path with parse errors returned to the frontend.
+
+Credit where due, and I looked for this specifically: **there is no command that deletes a frontend-supplied path.** Both delete paths operate on values read out of the database, never on IPC input. That is the right design.
+
+**Fix:** canonicalize and confine `import_files` sources to paths returned by the dialog plugin in the same session, and confine `export_media` and `backup_database` destinations likewise.
+
+### 3.5 One SQL statement interpolates free text (High)
+
+Of roughly 90 SQL statements, 87 bind every value. This is the exception:
+
+```rust
+// src-tauri/src/database.rs:1530-1537
+        if let Some(camera) = &filters.camera_make {
+            if !camera.is_empty() {
+                conditions.push(format!(
+                    "camera_make LIKE '%{}%'",
+                    camera.replace('\'', "''")
+                ));
+            }
+        }
+```
+
+The clause is joined and interpolated into both query bodies (`database.rs:1551-1559` and `1612-1621`), and the input is a free-text box: `Search.tsx:347-352` to `Search.tsx:118` to `api.ts:87` to `lib.rs:721-735`.
+
+**Honest exploitability assessment.** Quote-doubling *is* the correct escape for a SQLite string literal, and SQLite honours no backslash escapes inside literals, so I could not construct an arbitrary-statement injection. What is live today is a **LIKE-pattern injection**: `%` and `_` are not escaped, so a user typing `%` matches every row, and a pattern like `%_%_%_%_%` forces pathological backtracking on a full table scan of an unindexed column.
+
+The reason to fix it anyway is structural. This is a hand-rolled escaper on a concatenated clause: one future filter that forgets `.replace('\'', "''")` turns it into a real injection, and because the SQL text varies per filter combination it also defeats statement caching. Bind it, as the codebase already does correctly for its dynamic `IN (...)` lists.
+
+There are no dynamic table names, no dynamic column names, and no interpolated `ORDER BY`, `LIMIT` or `OFFSET` anywhere in 3,264 lines. Album names, tag names, person names, config keys and file paths are all bound. And there is **no SQL outside `database.rs`** at all, which is a genuinely valuable containment property.
+
+### 3.6 Unbounded allocation from an attacker-controlled length field (Medium)
+
+```rust
+// src-tauri/src/security/mod.rs:417-423
+let ct_len = u32::from_le_bytes(len_buf) as usize;
+if ct_len < 16 {
+    return Err(anyhow!("Invalid encrypted chunk length"));
+}
+
+let mut ciphertext = vec![0u8; ct_len];
+reader.read_exact(&mut ciphertext)?;
+```
+
+Only a lower bound is checked. The header's `chunk_size` **is** validated to at most 8 MiB (`security/mod.rs:392-394`) but that value is never used to bound `ct_len`. A malicious or corrupted blob fetched from Telegram can declare `0xFFFFFFFF` and force a roughly 4 GiB allocation per chunk, before any authentication tag is verified. One line fixes it: `if ct_len < 16 || ct_len > chunk_size as usize + 16`.
+
+### 3.7 Unclamped pagination and an unchecked negative cast (Medium)
+
+Nine query methods clamp defensively with `limit.max(0).min(1000)`. Two do not: `get_media_by_person` (`database.rs:2758-2777`) and `get_media_by_tag` (`database.rs:3074-3092`) pass frontend values straight through, so `limit: 10_000_000` materializes an unbounded result set into a `Vec` and serializes it over IPC.
+
+Worse, in `semantic_search`:
+
+```rust
+// src-tauri/src/lib.rs:2469-2473
+    let top_ids: Vec<i64> = scores
+        .iter()
+        .take(limit as usize)
+```
+
+`limit` is an `i32` from the frontend, and `-1i32 as usize` is `usize::MAX`, so a negative limit takes everything. Those IDs then flow into `get_media_by_ids`, which builds one `?` placeholder per ID, blowing past `SQLITE_MAX_VARIABLE_NUMBER`. `bulk_delete` and `bulk_set_favorite` have the same unbounded-placeholder exposure with an arbitrary-length `Vec<i64>`.
+
+### 3.8 Migration leaves plaintext copies in Telegram and reports success anyway (Medium)
+
+During migration to encrypted mode, the old plaintext message is deleted with the result thrown away:
+
+```rust
+// src-tauri/src/lib.rs:609-615
+if let Ok(old_id) = previous_tg_id.parse::<i32>() {
+    if old_id != new_msg_id {
+        let _ = telegram.delete_messages(&[old_id]).await;
+    }
+}
+```
+
+`let _ =` swallows rate limits, network errors and partial deletes, and `delete_messages` itself only reports `pts_count`, which can be lower than requested. The migration is then marked `succeeded` regardless (`lib.rs:622-623`). So plaintext originals can remain in Telegram cloud storage forever, with no record of which ones, while the app reports the library as fully migrated to encrypted. For a user who enabled encryption specifically to remove plaintext from Telegram, this silently fails to deliver the thing they asked for.
+
+**Fix:** verify the deletion, retry on `FLOOD_WAIT`, and record un-deleted message IDs in a durable pending-purge list surfaced in the UI.
