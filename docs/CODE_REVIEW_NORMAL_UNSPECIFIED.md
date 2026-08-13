@@ -325,3 +325,176 @@ The README's DPAPI claim is **true**, and the call is well formed: `CryptProtect
 ### 1.10 Metadata is never encrypted (Medium)
 
 `encrypt_file` covers media blobs, thumbnails and the backup artifact, but the live `library.db` is opened as a plain `rusqlite` database with no SQLCipher (`Cargo.toml:28` has no cipher feature). So filenames, full local paths, blake3 and perceptual hashes, extracted EXIF **including GPS coordinates**, face and person data, and album structure are all plaintext at rest, sitting alongside the wrapped-key material and the DPAPI blob. The README is admirably explicit that `backup/` is plaintext (Section 5) but does not mention that the metadata index is too, and for a photo library the GPS trail is arguably more sensitive than any single image.
+
+---
+
+## 2. Recoverability and data integrity
+
+### 2.1 The encrypted backup is mathematically undecryptable (Critical)
+
+This is the most serious finding in the report, and it is a design defect rather than a bug: the code does exactly what it says, and what it says is circular.
+
+The master key is **random**, not derived from the passphrase:
+
+```rust
+// src-tauri/src/security/mod.rs:99-109
+pub fn new_encrypted(passphrase: &str) -> Result<(Self, String, [u8; 32])> {
+    let mut master_key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut master_key);
+    let passphrase_wrap = wrap_master_key_with_secret(passphrase.as_bytes(), &master_key)?;
+    let recovery_wrap = wrap_master_key_with_secret(recovery_key.as_bytes(), &master_key)?;
+```
+
+The only copy of that wrapped key, with its Argon2 salts, is the `SecurityBundle`, persisted into the `config` table **inside `library.db`** (`lib.rs:105-108`). Now the backup:
+
+```rust
+// src-tauri/src/lib.rs:1901-1922
+std::fs::copy(&db_path, &backup_path).map_err(|e| e.to_string())?;
+// ...
+if security_mode == "encrypted" {
+    let key = get_active_master_key(&state).await
+        .ok_or_else(|| "Encryption vault is locked. Unlock to create encrypted backup.".to_string())?;
+    let encrypted_path = backup_path.with_extension("db.wbenc");
+    security::encrypt_file(&backup_path, &encrypted_path, &key).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&backup_path);
+    final_backup_path = encrypted_path;
+}
+```
+
+The backup of `library.db` is encrypted with the master key, and the wrapped master key lives only inside that same `library.db`. **The key material required to open the artifact is sealed inside the artifact.**
+
+Walk the disaster scenario the feature exists for. The user's drive fails. They reinstall Wander(er) on a new machine. They have their passphrase and their printed recovery key, exactly as the README told them to. They have `library_backup_1234.db.wbenc`, and they have every photo in Telegram. And there is no sequence of actions that recovers any of it, because unwrapping the master key requires the salts and wrapped ciphertext that are inside the encrypted blob they are trying to open. The recovery key advertised at `lib.rs:83-91` recovers nothing in this scenario.
+
+The same reasoning applies to the entire cloud archive: every uploaded media file is encrypted with that same master key (`upload_worker.rs:147-155`). **Lose `library.db` and the Telegram backup is cryptographically destroyed.** Note that `backup_database` will also happily upload the undecryptable artifact to Telegram when `upload_to_telegram` is set (`lib.rs:1927-1930`), so the off-site copy is off-site and useless.
+
+**Fix, and it is small:** the `SecurityBundle` is *already* protected by Argon2id and the passphrase; that is its entire purpose. So export it **unencrypted** alongside the encrypted backup, or write it as a plaintext header on the `.wbenc` artifact. Then the passphrase and recovery key work as documented. This should be shipped before anything else in this report, and existing users should be told to keep a copy of their current `library.db`.
+
+### 2.2 Filesystem deletions happen inside a transaction that can roll back (High)
+
+`empty_trash` unlinks irrecoverable user files *before* the transaction commits:
+
+```rust
+// src-tauri/src/database.rs:2281-2295
+let tx = conn.transaction()?;
+
+for (id, file_path, thumbnail_path, telegram_media_id) in items {
+    // Delete local file
+    if std::path::Path::new(&file_path).exists() {
+        let _ = std::fs::remove_file(&file_path);
+    }
+    // Delete thumbnail
+    if let Some(ref thumb_path) = thumbnail_path {
+        if std::path::Path::new(thumb_path).exists() {
+            let _ = std::fs::remove_file(thumb_path);
+        }
+    }
+```
+
+If any later `tx.execute` fails on item N, the `?` propagates, the transaction **rolls back**, and the database still lists all N items as present while their bytes are gone. The user is left with a populated trash in which every entry is a dangling path. The two `let _ = std::fs::remove_file` calls also discard the failure case entirely.
+
+`permanent_delete` has the mirror-image bug with **no transaction at all** (`database.rs:2234-2255`): file unlinked, then row deleted, so a failure between them leaves a row pointing at nothing.
+
+**Fix:** collect paths, commit the transaction, *then* unlink. Irreversible side effects must never live inside a rollback scope.
+
+### 2.3 SQLite runs without WAL or a busy timeout, and the backup is a raw copy of a live database (High)
+
+There is no `journal_mode`, `busy_timeout` or `synchronous` pragma anywhere in the codebase. The only pragma at open time is:
+
+```rust
+// src-tauri/src/database.rs:151-157
+let conn = Connection::open(path)?;
+// Enable foreign keys
+conn.execute("PRAGMA foreign_keys = ON;", [])?;
+```
+
+So the database runs in rollback-journal mode at default durability, with no configured wait on contention, while the upload worker, sync worker, AI worker and filesystem watcher all write through a shared `Arc<Database>`. Then `backup_database` takes a raw `std::fs::copy` of that live file (`lib.rs:1901`). If a write is in flight, the copy can capture a torn page set whose hot journal is not copied, producing a backup that will not open. Combined with 2.1, the user's disaster-recovery story is a possibly-corrupt file that they also cannot decrypt.
+
+**Fix:** set `journal_mode = WAL` and a `busy_timeout` at open, and use `rusqlite`'s online backup API or `VACUUM INTO` instead of `fs::copy`.
+
+### 2.4 Migration defects: a stale version variable, two destructive steps, and no committed schema (High)
+
+There **is** a real versioned migration system keyed on `PRAGMA user_version`, with 19 numbered steps each in its own `BEGIN; ... COMMIT;` batch, and three of them correctly implement the full SQLite table-rebuild dance to repair foreign keys. That is better than most projects this age and is credited in Section 8. Four defects sit on top of it.
+
+**(a) The `version` local is never updated after eight of the migrations.** Migration 5's update is commented out, literally:
+
+```rust
+// src-tauri/src/database.rs:317-321
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )?;
+            // version = 5;
+        }
+```
+
+The same omission occurs for migrations 7, 8, 9, 10, 11, 12 and 13. Because each gate is `if version < N` and the stale value *under*-estimates, today's effect is only "run more migrations than necessary", which the `IF NOT EXISTS` guards absorb. But `ALTER TABLE ... ADD COLUMN` is **not** idempotent, and several steps use it. This survives purely because those steps happen to be gated by a `version` still below their threshold. Anyone inserting a new migration between an assigning and a non-assigning step gets a duplicate-column error and a hard startup failure with no obvious cause. Only migration 12 does this properly, probing with `pragma_table_info` (`database.rs:416-443`).
+
+**(b) Migration 7 drops the config table without carrying rows across:**
+
+```rust
+// src-tauri/src/database.rs:338-345
+            conn.execute_batch(
+                "BEGIN;
+                 DROP TABLE IF EXISTS config;
+                 CREATE TABLE config (
+```
+
+Today that only wipes app preferences, which is survivable. But it establishes a drop-and-recreate pattern in **the table that now holds the encryption bundle from 2.1**. If that pattern is ever repeated, it is unrecoverable key destruction for every user.
+
+**(c) Migration 15 can delete every named person:**
+
+```rust
+// src-tauri/src/database.rs:512-517
+                  DELETE FROM persons WHERE id NOT IN
+                    (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL);
+```
+
+If face embeddings were never computed, which is the **default state** because AI is opt-in and off, then `faces.person_id` is uniformly `NULL`, the subquery returns the empty set, `NOT IN` is true for every row, and all persons with their user-assigned names are deleted. There is no backup and no undo.
+
+**(d) The schema is not committed anywhere.** There are zero `.sql` files in the repository. The only definition of the schema is roughly 480 lines of string literals inside `migrate()`, replayable only from version 0. There is no snapshot to diff against, no test that runs the chain, and no downgrade path. Commit a generated `schema.sql` and add a test that migrates 0 to 19 and asserts `pragma_table_info` for every table; that single test would have caught (a) and (c).
+
+Also worth noting: the v5/v12 person rename left an orphaned `people` table that is never dropped, and migration 11's `CREATE TABLE IF NOT EXISTS tags` was a silent no-op on upgraded databases whose legacy `tags` table had a different shape, meaning **all tag writes failed** until migration 16 repaired it (`database.rs:525-592`). Migration 16 is genuinely careful work, and it is also evidence of how expensive (a) already was.
+
+### 2.5 The full-text index is insert-only (High)
+
+`media_fts` is written in exactly one place, and the result is discarded:
+
+```rust
+// src-tauri/src/database.rs:1069
+let _ = conn.execute("INSERT INTO media_fts (file_path) VALUES (?1)", [file_path]);
+```
+
+Three consequences. The `let _ =` means a failed insert leaves that photo **permanently unsearchable, silently**. There is no `DELETE FROM media_fts` in `permanent_delete` or `empty_trash`, and no triggers exist anywhere, so the index accumulates rows for deleted media forever. And `add_media_synced` (`database.rs:1074-1105`), which is the sync-worker ingest path, never inserts into `media_fts` at all, so **every photo restored from Telegram is invisible to search**.
+
+Because search joins on the text column rather than a rowid (`database.rs:1615-1616`), stale rows also resurrect as phantom joins if a path is ever reused, and neither side of that join is indexed (2.6).
+
+**Fix:** an external-content FTS5 table with `INSERT`, `UPDATE` and `DELETE` triggers, which removes the manual call site entirely.
+
+### 2.6 Missing indexes on the hottest columns (Medium)
+
+There are 7 `CREATE INDEX` statements, and 2 of them died with the legacy `tags` table in migration 16. The effective indexes on `media` are the implicit unique index on `file_hash` and `idx_media_phash`. Unindexed and hot:
+
+- **`media.file_path`**, the single most-queried key in the app. `upload_worker.rs:205-224` performs three lookups on it per completed upload, each a full table scan.
+- **`media.is_deleted` and `is_archived`**, in the `WHERE` of essentially every gallery query.
+- **`media.created_at` and `date_taken`**, the `ORDER BY` of every timeline query, so every page load sorts the whole table.
+- **`media.telegram_media_id`**, hit once per Telegram message per sync cycle.
+- **`media.scan_status`, `clip_status`, `tags_status`, `face_status`**, polled continuously by the AI worker.
+- **`album_media.media_id`**: the primary key is `(album_id, media_id)`, so `WHERE media_id = ?` cannot use it.
+- **`faces.media_id`**: `idx_faces_person` exists but not this, despite three separate query paths filtering on it.
+
+Separately, there are **41** `conn.prepare(` calls and **zero** `prepare_cached`, so every query recompiles its plan on each invocation.
+
+### 2.7 Non-atomic read-modify-write and lost idempotency (Medium)
+
+`toggle_favorite` (`database.rs:2034-2047`) issues an `UPDATE ... SET is_favorite = NOT ...` and then a separate `SELECT` to report the new value, so a double-click can return a value contradicting the stored state and the UI renders the wrong icon. A single `RETURNING` clause fixes it.
+
+`add_to_queue` (`database.rs:1688-1707`) is a check-then-act across two statements, and there is **no `UNIQUE` constraint on `upload_queue(file_path)`** in any of the 19 migrations, so nothing enforces deduplication at the schema level. The watcher asserts the opposite in a comment:
+
+```rust
+// src-tauri/src/watcher.rs:171
+            // This is safe because database::add_to_queue now handles its own deduplication
+            db.add_to_queue(&path_str)?;
+```
+
+That comment is wrong. The result is duplicate uploads of the same photo. `upload_worker.rs:80-98` adds a third defensive hash check at upload time, which reads like scar tissue from exactly this bug.
+
+Relatedly, `upload_worker.rs` discards **seven** `update_queue_status` results. A dropped reset to `"pending"` leaves an item stuck in `"uploading"` forever, invisible both to `get_next_pending_item` and to the retry path, which only resets rows with `status = 'failed'`. There is no reaper for stale `uploading` rows.
