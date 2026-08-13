@@ -7,20 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Upload, RefreshCw, AlertCircle, CheckCircle2, Clock, Loader2, Zap, Timer } from "lucide-react";
 import { toast } from "sonner";
-
-// Format bytes per second to human readable
-const formatSpeed = (bps: number): string => {
-    if (bps < 1024) return `${bps.toFixed(0)} B/s`;
-    if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
-    return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
-};
-
-// Format seconds to human readable ETA
-const formatEta = (seconds: number): string => {
-    if (seconds < 60) return `~${seconds}s`;
-    if (seconds < 3600) return `~${Math.ceil(seconds / 60)} min`;
-    return `~${(seconds / 3600).toFixed(1)} hr`;
-};
+import { formatSpeed, formatEta } from "@/lib/format";
 
 export function UploadQueue() {
     const [items, setItems] = useState<QueueItem[]>([]);
