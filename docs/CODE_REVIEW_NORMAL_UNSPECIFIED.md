@@ -777,3 +777,214 @@ The duplication is measurable and the fix is unusually cheap. The 24-field `Medi
 - **A non-cryptographic RNG exists in the tree.** `sync_manifest.rs:212-231` seeds an unkeyed `DefaultHasher` from a timestamp. I traced every use: it feeds only `generate_device_id()` and touches **no** key, nonce, salt or recovery key. Harmless today, but it is a foot-gun sitting next to a crypto module.
 - **Dead `.env` machinery.** `dotenvy::dotenv().ok()` is called at `lib.rs:840` and `.env.example` advertises `TG_ID` and `TG_HASH`, but neither is ever read; credentials come exclusively from the DPAPI-protected config. Meanwhile **`.env` is not gitignored** in either `.gitignore`, so a developer following `.env.example` would have real credentials staged by default, for no functional benefit.
 - **`windows-sys` is not target-gated** (`Cargo.toml:63`), and the non-Windows DPAPI stubs hard-error, so onboarding cannot complete on Linux or macOS while `bundle.targets` is `"all"`. The stubs correctly **fail closed** with no plaintext fallback, which is the right behaviour; the packaging is what is wrong.
+
+---
+
+## 5. README accuracy
+
+I audit documentation separately because a user-facing README that makes security promises is part of the security posture: a false promise there causes users to take real risks. I checked 51 concrete factual claims against the code.
+
+**The result is unusually good.** 34 claims verify as fully true, including **every one of the six security claims**, and including the self-critical one. Two are false, both about distribution rather than behaviour.
+
+### 5.1 The six security claims all verify (context, and this is the headline)
+
+| Claim | Verdict | Evidence |
+| --- | --- | --- |
+| "Files are encrypted before Telegram cloud upload" | **True** | `upload_worker.rs:146-155` encrypts to a temp `.wbenc` before `upload_file_with_progress`. See 1.1 for the fail-open caveat. |
+| "Thumbnails are encrypted at rest" | **True** | `watcher.rs:231-246`, and it deletes the plaintext thumbnail rather than leaving it when the vault is locked. |
+| "View cache is encrypted at rest" | **True** | `lib.rs:2150-2168` writes only `.wbenc` blobs into `view_cache/`. |
+| "Database backup artifact is encrypted" | **True** | `lib.rs:1914-1922`. True, and unfortunately also finding 2.1. |
+| "API ID and hash are stored locally with Windows DPAPI" | **True** | Real `CryptProtectData` with `CRYPTPROTECT_UI_FORBIDDEN` and user scope, `security/mod.rs:481-501`. See 1.9 for the entropy caveat. |
+| "Local files in `backup/` are still plaintext at rest" | **True** | Correct, and **voluntarily disclosed**. `encrypt_file` is never applied to the `backup/` tree. |
+
+That last row deserves emphasis. A README that spends a section explaining what its own encryption does **not** protect, accurately, without being asked, is rare. It materially raises my confidence in the rest of the document.
+
+All seven documented storage paths under `%LOCALAPPDATA%\com.wanderer.desktop\` are exactly right. "AI is opt-in, default OFF" is true and enforced in the schema (`database.rs:349-350`, `606-607` seed `ai_face_enabled` and `ai_tags_enabled` to `'false'`). The onboarding flow, the one-way encryption warning, the recovery-key verification step, the `tg://` share-link caveat, the partial RAW support, the unimplemented mobile companion and the incomplete metadata preservation are all accurate. Several are hedged more carefully than they needed to be.
+
+### 5.2 The download links point at the wrong repository (High, documentation)
+
+```
+README.md:34-36
+- Releases page (all versions): https://github.com/ronimuliawan/Wanderer/releases
+- Direct download (Windows x64, v0.0.0): https://github.com/ronimuliawan/Wanderer/releases/download/0.0.0/Wanderer._0.0.0_x64-setup.exe
+- Direct download (Windows x64, latest): https://github.com/ronimuliawan/Wanderer/releases/latest/download/Wanderer._0.0.0_x64-setup.exe
+```
+
+The repository's actual remote is `https://github.com/rons-space/Wanderer`. All three download links point at a **different owner namespace**. Whether that namespace resolves, redirects, or 404s cannot be determined from inside the repository, but the URLs do not match this project either way.
+
+For most projects this would be a Medium typo. Here it is High, because the artifact being distributed is an **unsigned Windows installer** (7.2) for an application that will hold the user's entire photo library and a Telegram account credential. "Download this unsigned .exe from a GitHub namespace that is not the project's" is precisely the shape of a supply-chain phishing instruction, and a user has no way to tell the difference. If `ronimuliawan/Wanderer` is a legitimate second remote, say so explicitly in the README; if it is stale, fix it.
+
+Related, and in the same spirit: the one populated in-app link points at a **third** project name.
+
+```ts
+// src/components/Settings.tsx:49-53
+const ABOUT_LINKS = {
+    github: "https://github.com/ronimuliawan/wanderbackup-rust",
+```
+
+So the repository, the README's download links, and the app's own About tab name three different GitHub locations. The empty `telegramChannel`, `supportGroup` and `donate` values are handled gracefully, rendering "Not configured yet" with disabled buttons, which matches the README's honest "(if configured)" hedge.
+
+### 5.3 "Production build: `npm run build`" is false (Medium, documentation)
+
+```
+README.md, For Developers
+Production build:
+    npm run build
+```
+
+`"build": "tsc && vite build"` (`package.json:8`) type-checks and bundles **the frontend only**, emitting `dist/`. I ran it: it succeeds in 2.71 seconds and produces no application. The production build is `npm run tauri build`, which is never mentioned. This will waste every new contributor's first hour, and it is the reason the developer-facing section is the weakest part of an otherwise strong document.
+
+### 5.4 Claims that are true but materially incomplete (Medium, documentation)
+
+- **"Thumbnails / view cache are encrypted at rest"** is true of the documented directories, but omits that viewing anything writes an unencrypted copy into `%TEMP%` that is never cleaned up (1.2). A reader will conclude their viewed media is not recoverable from disk, and it is. This is the most important omission in the file.
+- **"If you lose both passphrase and recovery key, encrypted data is unrecoverable"** is true, but the README does not warn about the case that actually bites: losing `library.db` while *retaining* both secrets is **also** unrecoverable (2.1). The document tells users to safeguard the two secrets and never tells them to safeguard the file that the secrets are useless without.
+- **"Minimum 8 chars"** is enforced on the initialize path (`security/mod.rs:100-102`) but **not** on the recovery/reset path, which accepts any `new_passphrase` (1.8).
+- The README does not mention that the metadata index, including GPS coordinates, is plaintext (1.10).
+
+### 5.5 Audit summary
+
+| Verdict | Count |
+| --- | --- |
+| True | 34 |
+| True but materially incomplete | 5 |
+| True with a backend enforcement gap | 1 |
+| True but the cited link is wrong | 1 |
+| **False** | **2** (production build command; release URLs) |
+| Unverifiable from the repository | 4 |
+
+Failures cluster in exactly two places: developer-facing instructions, and distribution metadata. Neither is about the product's behaviour, which is why this section reads so differently from Sections 1 through 4. The user-facing security documentation is accurate and, in places, more forthcoming than it had to be.
+
+**Fix:** correct the two false claims, add the `%TEMP%` residue and the `library.db` dependency to the Security and Privacy section, and add a "back up your `library.db`" instruction that is at least as prominent as the recovery-key instruction. Once 2.1 is fixed, replace that with the new procedure.
+
+---
+
+## 6. Frontend
+
+### 6.1 The Settings path to enable encryption can silently destroy recoverability (High)
+
+There are **two** paths that enable encryption, and they diverge badly. Onboarding does it correctly (see Section 8). Settings does not:
+
+```tsx
+// src/components/Settings.tsx:601-609
+{generatedRecoveryKey && (
+    <div className="space-y-2 rounded-md border bg-muted p-3">
+        <Label>Recovery Key (shown once)</Label>
+        <p className="font-mono text-xs break-all">{generatedRecoveryKey}</p>
+        <p className="text-xs text-muted-foreground">
+            Save this key securely. It is required if passphrase is lost.
+        </p>
+    </div>
+)}
+```
+
+Compared with the onboarding flow, this is missing **everything that makes the onboarding flow safe**. There is no verification step, so nothing forces the user to have actually read the key; onboarding requires retyping two segments before proceeding (`Onboarding.tsx:170-194`). There are no Download, Print or Copy buttons, so the user must manually select the text. And the state is never cleared, so despite the "(shown once)" label nothing enforces that. A user can enable encryption from Settings, navigate away without reading the key, and has now permanently lost the ability to recover if they forget the passphrase.
+
+This is a direct consequence of the duplication in 6.6: the same security-critical operation implemented twice, once carefully.
+
+**Fix:** extract one `<EnableEncryption>` component containing the verification gate and the save affordances, and use it in both places.
+
+### 6.2 Recovery-key handling defects in the onboarding flow (High)
+
+Three separate issues around the one-time display of an unrecoverable secret:
+
+**The print window is never closed and fails silently.**
+
+```tsx
+// src/components/Onboarding.tsx:101-111
+const printRecoveryKey = () => {
+    if (!recoveryKey) return;
+    const printWindow = window.open("", "_blank", "width=700,height=500");
+    if (!printWindow) return;
+    printWindow.document.write(
+        `<pre style="...">Wander(er) Recovery Key\n\n${recoveryKey}\n\n...</pre>`,
+    );
+    printWindow.document.close();
+    printWindow.focus();
+    printWindow.print();
+};
+```
+
+After `print()` returns, or if the user cancels, a window containing the plaintext master-recovery secret stays open on the desktop indefinitely. And `if (!printWindow) return` is a **silent** no-op: in a Tauri WebView2 window with `decorations: false`, `window.open` is likely blocked, so the user clicks Print, nothing happens, no toast, no error. For the only display of an unrecoverable key, a silent no-op is a data-loss path. Every other failure in this file produces a `toast.error`.
+
+**The clipboard copy has no error handling.** `Onboarding.tsx:526-528` calls `navigator.clipboard.writeText(recoveryKey || "")` with the promise unhandled and no success toast, so a permission failure is indistinguishable from success. A safe helper already exists in this codebase: `Settings.tsx:240-251` wraps the same call in try/catch and toasts both outcomes.
+
+**The download revokes the blob URL synchronously after `click()`** (`Onboarding.tsx:89-99`), and the anchor is never appended to the document. Both work in current WebView2, but this is a known-fragile idiom for what is again a one-shot secret.
+
+### 6.3 Startup retries forever by string-matching a Rust error message (High)
+
+```tsx
+// src/App.tsx:43-63
+  const refreshSecurityStatus = async () => {
+    try {
+      const status = await api.getSecurityStatus();
+      // ...
+    } catch (e: any) {
+      const message = String(e);
+      if (message.includes("Database not initialized")) {
+        setTimeout(() => { refreshSecurityStatus(); }, 250);
+        return;
+      }
+```
+
+Four problems in twenty lines. The timeout handle is never captured or cleared, so the effect has no cleanup and under React 19 `StrictMode` (`main.tsx:11`) two independent 4 Hz polling chains start in development. There is **no retry cap and no timeout**, so if the Rust side never initializes the database the app sits on "Loading secure startup..." polling IPC forever with no user-visible error and no way out. The retry decision is made by string-matching an error message, a contract that breaks the moment the Rust text changes, which is the downstream cost of the dead `errors.rs` in 4.5. And `catch (e: any)`.
+
+### 6.4 The photo grid remounts every visible cell on every parent render (High)
+
+`Gallery.tsx:158` and `Trash.tsx:124` define `ItemWrapper` components **inside** render:
+
+```tsx
+// src/components/Gallery.tsx:158
+    const SelectableItemWrapper = ({ item, children }: { item: MediaItem; children: React.ReactNode }) => {
+        const isSelected = selectedIds.has(item.id);
+```
+
+Both are new function identities on every render, and both are passed as the `ItemWrapper` **component type** prop, which `MediaGrid.tsx:476` uses as a JSX element. React compares element types by reference, so a new type means unmount and remount of that subtree. In `Gallery`, `selectedIds` changes on every click, so **every selection toggle tears down and rebuilds every visible cell's DOM**, including the `<img>` elements, which re-enter the network and decode path.
+
+This compounds with two more issues. `VirtualGrid.handleScroll` triggers **two** state updates per scroll event (`MediaGrid.tsx:260`, `855`), one of them unconditionally. And there are **zero** `React.memo` usages in the entire codebase, while `MediaGrid` passes ten `on*` handler props with none wrapped in `useCallback`. So every scroll frame re-renders the grid and every visible `Cell`, and each `Cell` re-runs `convertFileSrc` and rebuilds a full Radix context menu subtree with a six-item rating submenu.
+
+Also: the grid cell key is an **absolute index** into the array (`MediaGrid.tsx:335`, `key={itemIndex}`) while `handleDelete` and `handleArchive` splice the array, so every item after a removal shifts index and React reuses the wrong DOM node and image for a different photo. `DuplicateReview.tsx:206` has the same hazard.
+
+**Fix:** hoist the wrappers to module scope, `memo()` the `Cell`, `useCallback` the handlers, key by `item.id`, and throttle scroll state through `requestAnimationFrame`.
+
+### 6.5 Zero accessibility affordances (High)
+
+There are **0** `aria-label` attributes in application code (2 in the repository, both in generated shadcn files) against **26** `size="icon"` buttons and 9 raw `<button>` elements. A screen reader announces the favourite toggle, the eight repeated Copy and ExternalLink pairs in the About tab, and the mobile menu control as just "button".
+
+Keyboard navigation is absent from the core surface. The clickable grid cell is a `<div onClick=...>` (`MediaGrid.tsx:412-415`) with no `tabIndex`, no `role` and no `onKeyDown`, and across the whole application there are exactly **2** occurrences of `onKeyDown`, `tabIndex` or `role=` combined. **The photo grid is entirely unreachable by keyboard.** `MediaViewer` has no arrow-key navigation, and structurally cannot: it receives a single `item` prop rather than a list and an index. Escape and focus trapping work only because Radix `Dialog` provides them.
+
+The only accessible-by-accident controls are the window buttons, which use `title` attributes. Enabling `eslint-plugin-jsx-a11y` (7.3) would catch most of this mechanically.
+
+### 6.6 Dead code, triplicated flows, and a hand-rolled event bus (Medium)
+
+**Three separate implementations** of the Telegram phone-and-code login exist: in `Onboarding.tsx:218-252`, in `Settings.tsx:316-346`, and in `LoginView.tsx:20-49`. `LoginView.tsx` is **never imported or rendered anywhere**, and it is also the only file in the app that calls `invoke()` directly rather than going through the typed `api.ts` layer, plus the only source of "Check console" error strings and a `"Log out (Stub)"` button. Also fully dead: `Sidebar.tsx` (147 lines, superseded by `AppSidebar.tsx`, still containing a 2-second polling loop and the app's only two `alert()` calls) and `ThemeSwitcher.tsx` (57 lines, now inlined into Settings).
+
+`Settings.tsx` at 1,302 lines holds **17 `useState` hooks** spanning five unrelated domains, does six independent fetches on mount, and returns one 940-line block of JSX. Its About tab alone is roughly 140 lines of four copy-pasted link rows differing only in icon, label and URL.
+
+There is **no state management library and no server-state cache**. Cross-cutting auth state is propagated through a hand-rolled pub/sub over `window`:
+
+```tsx
+// src/components/Settings.tsx:144
+window.dispatchEvent(new Event('auth-changed'));
+// src/components/AppSidebar.tsx:134
+window.addEventListener('auth-changed', checkUser);
+```
+
+`MediaGrid` refetches `getAllConfig()` **and** `getAlbums()` on every mount, and it is mounted by seven different parents, so switching views reissues both calls every time. `getAlbums()` is independently fetched in three places.
+
+The `loadNextPage` pagination block is copy-pasted across **seven** components in **two mutually incompatible variants**. `Favorites.tsx` and `Archive.tsx` are byte-for-byte identical except for one API method name and two log strings. The variant used by `Favorites`, `Archive` and `Trash` appends without de-duplicating by id, so any overlapping page, which fixed-offset pagination trivially produces when an item is deleted mid-scroll, yields **duplicate React keys**. This is one `useMediaPagination(fetcher)` hook.
+
+### 6.7 Error handling and other frontend findings (Medium / Low)
+
+- **The error boundary does not cover the whole app.** `ErrorBoundary` is correctly mounted inside `App` (`App.tsx:81-108`), but `main.tsx:12` mounts `ThemeProvider` **outside** it. `ThemeProvider` reads `localStorage` in six lazy initializers and throws from `useTheme` (`ThemeContext.tsx:186`), so a failure there escapes the boundary and produces a blank white window. The fallback also has **no reset or reload button**, which in a desktop app leaves killing the process as the only recourse, and it renders raw error text including absolute paths. Nothing is persisted or reported.
+- **Tauri event listener cleanup is broken in two places.** `Settings.tsx:125-133` and `Gallery.tsx:60-87` assign the unlisten function inside a `.then()`, so unmounting before the promise resolves leaves the listener registered forever, calling `setState` on an unmounted component. The correct pattern **already exists** in this codebase at `UploadQueue.tsx:80-86`, which unlistens through the stored promise.
+- **`MediaGrid` mirrors props into state** (`MediaGrid.tsx:648-657`), which double-renders on every load and actively fights the four optimistic-update handlers in the same file: they mutate `localItems`, then trigger a parent refetch, which then overwrites the local edit.
+- **A scroll timeout is never cleared** (`MediaGrid.tsx:861`), firing `setState` after unmount.
+- **`Search.tsx:82-94`** has a `useEffect` whose dependency array lists only `[selectedTag]` while the closure reads `query`, `hasSearched` and four filter states, and whose body contains five lines of question-mark comments admitting the control flow is not understood.
+- **Errors swallowed:** four bare `.catch(console.error)` sites where a failed `getAlbums()` renders as "No albums", and three places where an IPC failure is rendered identically to "logged out", including `Settings.tsx:310-313` which silently boots the user to the login form on any transient error.
+- **The error banner is unreadable.** `Settings.tsx:426` styles it `bg-red-50 text-red-500`, raw Tailwind palette values rather than the app's semantic `destructive` token, while the app defaults to dark mode (`index.html:2`).
+- **Three confirmation idioms** coexist: native `confirm()` (`Settings.tsx:137`, `BulkActionBar.tsx:116`), the Tauri dialog plugin's `ask()` (`AppSidebar.tsx:140-144`), and a Radix `AlertDialog` (`Trash.tsx:148-187`).
+- **`BulkActionBar` fires N sequential IPC calls** for "Cloud Only" (`BulkActionBar.tsx:125-133`) while every other bulk action in the same file uses a real batch command. Selecting 2,000 photos means 2,000 serialized round-trips behind one spinner.
+- **Non-virtualized grids elsewhere** load 100 full images at once with no `loading="lazy"` (`SmartAlbums.tsx`, `Tags.tsx`, `DuplicateReview.tsx`); only 2 `loading="lazy"` attributes exist in the app. `MapView.tsx:35` fetches 500 rows in one shot.
+- **The map cannot render.** `MapView.tsx:91-92` loads OpenStreetMap tiles over `https:`, and `MapView.tsx:15-17` loads Leaflet marker icons from `unpkg.com`, but the CSP's `img-src` is `'self' asset: http://asset.localhost blob: data:` with no `https:`. So the map view shows markers and tiles blocked. Silver lining: this also means photo GPS coordinates are **not** currently leaking to a third-party tile server. Decide which behaviour you want, and if you want tiles, vendor the marker assets locally and document the privacy tradeoff.
+- **Dead and duplicated UI**: a doubled `<ContextMenuSeparator />` (`MediaGrid.tsx:576-578`), a `theme` prop threaded through two components only to be explicitly ignored (`MediaGrid.tsx:158`), a permanently disabled "Log Out (Not Implemented)" button directly beneath a working "Disconnect Account" (`Settings.tsx:469-475`), three hardcoded fake tags with no `onClick` while a real tag system exists (`AppSidebar.tsx:371-388`), three separate controls navigating to the same timeline view, and a fabricated display email (`{(user || "guest") + "@wander.app"}`).
+- **Cosmetics:** `index.html:7` still reads `<title>Tauri + React + Typescript</title>`, `package.json` still declares `"name": "tauri-app"`, and `vite.config.ts:5` has a **disarmed** suppression comment (`// ts-expect-error`, missing the `@`) so it does nothing. Two debug banners log on every launch (`main.tsx:7-8`).
