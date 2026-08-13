@@ -10,6 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "sonner";
 import { Trash2, Check, Copy, RefreshCw, Scan } from "lucide-react";
+import { formatBytes, getFileNameFromPath, getFileTypeFromPath } from "@/lib/format";
 
 interface DuplicateGroup {
     items: MediaItem[];
@@ -26,34 +27,9 @@ const getPreviewSrc = (item: MediaItem): string => {
     return "/placeholder.jpg";
 };
 
-const formatBytes = (bytes?: number): string => {
-    if (!bytes || bytes <= 0) {
-        return "Unknown size";
-    }
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    let value = bytes;
-    let idx = 0;
-    while (value >= 1024 && idx < units.length - 1) {
-        value /= 1024;
-        idx += 1;
-    }
-    const precision = idx === 0 ? 0 : 1;
-    return `${value.toFixed(precision)} ${units[idx]}`;
-};
+const getFileType = (item: MediaItem): string => getFileTypeFromPath(item.file_path, item.mime_type);
 
-const getFileType = (item: MediaItem): string => {
-    const fromMime = item.mime_type?.split("/")[1];
-    if (fromMime) {
-        return fromMime.toUpperCase() === "JPEG" ? "JPG" : fromMime.toUpperCase();
-    }
-    const filename = item.file_path.split(/[/\\]/).pop() || "";
-    const ext = filename.split(".").pop();
-    return ext ? ext.toUpperCase() : "UNKNOWN";
-};
-
-const getFileName = (item: MediaItem): string => {
-    return item.file_path.split(/[/\\]/).pop() || item.file_path;
-};
+const getFileName = (item: MediaItem): string => getFileNameFromPath(item.file_path);
 
 export function DuplicateReview() {
     const [groups, setGroups] = useState<DuplicateGroup[]>([]);
