@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
 import { api, errorMessage, MigrationStatus } from "../lib/api";
 import { TelegramLoginForm, useTelegramLogin } from "./TelegramLogin";
+import { EnableEncryption } from "./EnableEncryption";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "./ui/card";
 import { Label } from "./ui/label";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
-import { Loader2, HardDrive, Brain, User, LayoutGrid, Copy, Info, Github, MessageCircle, Users, HandHeart, ExternalLink, type LucideIcon } from "lucide-react";
+import { HardDrive, Brain, User, LayoutGrid, Copy, Info, Github, MessageCircle, Users, HandHeart, ExternalLink, type LucideIcon } from "lucide-react";
 import { Alert, AlertTitle, AlertDescription } from "./ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { Switch } from "./ui/switch";
@@ -114,6 +115,7 @@ export function Settings() {
     });
     const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
     const [isSaving, setIsSaving] = useState(false);
+    const [encryptionFlowOpen, setEncryptionFlowOpen] = useState(false);
     const [backupPath, setBackupPath] = useState<string>("");
     const [appVersion, setAppVersion] = useState<string>("Loading...");
     const [securityStatus, setSecurityStatus] = useState<{
@@ -124,9 +126,6 @@ export function Settings() {
         telegramCredentialsConfigured: boolean;
         migration: MigrationStatus;
     } | null>(null);
-    const [securityPassphrase, setSecurityPassphrase] = useState("");
-    const [securityPassphraseConfirm, setSecurityPassphraseConfirm] = useState("");
-    const [generatedRecoveryKey, setGeneratedRecoveryKey] = useState<string | null>(null);
     const [migrationStatus, setMigrationStatus] = useState<MigrationStatus | null>(null);
     const [isRetryingPurge, setIsRetryingPurge] = useState(false);
 
@@ -307,37 +306,29 @@ export function Settings() {
         }
     };
 
-    const enableEncryption = async () => {
-        if (securityPassphrase.length < 8) {
-            toast.error("Passphrase must be at least 8 characters");
-            return;
-        }
-        if (securityPassphrase !== securityPassphraseConfirm) {
-            toast.error("Passphrase confirmation does not match");
-            return;
-        }
+    /**
+     * Runs once `EnableEncryption` has turned encryption on, before it shows
+     * the recovery key. Existing uploads are still stored unencrypted, so the
+     * migration has to be kicked off; a failure here is recoverable from the
+     * Resume Migration button and must not interrupt the key hand-off.
+     */
+    /** The user has saved and confirmed the key, so the panel can close. */
+    const handleEncryptionFlowFinished = async () => {
+        setEncryptionFlowOpen(false);
+        await loadSecurityStatus();
+    };
 
-        setIsSaving(true);
+    const handleEncryptionEnabled = async () => {
+        // Keeps the panel mounted: the card is otherwise hidden the moment the
+        // mode reads back as encrypted, which would take the one-time recovery
+        // key off the screen before the user had saved it.
+        setEncryptionFlowOpen(true);
         try {
-            const result = await api.initializeEncryption(securityPassphrase);
-            setGeneratedRecoveryKey(result.recoveryKey);
-            toast.success("Encryption enabled. Save your recovery key now.");
-
-            try {
-                await api.startEncryptionMigration();
-                toast.info("Started background migration of existing uploaded media.");
-                await loadMigrationStatus();
-            } catch (e) {
-                console.warn("Migration start failed:", e);
-            }
-
-            setSecurityPassphrase("");
-            setSecurityPassphraseConfirm("");
-            await loadSecurityStatus();
+            await api.startEncryptionMigration();
+            toast.info("Started background migration of existing uploaded media.");
+            await loadMigrationStatus();
         } catch (e) {
-            toast.error(`Failed to enable encryption: ${errorMessage(e)}`);
-        } finally {
-            setIsSaving(false);
+            console.warn("Migration start failed:", e);
         }
     };
 
@@ -572,48 +563,13 @@ export function Settings() {
                                     </div>
                                 )}
 
-                                {securityStatus?.securityMode !== "encrypted" && (
+                                {(securityStatus?.securityMode !== "encrypted" || encryptionFlowOpen) && (
                                     <div className="space-y-3 rounded-md border p-3">
-                                        <Alert>
-                                            <AlertTitle>Enable Encryption (One-way)</AlertTitle>
-                                            <AlertDescription>
-                                                Once enabled, you cannot switch back to unencrypted mode without a full reset.
-                                            </AlertDescription>
-                                        </Alert>
-                                        <div className="space-y-2">
-                                            <Label htmlFor="security-passphrase">New Passphrase</Label>
-                                            <Input
-                                                id="security-passphrase"
-                                                type="password"
-                                                value={securityPassphrase}
-                                                onChange={(e) => setSecurityPassphrase(e.target.value)}
-                                                placeholder="At least 8 characters"
-                                            />
-                                        </div>
-                                        <div className="space-y-2">
-                                            <Label htmlFor="security-passphrase-confirm">Confirm Passphrase</Label>
-                                            <Input
-                                                id="security-passphrase-confirm"
-                                                type="password"
-                                                value={securityPassphraseConfirm}
-                                                onChange={(e) => setSecurityPassphraseConfirm(e.target.value)}
-                                                placeholder="Repeat passphrase"
-                                            />
-                                        </div>
-                                        <Button onClick={enableEncryption} disabled={isSaving} className="w-full">
-                                            {isSaving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                                            Enable Encryption
-                                        </Button>
-                                    </div>
-                                )}
-
-                                {generatedRecoveryKey && (
-                                    <div className="space-y-2 rounded-md border bg-muted p-3">
-                                        <Label>Recovery Key (shown once)</Label>
-                                        <p className="font-mono text-xs break-all">{generatedRecoveryKey}</p>
-                                        <p className="text-xs text-muted-foreground">
-                                            Save this key securely. It is required if passphrase is lost.
-                                        </p>
+                                        <EnableEncryption
+                                            onEnabled={handleEncryptionEnabled}
+                                            onComplete={handleEncryptionFlowFinished}
+                                            continueLabel="Done"
+                                        />
                                     </div>
                                 )}
                             </CardContent>
