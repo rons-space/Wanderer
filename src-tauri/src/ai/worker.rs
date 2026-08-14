@@ -38,9 +38,9 @@ impl AiWorker {
         let arcface_clone = self.arcface.clone();
         let models_dir_clone = self.models_dir.clone();
 
-        println!("Spawning background thread for ArcFace initialization...");
+        log::info!("Spawning the ArcFace initialization thread");
         std::thread::spawn(move || {
-            println!("ArcFace background thread started.");
+            log::debug!("ArcFace background thread started");
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -49,35 +49,32 @@ impl AiWorker {
 
             let dl_result = rt.block_on(async {
                 let models_dir_path = models_dir_clone.as_path();
-                println!(
-                    "Starting download_arcface_model for path: {:?}",
-                    models_dir_path
-                );
+                log::debug!("Checking for the ArcFace model in {:?}", models_dir_path);
                 crate::ai::download_arcface_model(models_dir_path, |_, current, total| {
                     if current == 0 {
-                        println!("Starting ArcFace download...");
+                        log::info!("Downloading the ArcFace model");
                     }
                     if current % (10 * 1024 * 1024) == 0 {
-                        println!("Downloading ArcFace: {}/{} bytes", current, total);
+                        log::debug!("Downloading ArcFace: {}/{} bytes", current, total);
                     }
                 })
                 .await
             });
 
             if let Err(e) = dl_result {
-                println!("Failed to download ArcFace model: {}", e);
+                log::error!("Failed to download the ArcFace model: {}", e);
             } else {
-                println!("ArcFace model downloaded successfully.");
+                log::info!("ArcFace model downloaded");
             }
 
-            println!("Loading ArcFace model...");
+            log::debug!("Loading the ArcFace model");
             match ArcFace::new(&models_dir_clone) {
                 Ok(model) => {
-                    println!("ArcFace model loaded successfully.");
+                    log::info!("ArcFace model loaded");
                     *arcface_clone.blocking_lock() = Some(model);
                 }
                 Err(e) => {
-                    println!(
+                    log::warn!(
                         "ArcFace model failed to load: {}. Face clustering will be skipped.",
                         e
                     );
@@ -87,7 +84,7 @@ impl AiWorker {
     }
 
     pub async fn run(&self, cancel: CancellationToken) {
-        println!("AI Worker started (run method entered)");
+        log::info!("AI worker started");
 
         let mut tags_model_ready = false;
         let mut arcface_init_started = false;
@@ -96,7 +93,7 @@ impl AiWorker {
         let mut last_face_enabled = false;
         let mut last_tags_enabled = false;
 
-        println!("AI Worker entering main loop...");
+        log::debug!("AI worker entering its main loop");
         loop {
             if cancel.is_cancelled() {
                 log::info!("AI Worker received shutdown signal");
@@ -197,11 +194,13 @@ impl AiWorker {
             };
 
             if let Some(item) = item_opt {
-                println!("AI processing item: {}", item.file_path);
+                // Logged by row id: the file path is the user's own naming of people,
+                // places and events, and this line runs for every item in the library.
+                log::debug!("AI processing media {}", item.id);
 
                 let path = std::path::PathBuf::from(&item.file_path);
                 if !path.exists() {
-                    println!("File not found for AI scan: {:?}", path);
+                    log::warn!("File missing for AI scan, media {}", item.id);
                     let _ = self.db.mark_media_scan_failed(item.id);
                     continue;
                 }
@@ -213,7 +212,7 @@ impl AiWorker {
                     .unwrap_or(false);
 
                 if !is_image {
-                    println!("Skipping non-image item: {}", item.file_path);
+                    log::debug!("Skipping non-image media {}", item.id);
                     let _ = self.db.mark_media_scanned(item.id);
                     continue;
                 }
@@ -232,9 +231,9 @@ impl AiWorker {
                         match result {
                             Ok(detect_res) => match detect_res {
                                 Ok(faces) => {
-                                    println!("Found {} faces in {}", faces.len(), item.file_path);
+                                    log::debug!("Found {} faces in media {}", faces.len(), item.id);
                                     if let Err(e) = self.db.add_faces(item.id, &faces) {
-                                        println!("Failed to save faces to DB: {}", e);
+                                        log::error!("Failed to save faces: {}", e);
                                     }
 
                                     match image::open(&item.file_path) {

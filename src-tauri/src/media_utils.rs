@@ -6,6 +6,84 @@
 use log::{info, warn};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Name of the ffmpeg executable on this platform.
+#[cfg(windows)]
+const FFMPEG_EXE: &str = "ffmpeg.exe";
+#[cfg(not(windows))]
+const FFMPEG_EXE: &str = "ffmpeg";
+
+/// Absolute path to ffmpeg, resolved once per process.
+///
+/// `Command::new("ffmpeg")` resolves the name at spawn time, and on Windows
+/// `CreateProcess` searches the process working directory before `PATH`. Either way an
+/// `ffmpeg.exe` dropped somewhere the user can write runs with Wanderer's privileges
+/// the next time a video is imported. Resolving here means the path is decided once,
+/// from directories chosen deliberately, and the spawn is by absolute path.
+fn ffmpeg_path() -> Option<&'static Path> {
+    static FFMPEG: OnceLock<Option<PathBuf>> = OnceLock::new();
+    FFMPEG
+        .get_or_init(|| {
+            let resolved = resolve_ffmpeg();
+            match &resolved {
+                Some(path) => info!("Using ffmpeg at {:?}", path),
+                None => warn!(
+                    "No ffmpeg found beside the executable or on an absolute PATH entry; \
+                     video thumbnails are disabled"
+                ),
+            }
+            resolved
+        })
+        .as_deref()
+}
+
+fn resolve_ffmpeg() -> Option<PathBuf> {
+    // A copy shipped beside the executable wins: it is inside the installation
+    // directory, which is the only place with the same trust as the binary itself.
+    if let Some(sidecar) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(FFMPEG_EXE)))
+    {
+        if is_executable_file(&sidecar) {
+            return Some(sidecar);
+        }
+    }
+
+    let path_var = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+    find_executable(&dirs, FFMPEG_EXE)
+}
+
+/// First directory holding an executable `name`, ignoring relative entries.
+///
+/// A relative `PATH` entry resolves against whatever the working directory happens to
+/// be, and the empty entry that a stray `;` produces on Windows *is* the working
+/// directory. Neither is a location this process should be taking a binary from.
+fn find_executable(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
+    dirs.iter()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 
 /// Hash a file using Blake3 with streaming to avoid loading entire file into memory.
 ///
@@ -169,18 +247,20 @@ pub async fn generate_video_thumbnail(
         return Ok(Some(thumb_path));
     }
 
+    let Some(ffmpeg) = ffmpeg_path() else {
+        warn!("Skipping video thumbnail: ffmpeg is not available");
+        return Ok(None);
+    };
+
     let source_clone = source_path.to_path_buf();
     let thumb_clone = thumb_path.clone();
 
     let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        // Check if FFmpeg is available
-        let ffmpeg_check = Command::new("ffmpeg").arg("-version").output();
-        if ffmpeg_check.is_err() {
-            return Err("FFmpeg not found in PATH".to_string());
-        }
+        // Resolution above already proved the binary exists and is executable, so the
+        // `-version` probe that used to run here (a process spawn per thumbnail) is gone.
 
         // Extract frame at 1 second mark
-        let output = Command::new("ffmpeg")
+        let output = Command::new(ffmpeg)
             .args([
                 "-ss",
                 "1", // Seek to 1 second
@@ -209,7 +289,7 @@ pub async fn generate_video_thumbnail(
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 // Try extracting from first frame if 1 second seek failed
-                let fallback = Command::new("ffmpeg")
+                let fallback = Command::new(ffmpeg)
                     .args([
                         "-i",
                         &source_clone.to_string_lossy(),
@@ -269,5 +349,97 @@ mod tests {
         assert_eq!(escape_like_pattern("100%"), "100\\%");
         assert_eq!(escape_like_pattern("a_b"), "a\\_b");
         assert_eq!(escape_like_pattern("c:\\path"), "c:\\\\path");
+    }
+
+    /// A directory that removes itself, so the executable-lookup tests leave nothing
+    /// behind in the temp directory.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "wanderer-mediautils-{}-{}-{:?}",
+                name,
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn write_executable(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write fake binary");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn an_executable_is_found_in_an_absolute_directory() {
+        let dir = TempDir::new("found");
+        let expected = dir.write_executable(FFMPEG_EXE);
+
+        assert_eq!(
+            find_executable(&[dir.0.clone()], FFMPEG_EXE),
+            Some(expected)
+        );
+    }
+
+    /// The whole point of the change: a binary reachable only through a relative
+    /// `PATH` entry, which is to say through the working directory, is not used.
+    #[test]
+    fn relative_path_entries_are_ignored() {
+        let dir = TempDir::new("relative");
+        dir.write_executable(FFMPEG_EXE);
+
+        let relative = [
+            PathBuf::from(""),
+            PathBuf::from("."),
+            PathBuf::from("tools"),
+        ];
+        assert_eq!(find_executable(&relative, FFMPEG_EXE), None);
+    }
+
+    #[test]
+    fn the_first_absolute_directory_holding_it_wins() {
+        let first = TempDir::new("first");
+        let second = TempDir::new("second");
+        let expected = first.write_executable(FFMPEG_EXE);
+        second.write_executable(FFMPEG_EXE);
+
+        assert_eq!(
+            find_executable(&[first.0.clone(), second.0.clone()], FFMPEG_EXE),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_directory_is_not_mistaken_for_the_binary() {
+        let dir = TempDir::new("dir-shaped");
+        std::fs::create_dir_all(dir.0.join(FFMPEG_EXE)).expect("create decoy directory");
+
+        assert_eq!(find_executable(&[dir.0.clone()], FFMPEG_EXE), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_file_is_skipped() {
+        let dir = TempDir::new("not-executable");
+        std::fs::write(dir.0.join(FFMPEG_EXE), b"not executable").expect("write file");
+
+        assert_eq!(find_executable(&[dir.0.clone()], FFMPEG_EXE), None);
     }
 }
