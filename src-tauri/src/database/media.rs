@@ -174,6 +174,32 @@ impl Database {
         )
     }
 
+    /// Forget the thumbnails at these paths.
+    ///
+    /// Called before the files are unlinked, never after: a row pointing at a
+    /// file that is gone is a broken thumbnail in the gallery, while a file no
+    /// row points at is just wasted space that the next pass will remove.
+    pub fn clear_thumbnail_paths(&self, paths: &[String]) -> Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        let mut cleared = 0;
+
+        for chunk in paths.chunks(MAX_SQL_VARIABLES) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "UPDATE media SET thumbnail_path = NULL WHERE thumbnail_path IN ({placeholders})"
+            );
+            cleared += tx.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+        }
+
+        tx.commit()?;
+        Ok(cleared)
+    }
+
     pub fn get_media(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
         // Validate and clamp pagination parameters
         let limit = limit.clamp(0, 1000);

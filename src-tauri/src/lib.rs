@@ -16,6 +16,7 @@ mod session_store;
 mod sync_manifest;
 mod sync_worker;
 mod telegram;
+mod thumbnail_cache;
 mod upload_worker;
 mod view_cache;
 mod watcher;
@@ -716,6 +717,25 @@ pub fn run() {
                             view_cache::cleanup_cache(&cache_dir, max_size_bytes, retention_secs)
                         {
                             log::error!("Failed to cleanup view cache: {}", e);
+                        }
+
+                        // Thumbnails are not a view cache: they are referenced by
+                        // `media.thumbnail_path`, so they are bounded by size alone
+                        // (an old thumbnail is not stale) and every removal has to
+                        // clear the column with it.
+                        let thumb_budget_mb = db_for_cleanup
+                            .get_config("cache_size_mb")
+                            .unwrap_or(None)
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(5000);
+                        let thumb_dir = app_dir.join("cache").join("thumbnails");
+
+                        if let Err(e) = thumbnail_cache::enforce_budget(
+                            &db_for_cleanup,
+                            &thumb_dir,
+                            thumb_budget_mb * 1024 * 1024,
+                        ) {
+                            log::error!("Failed to bound the thumbnail cache: {}", e);
                         }
                     });
                 }
