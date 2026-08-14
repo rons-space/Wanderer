@@ -36,7 +36,10 @@ const TEXTUAL_MODEL_CANDIDATES: &[&str] = &[TEXTUAL_MODEL_NAME, LEGACY_TEXTUAL_M
 type RunnableModel = tract_onnx::prelude::SimplePlan<
     tract_onnx::prelude::TypedFact,
     Box<dyn tract_onnx::prelude::TypedOp>,
-    tract_onnx::prelude::Graph<tract_onnx::prelude::TypedFact, Box<dyn tract_onnx::prelude::TypedOp>>,
+    tract_onnx::prelude::Graph<
+        tract_onnx::prelude::TypedFact,
+        Box<dyn tract_onnx::prelude::TypedOp>,
+    >,
 >;
 
 /// Static storage for loaded models
@@ -81,14 +84,19 @@ impl tract_onnx::tract_hir::ops::expandable::Expansion for ClipRange {
         s.equals(&inputs[1].rank, 0)?;
         s.equals(&inputs[2].rank, 0)?;
         s.equals(&outputs[0].rank, 1)?;
-        s.given_3(&inputs[0].value, &inputs[1].value, &inputs[2].value, move |s, v0, v1, v2| {
-            let v0 = v0.cast_to::<TDim>()?;
-            let v1 = v1.cast_to::<TDim>()?;
-            let v2 = v2.cast_to::<i64>()?;
-            let out = (v1.to_scalar::<TDim>()?.clone() - v0.to_scalar::<TDim>()?)
-                .divceil(*v2.to_scalar::<i64>()? as _);
-            s.equals(&outputs[0].shape[0], out)
-        })?;
+        s.given_3(
+            &inputs[0].value,
+            &inputs[1].value,
+            &inputs[2].value,
+            move |s, v0, v1, v2| {
+                let v0 = v0.cast_to::<TDim>()?;
+                let v1 = v1.cast_to::<TDim>()?;
+                let v2 = v2.cast_to::<i64>()?;
+                let out = (v1.to_scalar::<TDim>()?.clone() - v0.to_scalar::<TDim>()?)
+                    .divceil(*v2.to_scalar::<i64>()? as _);
+                s.equals(&outputs[0].shape[0], out)
+            },
+        )?;
         Ok(())
     }
 
@@ -120,7 +128,10 @@ impl tract_onnx::tract_hir::ops::expandable::Expansion for ClipRange {
 fn clip_onnx() -> tract_onnx::Onnx {
     let mut onnx = tract_onnx::onnx();
     onnx.op_register.insert("Range", |_, _| {
-        Ok((tract_onnx::tract_hir::ops::expandable::expand(ClipRange), vec![]))
+        Ok((
+            tract_onnx::tract_hir::ops::expandable::expand(ClipRange),
+            vec![],
+        ))
     });
     onnx
 }

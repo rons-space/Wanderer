@@ -2,10 +2,8 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
 use argon2::{
-    password_hash::{
-        rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-    },
-    Argon2, Algorithm, Params, Version,
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Algorithm, Argon2, Params, Version,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
@@ -174,10 +172,7 @@ impl SecurityBundle {
         Ok((next, master_key))
     }
 
-    pub fn regenerate_recovery_key(
-        &self,
-        passphrase: &str,
-    ) -> Result<(Self, String, [u8; 32])> {
+    pub fn regenerate_recovery_key(&self, passphrase: &str) -> Result<(Self, String, [u8; 32])> {
         let master_key = self.unlock_with_passphrase(passphrase)?;
         let new_recovery_key = generate_recovery_key();
         let wrap = wrap_master_key_with_secret(new_recovery_key.as_bytes(), &master_key)?;
@@ -510,10 +505,10 @@ pub fn decrypt_file_if_needed(
 
 #[cfg(target_os = "windows")]
 pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
         CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
-    use windows_sys::Win32::Foundation::LocalFree;
 
     let mut in_blob = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -538,8 +533,8 @@ pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("CryptProtectData failed"));
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }
-        .to_vec();
+    let bytes =
+        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();
     unsafe {
         let _ = LocalFree(out_blob.pbData as _);
     }
@@ -574,8 +569,8 @@ pub fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("CryptUnprotectData failed"));
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }
-        .to_vec();
+    let bytes =
+        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();
 
     unsafe {
         if !out_blob.pbData.is_null() {
@@ -628,8 +623,8 @@ mod tests {
 
     #[test]
     fn security_bundle_encrypt_unlock_roundtrip() {
-        let (bundle, _, _) = SecurityBundle::new_encrypted("correct horse battery staple")
-            .expect("bundle");
+        let (bundle, _, _) =
+            SecurityBundle::new_encrypted("correct horse battery staple").expect("bundle");
         let key = bundle
             .unlock_with_passphrase("correct horse battery staple")
             .expect("unlock");
@@ -642,7 +637,9 @@ mod tests {
         let (bundle, recovery_key, key) =
             SecurityBundle::new_encrypted("correct horse battery staple").expect("bundle");
         assert_eq!(
-            bundle.unlock_with_recovery_key(&recovery_key).expect("unlock"),
+            bundle
+                .unlock_with_recovery_key(&recovery_key)
+                .expect("unlock"),
             key
         );
         assert!(bundle.unlock_with_recovery_key("WRONG-KEY").is_err());

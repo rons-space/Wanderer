@@ -143,7 +143,8 @@ impl AiWorker {
                 if should_attempt_download {
                     last_tags_model_attempt = Some(Instant::now());
 
-                    tags_model_ready = object_detection::ensure_model_loaded(&self.models_dir).is_ok();
+                    tags_model_ready =
+                        object_detection::ensure_model_loaded(&self.models_dir).is_ok();
 
                     if !tags_model_ready {
                         log::info!(
@@ -238,7 +239,9 @@ impl AiWorker {
 
                                     match image::open(&item.file_path) {
                                         Ok(img) => {
-                                            if let Ok(db_faces) = self.db.get_all_faces_for_media(item.id) {
+                                            if let Ok(db_faces) =
+                                                self.db.get_all_faces_for_media(item.id)
+                                            {
                                                 let arcface_clone = self.arcface.clone();
                                                 let img_clone = img.clone();
                                                 let db_clone = self.db.clone();
@@ -296,7 +299,10 @@ impl AiWorker {
                                             }
                                         }
                                         Err(e) => {
-                                            log::warn!("Failed to reopen image for embedding: {}", e)
+                                            log::warn!(
+                                                "Failed to reopen image for embedding: {}",
+                                                e
+                                            )
                                         }
                                     }
                                 }

@@ -25,11 +25,7 @@ static CLASSIFIER: OnceLock<
 > = OnceLock::new();
 
 const PRIMARY_MODEL_NAME: &str = "mobilenet_v2.onnx";
-const MODEL_ALIASES: &[&str] = &[
-    "MobileNetV2.onnx",
-    "mobilenetv2.onnx",
-    "mobilenet-v2.onnx",
-];
+const MODEL_ALIASES: &[&str] = &["MobileNetV2.onnx", "mobilenetv2.onnx", "mobilenet-v2.onnx"];
 
 /// ImageNet class labels (top 100 most useful for photo tagging)
 const IMAGENET_LABELS: &[&str] = &[
@@ -318,11 +314,7 @@ where
     let mut last_error = String::new();
 
     for (idx, url) in urls.iter().enumerate() {
-        log::info!(
-            "Downloading MobileNet V2 from mirror {}: {}",
-            idx + 1,
-            url
-        );
+        log::info!("Downloading MobileNet V2 from mirror {}: {}", idx + 1, url);
 
         match download_from_url(
             &client,
@@ -437,8 +429,7 @@ where
         ));
     }
 
-    std::fs::rename(&temp_path, model_path)
-        .map_err(|e| format!("Failed to rename file: {}", e))?;
+    std::fs::rename(&temp_path, model_path).map_err(|e| format!("Failed to rename file: {}", e))?;
     Ok(())
 }
 

@@ -1168,7 +1168,10 @@ impl Database {
 
     pub fn mark_media_encrypted_by_id(&self, media_id: i64) -> Result<usize> {
         let conn = self.get_conn()?;
-        conn.execute("UPDATE media SET is_encrypted = 1 WHERE id = ?1", [media_id])
+        conn.execute(
+            "UPDATE media SET is_encrypted = 1 WHERE id = ?1",
+            [media_id],
+        )
     }
 
     pub fn get_uploaded_unencrypted_media(
@@ -2456,7 +2459,10 @@ impl Database {
         let mut updated = 0usize;
         for (media_id, file_path) in candidates {
             if !Path::new(&file_path).exists() {
-                conn.execute("UPDATE media SET is_cloud_only = 1 WHERE id = ?1", [media_id])?;
+                conn.execute(
+                    "UPDATE media SET is_cloud_only = 1 WHERE id = ?1",
+                    [media_id],
+                )?;
                 updated += 1;
             }
         }
