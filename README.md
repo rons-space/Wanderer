@@ -31,12 +31,19 @@ Done. Your Telegram backup is running. ✅
 
 If you are not technical, use a prebuilt release.
 
-- Releases page (all versions): [Wander(er) Releases](https://github.com/ronimuliawan/Wanderer/releases)
-- Direct download (Windows x64, v0.0.0): [Wanderer._0.0.0_x64-setup.exe](https://github.com/ronimuliawan/Wanderer/releases/download/0.0.0/Wanderer._0.0.0_x64-setup.exe)
-- Direct download (Windows x64, latest): [Wanderer._0.0.0_x64-setup.exe (latest link)](https://github.com/ronimuliawan/Wanderer/releases/latest/download/Wanderer._0.0.0_x64-setup.exe)
+Every download comes from this repository, `rons-space/Wanderer`, and nowhere else:
 
-1. Download the installer
+- Latest release: <https://github.com/rons-space/Wanderer/releases/latest>
+- All releases: <https://github.com/rons-space/Wanderer/releases>
+
+1. Open the latest release and download the Windows x64 `-setup.exe` asset
 2. Install and open Wander(er)
+
+> [!WARNING]
+> The installer is not code signed, so Windows SmartScreen will warn you about an
+> unknown publisher. Check the address bar says `github.com/rons-space/Wanderer`
+> before you download. If you found a Wander(er) installer anywhere else, it did
+> not come from this project.
 
 If you are running from source, see `For Developers (Optional)` at the bottom.
 
@@ -182,9 +189,17 @@ To restore later:
   passphrase or your recovery key. The header exposes no secret: without one of
   those two, it is Argon2id-wrapped key material and nothing else.
 
-> **Older `.db.wbenc` backups cannot be restored.** They were encrypted with the
-> master key while the only copy of that key stayed behind in `library.db`. If
-> you have one, keep your current `library.db` safe and take a fresh backup.
+> [!IMPORTANT]
+> **If you were using encrypted mode before v0.1.0, keep a copy of `library.db`.**
+> Older `.db.wbenc` backups cannot be restored: they were encrypted with the master
+> key while the only copy of that key stayed behind in `library.db`, so that file is
+> the only thing standing between you and an unreadable library. Copy it somewhere
+> safe, then take a fresh `.wbak` backup, which does not have this problem.
+
+Restoring a `.wbak` on a new machine is a backend command today, not a button in
+onboarding, which is tracked in
+[#70](https://github.com/rons-space/Wanderer/issues/70). Until that ships, treat the
+backup as the thing that makes recovery possible rather than as a one-click restore.
 
 ---
 
