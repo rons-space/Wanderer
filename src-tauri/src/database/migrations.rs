@@ -583,6 +583,87 @@ impl Database {
             version = 20;
         }
 
+        if version < 21 {
+            // Migration 21: one row per local file, enforced by the schema.
+            //
+            // Migration 20 indexed `media.file_path` but deliberately left the index
+            // non-unique, because a library that already held two rows for one path
+            // would have failed the migration and left the application unable to
+            // start. That deferred the question rather than answering it: until now
+            // `update_telegram_id_by_path` and the other path-keyed writes have
+            // silently updated whichever row SQLite reached first.
+            //
+            // Duplicates are collapsed rather than deleted. The survivor is the row
+            // that has a Telegram copy, since that is the one the cloud and the sync
+            // manifest already refer to, and the oldest row otherwise. Album
+            // memberships, faces and tags are moved onto the survivor instead of
+            // being cascaded away with the row they hung off, and the survivor
+            // adopts a hash, a thumbnail or a Telegram id that it lacks and a loser
+            // had. The upload queue is keyed by path rather than by media id, so it
+            // needs no repointing.
+            //
+            // A loser's thumbnail file is left on disk when the survivor already had
+            // one of its own. Deleting files is what made the old thumbnail cache
+            // dangerous (#13), and an orphaned 20 KB JPEG is a far smaller problem
+            // than a migration that unlinks something still referenced.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TEMP TABLE media_dedupe AS
+                 SELECT
+                     dupe.id AS loser,
+                     (
+                         SELECT keep.id FROM media keep
+                         WHERE keep.file_path = dupe.file_path
+                         ORDER BY (keep.telegram_media_id IS NULL), keep.id
+                         LIMIT 1
+                     ) AS keeper,
+                     dupe.file_hash AS loser_hash,
+                     dupe.thumbnail_path AS loser_thumbnail,
+                     dupe.telegram_media_id AS loser_telegram
+                 FROM media dupe;
+                 DELETE FROM media_dedupe WHERE loser = keeper;
+
+                 -- OR IGNORE because the survivor may already be in the same album
+                 -- or carry the same tag; the leftover rows go with the loser below.
+                 UPDATE OR IGNORE album_media
+                     SET media_id = (SELECT keeper FROM media_dedupe WHERE loser = media_id)
+                     WHERE media_id IN (SELECT loser FROM media_dedupe);
+                 UPDATE OR IGNORE media_tags
+                     SET media_id = (SELECT keeper FROM media_dedupe WHERE loser = media_id)
+                     WHERE media_id IN (SELECT loser FROM media_dedupe);
+                 UPDATE faces
+                     SET media_id = (SELECT keeper FROM media_dedupe WHERE loser = media_id)
+                     WHERE media_id IN (SELECT loser FROM media_dedupe);
+
+                 DELETE FROM media WHERE id IN (SELECT loser FROM media_dedupe);
+
+                 -- After the delete, so adopting a hash cannot collide with the row
+                 -- it is being adopted from: file_hash is UNIQUE.
+                 UPDATE media SET
+                     file_hash = COALESCE(file_hash, (
+                         SELECT loser_hash FROM media_dedupe
+                         WHERE keeper = media.id AND loser_hash IS NOT NULL LIMIT 1
+                     )),
+                     thumbnail_path = COALESCE(thumbnail_path, (
+                         SELECT loser_thumbnail FROM media_dedupe
+                         WHERE keeper = media.id AND loser_thumbnail IS NOT NULL LIMIT 1
+                     )),
+                     telegram_media_id = COALESCE(telegram_media_id, (
+                         SELECT loser_telegram FROM media_dedupe
+                         WHERE keeper = media.id AND loser_telegram IS NOT NULL LIMIT 1
+                     ))
+                 WHERE id IN (SELECT keeper FROM media_dedupe);
+
+                 DROP TABLE media_dedupe;
+
+                 DROP INDEX IF EXISTS idx_media_file_path;
+                 CREATE UNIQUE INDEX idx_media_file_path ON media(file_path);
+                 PRAGMA user_version = 21;
+                 COMMIT;",
+            )?;
+            version = 21;
+        }
+
         // Rows left in `uploading` by a process that died mid-transfer are invisible to
         // `get_next_pending_item` forever, so the file silently never uploads. Nothing
         // can legitimately be uploading at startup, before any worker has run.
