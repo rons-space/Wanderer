@@ -2,11 +2,14 @@ use grammers_client::client::{LoginToken, UpdatesConfiguration};
 use grammers_client::message::InputMessage;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
-use grammers_session::storages::SqliteSession;
 use log::info;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use crate::secret_store::SecretStore;
+use crate::security::MasterKey;
+use crate::session_store::EncryptedSession;
 
 /// Error type for upload operations supporting rate limit detection
 #[derive(Debug)]
@@ -94,7 +97,21 @@ impl TelegramService {
         self.credentials.lock().await.is_some()
     }
 
-    pub async fn connect(&self, app_data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn is_connected(&self) -> bool {
+        self.client.lock().await.is_some()
+    }
+
+    /// Connect, unsealing the stored session first.
+    ///
+    /// `master_key` is what the vault currently holds. On Windows it is unused, since
+    /// DPAPI needs nothing unlocked; elsewhere it is the only thing that can open the
+    /// session, so a locked or unencrypted library fails here with an explanation
+    /// rather than falling back to storing the account key in the clear.
+    pub async fn connect(
+        &self,
+        app_data_dir: PathBuf,
+        master_key: Option<MasterKey>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (api_id, _api_hash) = self
             .credentials
             .lock()
@@ -102,14 +119,14 @@ impl TelegramService {
             .clone()
             .ok_or("Telegram API credentials not configured")?;
 
-        let session_path = app_data_dir.join("session.db");
-        info!(
-            "Connecting to Telegram using session at: {:?}",
-            session_path
-        );
-
         // 1. Initialize Session
-        let session = SqliteSession::open(session_path)?;
+        let store = SecretStore::for_session(master_key).map_err(|e| format!("{:#}", e))?;
+        info!(
+            "Connecting to Telegram with a session sealed by {}",
+            store.describe()
+        );
+        let session =
+            EncryptedSession::open(&app_data_dir, store).map_err(|e| format!("{:#}", e))?;
 
         // 2. Initialize SenderPool
         let session_handle = Arc::new(session);
@@ -153,13 +170,14 @@ impl TelegramService {
         &self,
         phone: &str,
         app_data_dir: PathBuf,
+        master_key: Option<MasterKey>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Reconnect if client is missing (e.g. after logout)
         let needs_connect = { self.client.lock().await.is_none() };
 
         if needs_connect {
             info!("Client not connected, re-initializing...");
-            self.connect(app_data_dir).await?;
+            self.connect(app_data_dir, master_key).await?;
         }
 
         let client_guard = self.client.lock().await;
@@ -478,29 +496,30 @@ impl TelegramService {
             handle.abort();
         }
 
-        // 4. Delete Session File
-        let session_path = app_data_dir.join("session.db");
-        if session_path.exists() {
-            for i in 0..5 {
-                match tokio::fs::remove_file(&session_path).await {
-                    Ok(_) => {
-                        info!("Deleted session file: {:?}", session_path);
-                        break;
-                    }
-                    Err(e) => {
-                        if i == 4 {
-                            return Err(format!(
-                                "Failed to delete session file after retries: {}",
-                                e
-                            ));
-                        }
-                        log::warn!(
-                            "Failed to delete session file (attempt {}): {}. Retrying...",
-                            i + 1,
-                            e
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    }
+        // 4. Delete the session, sealed or legacy plaintext.
+        //
+        // Retried, because the runner task above is aborted rather than joined and
+        // Windows refuses to unlink a file another handle still holds. Logout that
+        // leaves the account key on disk is the one outcome worth retrying for.
+        for attempt in 0..5 {
+            match EncryptedSession::remove(&app_data_dir) {
+                Ok(()) => {
+                    info!("Deleted the stored Telegram session");
+                    break;
+                }
+                Err(e) if attempt == 4 => {
+                    return Err(format!(
+                        "Failed to delete the Telegram session after retries: {:#}",
+                        e
+                    ));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to delete the Telegram session (attempt {}): {:#}. Retrying...",
+                        attempt + 1,
+                        e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
             }
         }

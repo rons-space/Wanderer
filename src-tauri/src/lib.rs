@@ -9,7 +9,9 @@ mod model_integrity;
 mod paths;
 mod progress_stream;
 mod raw_support;
+mod secret_store;
 mod security;
+mod session_store;
 mod sync_manifest;
 mod sync_worker;
 mod telegram;
@@ -415,8 +417,35 @@ async fn initialize_encryption(
     })
 }
 
+/// Connect Telegram now that the vault holds a master key.
+///
+/// Outside Windows the session file is sealed with that key, so startup cannot open it
+/// while the library is locked and unlocking is the first moment a connection becomes
+/// possible. Best effort by design: the user asked to unlock, not to go online, and a
+/// network or session failure must not turn a successful unlock into an error.
+async fn connect_telegram_after_unlock(state: &State<'_, AppState>, app: &tauri::AppHandle) {
+    if !state.telegram.has_credentials().await || state.telegram.is_connected().await {
+        return;
+    }
+    let app_dir = match resolve_app_data_dir(app) {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::warn!("Cannot connect to Telegram after unlock: {}", e);
+            return;
+        }
+    };
+    let master_key = state.security_runtime.lock().await.master_key.clone();
+    if let Err(e) = state.telegram.connect(app_dir, master_key).await {
+        log::warn!("Failed to connect to Telegram after unlock: {}", e);
+    }
+}
+
 #[tauri::command]
-async fn unlock_encryption(passphrase: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn unlock_encryption(
+    passphrase: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let passphrase = Zeroizing::new(passphrase);
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -430,6 +459,7 @@ async fn unlock_encryption(passphrase: String, state: State<'_, AppState>) -> Re
         .map_err(|e| e.to_string())?;
     drop(db_guard);
     state.security_runtime.lock().await.master_key = Some(key);
+    connect_telegram_after_unlock(&state, &app).await;
     Ok(())
 }
 
@@ -452,6 +482,7 @@ async fn recover_encryption(
     recovery_key: String,
     new_passphrase: String,
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let recovery_key = Zeroizing::new(recovery_key);
     let new_passphrase = Zeroizing::new(new_passphrase);
@@ -465,6 +496,7 @@ async fn recover_encryption(
     save_security_bundle(db, &next_bundle)?;
     drop(db_guard);
     state.security_runtime.lock().await.master_key = Some(key);
+    connect_telegram_after_unlock(&state, &app).await;
     Ok(())
 }
 
@@ -746,8 +778,13 @@ async fn login_request_code(
         );
     }
     let app_dir = resolve_app_data_dir(&app)?;
+    let master_key = state.security_runtime.lock().await.master_key.clone();
 
-    match state.telegram.request_code(&phone, app_dir).await {
+    match state
+        .telegram
+        .request_code(&phone, app_dir, master_key)
+        .await
+    {
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string()),
     }
@@ -1189,8 +1226,13 @@ pub fn run() {
 
                 // Connect Telegram only when BYOK credentials are configured.
                 if state.telegram.has_credentials().await {
-                    if let Err(e) = state.telegram.connect(app_dir.clone()).await {
-                        eprintln!("Failed to connect to Telegram: {}", e);
+                    // Windows ignores this: DPAPI opens the session with nothing
+                    // unlocked. Elsewhere an encrypted library that has not been
+                    // unlocked yet cannot unseal the session, so this fails and
+                    // `unlock_encryption` connects instead once the key exists.
+                    let master_key = state.security_runtime.lock().await.master_key.clone();
+                    if let Err(e) = state.telegram.connect(app_dir.clone(), master_key).await {
+                        log::warn!("Not connecting to Telegram yet: {}", e);
                     }
                 } else {
                     log::info!("Telegram API credentials not configured yet; skipping connect");

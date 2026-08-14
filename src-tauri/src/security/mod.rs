@@ -821,8 +821,19 @@ pub fn decrypt_file_if_needed(
     Ok(true)
 }
 
+/// Protect `data` with DPAPI, optionally mixing in secondary entropy.
+///
+/// Entropy is a second input the caller must present again to unprotect. Without it,
+/// any process running as the same user can hand a stolen blob straight back to
+/// `CryptUnprotectData`. Existing blobs were written without it, which is why this is
+/// a parameter and not a constant: an empty slice reproduces the old behaviour
+/// exactly, so those blobs keep opening.
 #[cfg(target_os = "windows")]
-pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
+pub fn dpapi_protect_with_entropy(
+    data: &[u8],
+    description: &str,
+    entropy: &[u8],
+) -> Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
         CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -835,11 +846,21 @@ pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
     let mut out_blob = CRYPT_INTEGER_BLOB::default();
     let description_utf16: Vec<u16> = description.encode_utf16().chain(Some(0)).collect();
 
+    let mut entropy_blob = CRYPT_INTEGER_BLOB {
+        cbData: entropy.len() as u32,
+        pbData: entropy.as_ptr() as *mut u8,
+    };
+    let entropy_ptr = if entropy.is_empty() {
+        std::ptr::null()
+    } else {
+        &mut entropy_blob as *const CRYPT_INTEGER_BLOB
+    };
+
     let ok = unsafe {
         CryptProtectData(
             &mut in_blob,
             description_utf16.as_ptr(),
-            std::ptr::null(),
+            entropy_ptr,
             std::ptr::null_mut(),
             std::ptr::null(),
             CRYPTPROTECT_UI_FORBIDDEN,
@@ -860,7 +881,7 @@ pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(target_os = "windows")]
-pub fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
+pub fn dpapi_unprotect_with_entropy(data: &[u8], entropy: &[u8]) -> Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
@@ -871,11 +892,21 @@ pub fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
     let mut out_blob = CRYPT_INTEGER_BLOB::default();
     let mut desc_out: windows_sys::core::PWSTR = std::ptr::null_mut();
 
+    let mut entropy_blob = CRYPT_INTEGER_BLOB {
+        cbData: entropy.len() as u32,
+        pbData: entropy.as_ptr() as *mut u8,
+    };
+    let entropy_ptr = if entropy.is_empty() {
+        std::ptr::null()
+    } else {
+        &mut entropy_blob as *const CRYPT_INTEGER_BLOB
+    };
+
     let ok = unsafe {
         CryptUnprotectData(
             &mut in_blob,
             &mut desc_out,
-            std::ptr::null(),
+            entropy_ptr,
             std::ptr::null_mut(),
             std::ptr::null(),
             0,
@@ -902,17 +933,34 @@ pub fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn dpapi_protect(_data: &[u8], _description: &str) -> Result<Vec<u8>> {
+pub fn dpapi_protect_with_entropy(
+    _data: &[u8],
+    _description: &str,
+    _entropy: &[u8],
+) -> Result<Vec<u8>> {
     Err(anyhow!(
         "DPAPI secure storage is only supported on Windows in this build"
     ))
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn dpapi_unprotect(_data: &[u8]) -> Result<Vec<u8>> {
+pub fn dpapi_unprotect_with_entropy(_data: &[u8], _entropy: &[u8]) -> Result<Vec<u8>> {
     Err(anyhow!(
         "DPAPI secure storage is only supported on Windows in this build"
     ))
+}
+
+/// Entropy-free DPAPI, for the credential blobs that were written that way.
+///
+/// New callers should pass entropy. Rewrapping the existing `api_id`/`api_hash` blob
+/// means reading it with the old shape and writing it back with the new one, which is
+/// its own change with its own failure mode, so it is not folded in here.
+pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
+    dpapi_protect_with_entropy(data, description, &[])
+}
+
+pub fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
+    dpapi_unprotect_with_entropy(data, &[])
 }
 
 pub fn serialize_and_protect<T: Serialize>(value: &T, description: &str) -> Result<String> {
