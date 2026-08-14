@@ -26,6 +26,13 @@ impl ArcFace {
             ));
         }
 
+        // Verified here rather than only at download time, because this is the last
+        // point before the bytes reach the ONNX parser, and the file could have been
+        // replaced on disk since it was fetched.
+        crate::model_integrity::ARCFACE
+            .verify(&model_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
         let model = tract_onnx::onnx()
             .model_for_path(&model_path)?
             // ArcFace input: 112x112

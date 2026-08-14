@@ -1,3 +1,4 @@
+use crate::model_integrity::ARCFACE;
 use image::GenericImageView;
 use ndarray::{Array4, Axis, Ix2};
 use std::io::Cursor;
@@ -220,21 +221,15 @@ where
     let model_path = models_dir.join("w600k_r50.onnx");
 
     if model_path.exists() {
-        // Check size
-        let metadata = std::fs::metadata(&model_path).map_err(|e| e.to_string())?;
-        if metadata.len() > 100_000_000 {
-            // > 100 MB
-            log::info!(
-                "ArcFace model already exists and looks valid ({} bytes)",
-                metadata.len()
-            );
-            return Ok(());
-        } else {
-            log::warn!(
-                "ArcFace model exists but is too small ({} bytes). Deleting and re-downloading...",
-                metadata.len()
-            );
-            std::fs::remove_file(&model_path).map_err(|e| e.to_string())?;
+        // A size threshold used to stand in for a real check here, which accepted any
+        // file over 100 MB. Verify the pin instead, and re-download anything that fails
+        // rather than trusting what is on disk.
+        match ARCFACE.verify_or_remove(&model_path) {
+            Ok(()) => {
+                log::info!("ArcFace model already present and verified");
+                return Ok(());
+            }
+            Err(e) => log::warn!("Discarding the existing ArcFace model: {}", e),
         }
     }
 
@@ -252,10 +247,19 @@ where
         );
 
         match download_from_url(&client, url, &model_path, progress_callback.clone()).await {
-            Ok(_) => {
-                log::info!("ArcFace download complete from URL {}", i + 1);
-                return Ok(());
-            }
+            Ok(_) => match ARCFACE.verify_or_remove(&model_path) {
+                Ok(()) => {
+                    log::info!("ArcFace download complete and verified from URL {}", i + 1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Treated like any other mirror failure: a mirror that no longer
+                    // serves the pinned bytes is a mirror we move on from.
+                    log::warn!("URL {} served an unexpected ArcFace model: {}", i + 1, e);
+                    last_error = e;
+                    continue;
+                }
+            },
             Err(e) => {
                 log::warn!("Failed to download from URL {}: {}", i + 1, e);
                 last_error = e;

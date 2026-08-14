@@ -5,6 +5,7 @@ mod database;
 mod errors;
 mod media_utils;
 mod metadata;
+mod model_integrity;
 mod paths;
 mod progress_stream;
 mod raw_support;

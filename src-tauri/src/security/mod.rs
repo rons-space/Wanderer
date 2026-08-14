@@ -700,4 +700,73 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Two fixtures for the tamper tests: a multi-chunk `.wbenc` and its plaintext.
+    fn sealed_fixture(name: &str) -> (std::path::PathBuf, [u8; 32], Vec<u8>) {
+        let dir =
+            std::env::temp_dir().join(format!("wanderer-sec-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let plain = dir.join("plain.bin");
+        let sealed = dir.join("sealed.wbenc");
+
+        // Larger than one chunk, so truncation and tampering can be aimed at a chunk
+        // boundary rather than at the header.
+        let contents: Vec<u8> = (0..(DEFAULT_CHUNK_SIZE as usize * 2 + 77))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&plain, &contents).expect("write");
+
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        encrypt_file(&plain, &sealed, &key).expect("encrypt");
+
+        (sealed, key, contents)
+    }
+
+    /// A `.wbenc` cut short must fail rather than yielding the prefix it can decrypt.
+    /// Returning partial plaintext would be worse than failing: the caller cannot tell
+    /// a complete file from a truncated one, and a truncated media file looks like a
+    /// corrupt photo rather than an integrity failure.
+    #[test]
+    fn truncated_ciphertext_is_rejected() {
+        let (sealed, key, contents) = sealed_fixture("truncated");
+        let dir = sealed.parent().unwrap().to_path_buf();
+
+        let full = std::fs::read(&sealed).expect("read sealed");
+        // Drop the final chunk, keeping the header and the first chunk intact.
+        let cut = full.len() - (contents.len() / 2);
+        std::fs::write(&sealed, &full[..cut]).expect("truncate");
+
+        let out = dir.join("out.bin");
+        assert!(
+            decrypt_file(&sealed, &out, &key).is_err(),
+            "a truncated archive decrypted successfully"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Flipping a bit inside a chunk must fail the AEAD tag, not surface as altered
+    /// plaintext.
+    #[test]
+    fn tampered_chunk_is_rejected() {
+        let (sealed, key, _) = sealed_fixture("tampered");
+        let dir = sealed.parent().unwrap().to_path_buf();
+
+        let mut bytes = std::fs::read(&sealed).expect("read sealed");
+        // magic (6) + version (1) + chunk size (4) + base nonce (12), then the
+        // 4-byte length of the first chunk: anything past that is ciphertext.
+        const HEADER_LEN: usize = 6 + 1 + 4 + 12 + 4;
+        let target = HEADER_LEN + 64;
+        bytes[target] ^= 0b0000_0001;
+        std::fs::write(&sealed, &bytes).expect("write tampered");
+
+        let out = dir.join("out.bin");
+        assert!(
+            decrypt_file(&sealed, &out, &key).is_err(),
+            "a tampered chunk decrypted successfully"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

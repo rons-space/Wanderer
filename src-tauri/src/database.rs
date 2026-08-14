@@ -363,7 +363,7 @@ impl Database {
                  PRAGMA user_version = 5;
                  COMMIT;",
             )?;
-            // version = 5;
+            version = 5;
         }
 
         if version < 6 {
@@ -398,6 +398,7 @@ impl Database {
                  PRAGMA user_version = 7;
                  COMMIT;",
             )?;
+            version = 7;
         }
 
         // Migration 8: Add is_archived column for Archive feature
@@ -409,6 +410,7 @@ impl Database {
                  PRAGMA user_version = 8;
                  COMMIT;",
             )?;
+            version = 8;
         }
 
         // Migration 9: Add is_cloud_only column for Cloud-Only mode
@@ -419,6 +421,7 @@ impl Database {
                  PRAGMA user_version = 9;
                  COMMIT;",
             )?;
+            version = 9;
         }
 
         // Migration 10: Add clip_embedding and clip_status
@@ -430,6 +433,7 @@ impl Database {
                  PRAGMA user_version = 10;
                  COMMIT;",
             )?;
+            version = 10;
         }
 
         // Migration 11: Add tags and media_tags tables for object detection
@@ -453,6 +457,7 @@ impl Database {
                  PRAGMA user_version = 11;
                  COMMIT;",
             )?;
+            version = 11;
         }
 
         // Migration 12: Add embedding to faces and create persons table (FR-6)
@@ -501,6 +506,7 @@ impl Database {
                  PRAGMA user_version = 12;
                  COMMIT;",
             )?;
+            version = 12;
         }
 
         // Migration 13: Fix foreign key in persons table (rowid -> id)
@@ -524,6 +530,7 @@ impl Database {
                  COMMIT;
                  PRAGMA foreign_keys = ON;",
             )?;
+            version = 13;
         }
         if version < 14 {
             // Migration 14: Repair 'faces' table FK pointing to 'people' (should be 'persons')
@@ -554,13 +561,22 @@ impl Database {
         }
 
         if version < 15 {
-            // Migration 15: Cleanup ghost persons (created during failed FK runs)
+            // Migration 15: Cleanup ghost persons (created during failed FK runs).
+            //
+            // The EXISTS guard is load-bearing. `NOT IN` against an empty subquery is
+            // true for every row, so without it this deletes every named person on any
+            // library where no face has been assigned one yet, which is the normal
+            // state for a user who has not run face detection. The guard makes the
+            // statement a no-op in exactly that case, and leaves the intended cleanup
+            // untouched once at least one assignment exists.
             conn.execute_batch(
-                 "BEGIN;
-                  DELETE FROM persons WHERE id NOT IN (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL);
+                "BEGIN;
+                  DELETE FROM persons
+                  WHERE EXISTS (SELECT 1 FROM faces WHERE person_id IS NOT NULL)
+                    AND id NOT IN (SELECT person_id FROM faces WHERE person_id IS NOT NULL);
                   PRAGMA user_version = 15;
                   COMMIT;",
-             )?;
+            )?;
             version = 15;
         }
 
@@ -3312,5 +3328,185 @@ impl Database {
 
         let tags_iter = stmt.query_map([media_id], |row| row.get(0))?;
         tags_iter.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The schema version the chain is expected to reach. Update this together with a
+    /// new migration, which is the point: forgetting makes the test fail loudly here
+    /// rather than quietly at a user's next startup.
+    const CURRENT_SCHEMA_VERSION: i32 = 19;
+
+    fn migrated() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        Database::migrate(&conn).expect("migration chain should run on an empty database");
+        conn
+    }
+
+    fn user_version(conn: &Connection) -> i32 {
+        conn.query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        names
+    }
+
+    #[test]
+    fn migrating_from_empty_reaches_the_current_version() {
+        let conn = migrated();
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    /// Every block assigns the local `version` after its `PRAGMA user_version`. When
+    /// they disagree, the chain still happens to work in one direction and breaks the
+    /// next time a migration is inserted, so assert they agree rather than waiting.
+    #[test]
+    fn running_the_chain_twice_is_a_no_op() {
+        let conn = migrated();
+        let before = table_names(&conn);
+        Database::migrate(&conn).expect("re-running the chain should be a no-op");
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert_eq!(before, table_names(&conn));
+    }
+
+    /// The bug this guards against: a migration block sets `PRAGMA user_version` in
+    /// SQL but forgets to assign the local `version` in Rust. Eight blocks had drifted
+    /// that way. Nothing breaks immediately, because the blocks run in order and each
+    /// one only widens the schema, so the omission sits latent until someone inserts a
+    /// migration whose guard then reads a stale version and skips or repeats work.
+    ///
+    /// Reading the source is unusual for a test, but the alternative is a runtime
+    /// assertion that cannot fire until the damage is already possible.
+    #[test]
+    fn every_migration_block_updates_the_local_version() {
+        let source = include_str!("database.rs");
+        for n in 1..=CURRENT_SCHEMA_VERSION {
+            assert!(
+                source.contains(&format!("PRAGMA user_version = {};", n)),
+                "migration {} does not set PRAGMA user_version",
+                n
+            );
+            // Matched as a whole line, because `contains` on "version = 12;" also
+            // matches the "PRAGMA user_version = 12;" two lines above it, which would
+            // make this assertion pass for exactly the code it exists to reject.
+            let assignment = format!("version = {};", n);
+            assert!(
+                source
+                    .lines()
+                    .any(|line| line.trim().starts_with(&assignment)),
+                "migration {} sets PRAGMA user_version but never assigns the local \
+                 `version`, so a later migration guard will read a stale value",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn the_expected_tables_exist() {
+        let conn = migrated();
+        let tables = table_names(&conn);
+        for required in [
+            "media",
+            "albums",
+            "album_media",
+            "upload_queue",
+            "tags",
+            "media_tags",
+            "faces",
+            "persons",
+            "config",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == required),
+                "missing table {}: {:?}",
+                required,
+                tables
+            );
+        }
+    }
+
+    /// Migration 15 deletes persons with no faces pointing at them. `NOT IN` against an
+    /// empty subquery matches every row, so without its guard this wipes every named
+    /// person on a library where face detection has not run, which is the normal state
+    /// for most users.
+    #[test]
+    fn ghost_person_cleanup_keeps_people_when_no_face_is_assigned() {
+        let conn = migrated();
+        conn.execute("INSERT INTO persons (name) VALUES ('Ana')", [])
+            .unwrap();
+        conn.execute("INSERT INTO persons (name) VALUES ('Bo')", [])
+            .unwrap();
+
+        // Re-run the cleanup exactly as migration 15 does.
+        conn.execute_batch(
+            "DELETE FROM persons
+             WHERE EXISTS (SELECT 1 FROM faces WHERE person_id IS NOT NULL)
+               AND id NOT IN (SELECT person_id FROM faces WHERE person_id IS NOT NULL);",
+        )
+        .unwrap();
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM persons", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 2,
+            "named people were deleted with no faces present"
+        );
+    }
+
+    /// The other half of the same guard: once assignments exist, the cleanup still
+    /// removes the persons that nothing points at.
+    #[test]
+    fn ghost_person_cleanup_still_removes_unreferenced_people() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO media (file_path, created_at) VALUES ('/tmp/a.jpg', 0)",
+            [],
+        )
+        .unwrap();
+        let media_id: i64 = conn.last_insert_rowid();
+        conn.execute("INSERT INTO persons (name) VALUES ('Ana')", [])
+            .unwrap();
+        let ana: i64 = conn.last_insert_rowid();
+        conn.execute("INSERT INTO persons (name) VALUES ('ghost')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO faces (media_id, x, y, width, height, score, person_id) VALUES (?, 0, 0, 1, 1, 1.0, ?)",
+            rusqlite::params![media_id, ana],
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "DELETE FROM persons
+             WHERE EXISTS (SELECT 1 FROM faces WHERE person_id IS NOT NULL)
+               AND id NOT IN (SELECT person_id FROM faces WHERE person_id IS NOT NULL);",
+        )
+        .unwrap();
+
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM persons ORDER BY name")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(names, vec!["Ana".to_string()]);
     }
 }
