@@ -116,6 +116,7 @@ export function Settings() {
     const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
     const [isSaving, setIsSaving] = useState(false);
     const [encryptionFlowOpen, setEncryptionFlowOpen] = useState(false);
+    const [logPath, setLogPath] = useState<string | null>(null);
     const [backupPath, setBackupPath] = useState<string>("");
     const [appVersion, setAppVersion] = useState<string>("Loading...");
     const [securityStatus, setSecurityStatus] = useState<{
@@ -155,6 +156,7 @@ export function Settings() {
         loadConfig();
         loadBackupPath();
         loadAppVersion();
+        loadLogPath();
         checkClipStatus();
         loadSecurityStatus();
 
@@ -232,6 +234,14 @@ export function Settings() {
         } catch (e) {
             console.error("Failed to load app version:", e);
             setAppVersion("Unknown");
+        }
+    };
+
+    const loadLogPath = async () => {
+        try {
+            setLogPath(await api.getLogPath());
+        } catch (e) {
+            console.error("Failed to load the log path:", e);
         }
     };
 
@@ -1155,6 +1165,29 @@ export function Settings() {
                                     <span className="text-sm font-mono bg-muted px-2 py-1 rounded">
                                         {appVersion}
                                     </span>
+                                </div>
+
+                                {/*
+                                    A packaged build has no console, so this file
+                                    is the only record of a crash. Surfacing the
+                                    path is what makes a bug report possible.
+                                */}
+                                <div className="flex items-center justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <Label>Log File</Label>
+                                        <p className="text-muted-foreground truncate text-xs">
+                                            {logPath || "Not available"}
+                                        </p>
+                                    </div>
+                                    <Button
+                                        size="icon"
+                                        variant="outline"
+                                        disabled={!logPath}
+                                        aria-label="Copy log file path"
+                                        onClick={() => copyText(logPath ?? "", "Log file path copied")}
+                                    >
+                                        <Copy className="h-4 w-4" aria-hidden="true" />
+                                    </Button>
                                 </div>
 
                                 <Separator />

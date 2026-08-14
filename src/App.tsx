@@ -16,6 +16,23 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Onboarding } from "./components/Onboarding";
 import "./App.css";
 
+/** Human names for the views, used when a per-view boundary reports a crash. */
+const VIEW_LABELS: Record<string, string> = {
+  timeline: "The timeline",
+  albums: "Albums",
+  favorites: "Favorites",
+  trash: "Trash",
+  archive: "The archive",
+  uploads: "The upload queue",
+  map: "The map",
+  duplicates: "Duplicate review",
+  people: "People",
+  tags: "Tags",
+  "smart-albums": "Smart albums",
+  search: "Search",
+  settings: "Settings",
+};
+
 import { useEffect, useState } from "react";
 import { api, hasErrorCode } from "./lib/api";
 
@@ -81,7 +98,7 @@ function App() {
       (securityStatus.securityMode === "encrypted" && securityStatus.encryptionLocked));
 
   return (
-    <ErrorBoundary>
+    <>
       {securityLoading ? (
         <div className="h-screen w-screen flex items-center justify-center">
           <p className="text-muted-foreground">Loading secure startup...</p>
@@ -90,25 +107,34 @@ function App() {
         <Onboarding status={securityStatus} onReady={refreshSecurityStatus} />
       ) : (
         <Layout currentView={view} onViewChange={setView}>
-          <div className="h-full overflow-hidden">
-            {view === 'timeline' && <Gallery />}
-            {view === 'albums' && <Albums />}
-            {view === 'favorites' && <Favorites />}
-            {view === 'trash' && <Trash />}
-            {view === 'archive' && <Archive />}
-            {view === 'uploads' && <UploadQueue />}
-            {view === 'map' && <MapView />}
-            {view === 'duplicates' && <DuplicateReview />}
-            {view === 'people' && <People />}
-            {view === 'tags' && <Tags />}
-            {view === 'smart-albums' && <SmartAlbums />}
-            {view === 'search' && <Search />}
-            {view === 'settings' && <Settings />}
-          </div>
+          {/*
+            Keyed by view so that switching views resets a boundary that has
+            already caught something: without the key, one crash would leave
+            the fallback in place for every view the user navigated to next.
+            Per-view rather than one boundary around Layout, so that a broken
+            view leaves the sidebar and the rest of the app usable.
+          */}
+          <ErrorBoundary key={view} context={VIEW_LABELS[view]} inline>
+            <div className="h-full overflow-hidden">
+              {view === 'timeline' && <Gallery />}
+              {view === 'albums' && <Albums />}
+              {view === 'favorites' && <Favorites />}
+              {view === 'trash' && <Trash />}
+              {view === 'archive' && <Archive />}
+              {view === 'uploads' && <UploadQueue />}
+              {view === 'map' && <MapView />}
+              {view === 'duplicates' && <DuplicateReview />}
+              {view === 'people' && <People />}
+              {view === 'tags' && <Tags />}
+              {view === 'smart-albums' && <SmartAlbums />}
+              {view === 'search' && <Search />}
+              {view === 'settings' && <Settings />}
+            </div>
+          </ErrorBoundary>
         </Layout>
       )}
       <Toaster />
-    </ErrorBoundary>
+    </>
   );
 }
 

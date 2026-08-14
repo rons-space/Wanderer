@@ -60,6 +60,27 @@ export interface MigrationStatus {
 }
 
 export const api = {
+    /**
+     * Sends a webview crash to the backend log.
+     *
+     * Deliberately swallows its own failure: this is called from an error
+     * boundary and from the global handlers, and a throw here would either
+     * replace the crash being reported or start a loop of reports about
+     * failing to report.
+     */
+    reportFrontendError: async (context: string, message: string, stack?: string): Promise<void> => {
+        try {
+            await invoke("report_frontend_error", { context, message, stack });
+        } catch (e) {
+            console.error("Failed to report a frontend error:", e);
+        }
+    },
+
+    /** Absolute path of the log file, for telling the user what to attach. */
+    getLogPath: async (): Promise<string | null> => {
+        return await invoke("get_log_path");
+    },
+
     getSecurityStatus: async (): Promise<{
         onboardingComplete: boolean;
         securityMode: string;

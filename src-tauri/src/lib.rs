@@ -3,6 +3,7 @@ mod backup;
 mod clip;
 mod database;
 mod errors;
+mod logging;
 mod media_utils;
 mod metadata;
 mod model_integrity;
@@ -662,6 +663,27 @@ async fn clear_telegram_api_credentials(
     Ok(())
 }
 
+/// Take a webview crash into the same log file as everything else.
+///
+/// `console.error` in a packaged build is as invisible as `println!` is, so the
+/// error boundary and the global handlers call this instead. `context` says
+/// where it came from (which view, or which global handler); the rest is
+/// whatever the browser gave us.
+#[tauri::command]
+fn report_frontend_error(context: String, message: String, stack: Option<String>) {
+    logging::record_frontend_error(&context, &message, stack.as_deref());
+}
+
+/// Where the log file is, so the UI can tell the user what to attach.
+///
+/// Returns the path rather than the contents: the file is the user's, and
+/// nothing about reporting a bug should require the app to read it back into
+/// the webview.
+#[tauri::command]
+fn get_log_path() -> Option<String> {
+    logging::log_path().map(|p| p.display().to_string())
+}
+
 #[tauri::command]
 async fn get_encryption_migration_status(
     state: State<'_, AppState>,
@@ -1225,6 +1247,13 @@ pub fn run() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
 
+            // Before the first log line that matters: everything up to here went to
+            // stderr, which a packaged build does not have. `resolve_app_data_dir`
+            // logs on failure, so it is called for its path and not for its warning.
+            if let Ok(app_dir) = resolve_app_data_dir(&app_handle) {
+                logging::init(&app_dir);
+            }
+
             // Before anything else, and before the vault can be unlocked again: a crash
             // or a kill leaves decrypted scratch behind that no lock handler ever ran
             // for, and startup is the only moment nothing is using it.
@@ -1459,6 +1488,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            report_frontend_error,
+            get_log_path,
             get_security_status,
             initialize_unencrypted_mode,
             initialize_encryption,

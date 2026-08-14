@@ -33,7 +33,6 @@ blake3 = "1.5.5"
 # Used to verify pinned SHA-256 digests for downloaded ONNX models.
 sha2 = "0.10"
 log = "0.4.25"
-env_logger = "0.11.6"
 dirs = "5.0"
 dotenvy = "0.15.7"
 time = { version = "0.3.44", features = ["serde", "macros", "formatting", "parsing"] }

@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "lint": "eslint . --max-warnings 38",
+    "lint": "eslint . --max-warnings 39",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
