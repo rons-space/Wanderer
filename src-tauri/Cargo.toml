@@ -66,6 +66,8 @@ base64 = "0.22.1"
 rand = "0.8.5"
 windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
 hex = "0.4.3"
+# `derive` for `ZeroizeOnDrop` on the master key newtype.
+zeroize = { version = "1.8", features = ["derive"] }
 
 [features]
 default = []
