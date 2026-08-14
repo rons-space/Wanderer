@@ -5,6 +5,7 @@ mod database;
 mod errors;
 mod media_utils;
 mod metadata;
+mod paths;
 mod progress_stream;
 mod raw_support;
 mod security;
@@ -165,8 +166,20 @@ fn save_migration_status(db: &Database, status: &MigrationStatus) -> Result<(), 
 fn ensure_thumbnail_encrypted(
     thumb_path: &str,
     key: &[u8; 32],
+    roots: &[std::path::PathBuf],
 ) -> Result<Option<std::path::PathBuf>, String> {
     let path = std::path::Path::new(thumb_path);
+
+    // `thumbnail_path` is a text column, and this function deletes the file it
+    // reads, so a poisoned row would mean encrypting and then unlinking an
+    // arbitrary file.
+    if !paths::is_within_any(roots, path) {
+        return Err(format!(
+            "Refusing to encrypt a thumbnail outside the managed library: {}",
+            thumb_path
+        ));
+    }
+
     if !path.exists() {
         return Ok(None);
     }
@@ -515,7 +528,10 @@ async fn get_encryption_migration_status(
 }
 
 #[tauri::command]
-async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_encryption_migration(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let db = {
         let db_guard = state.db.lock().await;
         db_guard
@@ -536,6 +552,10 @@ async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), St
         .await
         .master_key
         .ok_or_else(|| "Unlock encryption before starting migration".to_string())?;
+
+    // Resolved once here and moved into the worker below, so every unlink the
+    // migration performs is confined to the managed library.
+    let managed_roots = paths::managed_roots(&resolve_app_data_dir(&app)?);
 
     let cloud_items = db
         .get_uploaded_unencrypted_media(1_000_000)
@@ -567,7 +587,7 @@ async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), St
 
     tokio::spawn(async move {
         for (media_id, thumb_path) in thumb_items {
-            let result = match ensure_thumbnail_encrypted(&thumb_path, &key) {
+            let result = match ensure_thumbnail_encrypted(&thumb_path, &key, &managed_roots) {
                 Ok(Some(new_path)) => {
                     let new_path_str = new_path.to_string_lossy().to_string();
                     if new_path_str != thumb_path {
@@ -599,7 +619,9 @@ async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), St
 
             let result: Result<(), String> = async {
                 if let Some(thumb_path) = thumbnail_path.as_deref() {
-                    if let Some(new_thumb) = ensure_thumbnail_encrypted(thumb_path, &key)? {
+                    if let Some(new_thumb) =
+                        ensure_thumbnail_encrypted(thumb_path, &key, &managed_roots)?
+                    {
                         let new_thumb_str = new_thumb.to_string_lossy().to_string();
                         if new_thumb_str != thumb_path {
                             db.update_thumbnail_path(media_id, &new_thumb_str)
@@ -1271,8 +1293,33 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
 
     let mut success_count = 0;
 
+    let managed = paths::managed_roots(&app_dir);
+    let mut rejected = 0usize;
+
     for file_path in files {
         let path = std::path::Path::new(&file_path);
+
+        // Imports are indexed by the watcher and uploaded to Telegram, so an
+        // unfiltered import is an exfiltration primitive: a compromised webview
+        // could import `id_rsa` and have it sent to the cloud. Only media the
+        // app can display is accepted.
+        if !path.is_file() || !paths::is_importable(path) {
+            rejected += 1;
+            log::warn!("Import refused for non-media path: {}", file_path);
+            continue;
+        }
+
+        // Copying a file that is already in the library onto itself is at best
+        // pointless and at worst destructive.
+        if paths::is_within_any(&managed, path) {
+            rejected += 1;
+            log::warn!(
+                "Import refused for a path already in the library: {}",
+                file_path
+            );
+            continue;
+        }
+
         if let Some(file_name) = path.file_name() {
             let dest_path = backup_dir.join(file_name);
 
@@ -1289,6 +1336,13 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
                 success_count += 1;
             }
         }
+    }
+
+    if rejected > 0 {
+        log::warn!(
+            "Import rejected {} path(s) that were not importable media",
+            rejected
+        );
     }
 
     Ok(success_count)
@@ -1429,30 +1483,38 @@ async fn export_media(
     let items = db.get_media_by_ids(&media_ids).map_err(|e| e.to_string())?;
     drop(db_guard);
 
-    let dest_path = Path::new(&destination);
-    if !dest_path.exists() {
-        std::fs::create_dir_all(dest_path).map_err(|e| e.to_string())?;
+    let dest_path = paths::normalize_lexically(Path::new(&destination));
+    if !dest_path.is_absolute() {
+        return Err("Export destination must be an absolute path".to_string());
     }
+    if !dest_path.exists() {
+        std::fs::create_dir_all(&dest_path).map_err(|e| e.to_string())?;
+    }
+    let dest_root = paths::resolve(&dest_path);
 
     let mut exported = 0;
     for item in &items {
         let source = Path::new(&item.file_path);
         let source_hint = Path::new(&item.file_path);
 
-        // Create Year/Month folder structure
-        let (year, month) = if let Some(date_taken) = &item.date_taken {
-            // Parse date_taken string (format: "2026-01-15 12:00:00")
-            let parts: Vec<&str> = date_taken.split('-').collect();
-            if parts.len() >= 2 {
-                (parts[0].to_string(), parts[1].to_string())
-            } else {
-                let now = OffsetDateTime::now_utc();
-                (now.year().to_string(), format!("{:02}", now.month() as u8))
-            }
-        } else {
-            let now = OffsetDateTime::now_utc();
-            (now.year().to_string(), format!("{:02}", now.month() as u8))
-        };
+        // Create Year/Month folder structure.
+        //
+        // `date_taken` comes from the photo's EXIF, so it is attacker-supplied
+        // text being used as two path components. Anything that is not a plain
+        // number falls back to today rather than steering the write.
+        let now = OffsetDateTime::now_utc();
+        let fallback = (now.year().to_string(), format!("{:02}", now.month() as u8));
+        let (year, month) = item
+            .date_taken
+            .as_deref()
+            .and_then(|date_taken| {
+                // Format: "2026-01-15 12:00:00"
+                let mut parts = date_taken.split('-');
+                let year = paths::sanitize_date_fragment(parts.next()?, 4)?;
+                let month = paths::sanitize_date_fragment(parts.next()?, 2)?;
+                Some((year, month))
+            })
+            .unwrap_or(fallback);
 
         let folder = dest_path.join(&year).join(&month);
         if !folder.exists() {
@@ -1487,6 +1549,10 @@ async fn export_media(
         } else {
             dest_file
         };
+
+        // Belt and braces: whatever the pieces above produced, the write must
+        // land under the directory the user chose.
+        let final_dest = paths::confine(&dest_root, &final_dest)?;
 
         if source.exists() {
             std::fs::copy(source, &final_dest).map_err(|e| e.to_string())?;
@@ -1928,9 +1994,18 @@ async fn backup_database(
         return Err("Database file not found".to_string());
     }
 
-    // Determine backup destination
+    // Determine backup destination. A caller-supplied destination must be an
+    // existing directory the user already has: this command creates a file with
+    // a name it chooses itself, and has no business creating directory trees at
+    // arbitrary locations on the disk.
     let backup_path = if let Some(dest) = destination {
-        let dest_path = Path::new(&dest);
+        let dest_path = paths::normalize_lexically(Path::new(&dest));
+        if !dest_path.is_dir() {
+            return Err(format!(
+                "Backup destination is not an existing directory: {}",
+                dest_path.display()
+            ));
+        }
         let filename = format!(
             "library_backup_{}.db",
             time::OffsetDateTime::now_utc().unix_timestamp()
@@ -2071,7 +2146,11 @@ async fn restore_backup_archive(
 }
 
 #[tauri::command]
-async fn remove_local_copy(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+async fn remove_local_copy(
+    media_id: i64,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     // Get the media item to find the file path
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -2091,8 +2170,17 @@ async fn remove_local_copy(media_id: i64, state: State<'_, AppState>) -> Result<
         return Err("Media is already cloud-only".to_string());
     }
 
-    // Delete the local file (but keep the thumbnail)
+    // Delete the local file (but keep the thumbnail). `file_path` is a plain
+    // text column, so it is confined to the managed library before any unlink.
+    let app_data = resolve_app_data_dir(&app)?;
+    let roots = paths::managed_roots(&app_data);
     let file_path = std::path::Path::new(&media.file_path);
+    if !paths::is_within_any(&roots, file_path) {
+        return Err(format!(
+            "Refusing to delete a file outside the managed library: {}",
+            media.file_path
+        ));
+    }
     if file_path.exists() {
         std::fs::remove_file(file_path).map_err(|e| format!("Failed to delete file: {}", e))?;
     }
