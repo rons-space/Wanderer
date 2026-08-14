@@ -155,7 +155,7 @@ export function UploadQueue() {
                         </p>
                     </div>
                 </div>
-                <Button variant="ghost" size="icon" onClick={loadData}>
+                <Button variant="ghost" size="icon" onClick={loadData} aria-label="Refresh upload queue">
                     <RefreshCw className="h-4 w-4" />
                 </Button>
             </div>

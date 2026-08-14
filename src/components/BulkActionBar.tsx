@@ -228,6 +228,7 @@ export function BulkActionBar({ selectedIds, onClearSelection, onActionComplete 
                 <Button
                     variant="ghost"
                     size="icon"
+                    aria-label="Clear selection"
                     onClick={onClearSelection}
                     className="ml-1 text-zinc-400 hover:text-white hover:bg-zinc-700 h-8 w-8 rounded-lg"
                 >

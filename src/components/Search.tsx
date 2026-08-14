@@ -282,6 +282,7 @@ export function Search() {
                                                 type="button"
                                                 variant="ghost"
                                                 size="icon"
+                                                aria-label={`Remove "${historyItem}" from search history`}
                                                 className="h-6 w-6 opacity-0 group-hover:opacity-100"
                                                 onClick={(e) => {
                                                     e.stopPropagation();
@@ -302,6 +303,8 @@ export function Search() {
                             variant={isAiSearch ? "default" : "outline"}
                             size="icon"
                             onClick={() => setIsAiSearch(!isAiSearch)}
+                            aria-label="Toggle AI semantic search"
+                            aria-pressed={isAiSearch}
                             title="Toggle AI Semantic Search"
                             className={isAiSearch ? "bg-purple-600 hover:bg-purple-700 text-white border-purple-600" : ""}
                         >
@@ -312,6 +315,8 @@ export function Search() {
                             variant={showFilters ? "secondary" : "outline"}
                             size="icon"
                             onClick={() => setShowFilters(!showFilters)}
+                            aria-label="Toggle search filters"
+                            aria-expanded={showFilters}
                             className="relative"
                             disabled={isAiSearch} // Disable filters in AI mode for now
                         >

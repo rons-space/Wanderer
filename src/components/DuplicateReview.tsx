@@ -177,7 +177,10 @@ export function DuplicateReview() {
             <ScrollArea className="flex-1 p-4">
                 <div className="space-y-6">
                     {groups.map((group, groupIndex) => (
-                        <Card key={groupIndex}>
+                        // Keyed by the group's first photo: the index shifts as
+                        // groups are resolved, which would hand one group's
+                        // state to another.
+                        <Card key={group.items[0]?.id ?? groupIndex}>
                             <CardHeader className="py-3">
                                 <CardTitle className="text-sm flex items-center gap-2">
                                     <Copy className="h-4 w-4" />
@@ -187,9 +190,12 @@ export function DuplicateReview() {
                             <CardContent className="py-0">
                                 <div className="flex gap-3 overflow-x-auto pb-3">
                                     {group.items.map((item, itemIndex) => (
-                                        <div
+                                        <button
                                             key={item.id}
-                                            className={`relative flex-shrink-0 cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${itemIndex === group.keepIndex
+                                            type="button"
+                                            aria-pressed={itemIndex === group.keepIndex}
+                                            aria-label={`Keep ${getFileName(item)}, ${getFileType(item)}, ${formatBytes(item.size_bytes)}`}
+                                            className={`focus-visible:ring-ring relative flex-shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 transition-all focus-visible:ring-2 focus-visible:outline-none ${itemIndex === group.keepIndex
                                                 ? "border-green-500 ring-2 ring-green-500/30"
                                                 : "border-transparent hover:border-muted-foreground"
                                                 }`}
@@ -219,7 +225,7 @@ export function DuplicateReview() {
                                                     {getFileName(item)}
                                                 </div>
                                             </div>
-                                        </div>
+                                        </button>
                                     ))}
                                 </div>
                             </CardContent>

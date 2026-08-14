@@ -151,7 +151,7 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
     return (
         <div className="h-full w-full flex flex-col">
             <div className="flex items-center gap-2 p-4 border-b">
-                <Button variant="ghost" size="icon" onClick={() => onBack()}>
+                <Button variant="ghost" size="icon" onClick={() => onBack()} aria-label="Back to people">
                     <ArrowLeft className="h-4 w-4" />
                 </Button>
 
@@ -167,10 +167,10 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
                                     if (e.key === "Escape") setIsEditing(false);
                                 }}
                             />
-                            <Button size="icon" variant="ghost" onClick={handleRename} disabled={isSavingName}>
+                            <Button size="icon" variant="ghost" onClick={handleRename} disabled={isSavingName} aria-label="Save name">
                                 <Save className="h-4 w-4 text-green-500" />
                             </Button>
-                            <Button size="icon" variant="ghost" onClick={() => setIsEditing(false)}>
+                            <Button size="icon" variant="ghost" onClick={() => setIsEditing(false)} aria-label="Cancel renaming">
                                 <X className="h-4 w-4 text-red-500" />
                             </Button>
                         </div>
@@ -182,6 +182,7 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
                             <Button
                                 size="icon"
                                 variant="ghost"
+                                aria-label="Rename person"
                                 className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity"
                                 onClick={() => {
                                     setNewName(person.name || "");
@@ -214,6 +215,8 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
                 item={selectedMedia}
                 open={isViewerOpen}
                 onClose={() => setIsViewerOpen(false)}
+                items={items}
+                onNavigate={setSelectedMedia}
             />
 
             <Dialog open={isMergeDialogOpen} onOpenChange={setIsMergeDialogOpen}>

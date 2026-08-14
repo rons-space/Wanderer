@@ -113,7 +113,7 @@ export function SmartAlbums() {
         return (
             <div className="h-full w-full flex flex-col">
                 <div className="flex items-center gap-4 p-4 border-b">
-                    <Button variant="ghost" size="icon" onClick={handleBack}>
+                    <Button variant="ghost" size="icon" onClick={handleBack} aria-label="Back to smart albums">
                         <ChevronLeft className="h-5 w-5" />
                     </Button>
                     <div className="flex items-center gap-3">
@@ -173,6 +173,8 @@ export function SmartAlbums() {
                         item={selectedItem}
                         open={!!selectedItem}
                         onClose={() => setSelectedItem(null)}
+                        items={albumItems}
+                        onNavigate={setSelectedItem}
                     />
                 )}
             </div>
