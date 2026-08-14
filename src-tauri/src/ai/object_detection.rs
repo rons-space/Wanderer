@@ -6,32 +6,33 @@
 //!
 //! The model is downloaded on first use from public model mirrors.
 
+use crate::model_integrity::MOBILENET;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tract_onnx::prelude::*;
 
-/// Model singleton
-static CLASSIFIER: OnceLock<
-    Option<
-        tract_onnx::prelude::SimplePlan<
-            tract_onnx::prelude::TypedFact,
-            Box<dyn tract_onnx::prelude::TypedOp>,
-            tract_onnx::prelude::Graph<
-                tract_onnx::prelude::TypedFact,
-                Box<dyn tract_onnx::prelude::TypedOp>,
-            >,
-        >,
+/// A loaded, runnable ONNX graph. Named for the same reason `clip.rs` names its own:
+/// the inferred type is four lines of `tract` generics.
+type RunnableModel = tract_onnx::prelude::SimplePlan<
+    tract_onnx::prelude::TypedFact,
+    Box<dyn tract_onnx::prelude::TypedOp>,
+    tract_onnx::prelude::Graph<
+        tract_onnx::prelude::TypedFact,
+        Box<dyn tract_onnx::prelude::TypedOp>,
     >,
-> = OnceLock::new();
+>;
+
+/// Model singleton
+static CLASSIFIER: OnceLock<Option<RunnableModel>> = OnceLock::new();
 
 const PRIMARY_MODEL_NAME: &str = "mobilenet_v2.onnx";
-const MODEL_ALIASES: &[&str] = &[
-    "MobileNetV2.onnx",
-    "mobilenetv2.onnx",
-    "mobilenet-v2.onnx",
-];
+const MODEL_ALIASES: &[&str] = &["MobileNetV2.onnx", "mobilenetv2.onnx", "mobilenet-v2.onnx"];
 
 /// ImageNet class labels (top 100 most useful for photo tagging)
+// Unread: `map_class_to_tag` below returns tags from hard-coded class ranges instead of
+// indexing this table. Kept because it is the vocabulary that mapping approximates, and
+// the replacement for that mapping needs it.
+#[allow(dead_code)]
 const IMAGENET_LABELS: &[&str] = &[
     "person",
     "bicycle",
@@ -150,6 +151,9 @@ pub fn ensure_model_loaded(models_dir: &Path) -> Result<(), String> {
     }
 
     let model_path = ensure_primary_model_file(models_dir)?;
+
+    // Last point before the bytes reach the ONNX parser.
+    MOBILENET.verify(&model_path)?;
 
     log::info!("Loading MobileNet V2 model from {:?}", model_path);
 
@@ -308,9 +312,20 @@ where
     std::fs::create_dir_all(models_dir)
         .map_err(|e| format!("Failed to create models dir: {}", e))?;
 
+    // Pinned to a commit rather than `main`: a branch ref means the bytes behind this
+    // URL can change without the application noticing, and the SHA-256 below would then
+    // reject a legitimate upstream update in a way nobody could diagnose from the error.
+    // Pinning both together makes the two agree by construction.
+    const ONNX_MODELS_COMMIT: &str = "4c46cd00fbdb7cd30b6c1c17ab54f2e1f4f7b177";
     let urls = [
-        "https://media.githubusercontent.com/media/onnx/models/main/validated/vision/classification/mobilenet/model/mobilenetv2-7.onnx",
-        "https://github.com/onnx/models/raw/main/validated/vision/classification/mobilenet/model/mobilenetv2-7.onnx",
+        format!(
+            "https://media.githubusercontent.com/media/onnx/models/{}/validated/vision/classification/mobilenet/model/mobilenetv2-7.onnx",
+            ONNX_MODELS_COMMIT
+        ),
+        format!(
+            "https://github.com/onnx/models/raw/{}/validated/vision/classification/mobilenet/model/mobilenetv2-7.onnx",
+            ONNX_MODELS_COMMIT
+        ),
     ];
 
     let client = reqwest::Client::new();
@@ -318,25 +333,34 @@ where
     let mut last_error = String::new();
 
     for (idx, url) in urls.iter().enumerate() {
-        log::info!(
-            "Downloading MobileNet V2 from mirror {}: {}",
-            idx + 1,
-            url
-        );
+        log::info!("Downloading MobileNet V2 from mirror {}: {}", idx + 1, url);
 
         match download_from_url(
             &client,
-            url,
+            url.as_str(),
             &target_path,
             progress_callback.clone(),
             PRIMARY_MODEL_NAME,
         )
         .await
         {
-            Ok(_) => {
-                log::info!("MobileNet V2 download complete from mirror {}", idx + 1);
-                return Ok(());
-            }
+            Ok(_) => match MOBILENET.verify_or_remove(&target_path) {
+                Ok(()) => {
+                    log::info!(
+                        "MobileNet V2 download complete and verified from mirror {}",
+                        idx + 1
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Mirror {} served an unexpected MobileNet model: {}",
+                        idx + 1,
+                        e
+                    );
+                    last_error = e;
+                }
+            },
             Err(e) => {
                 last_error = e.clone();
                 log::warn!("Failed MobileNet download from mirror {}: {}", idx + 1, e);
@@ -437,8 +461,7 @@ where
         ));
     }
 
-    std::fs::rename(&temp_path, model_path)
-        .map_err(|e| format!("Failed to rename file: {}", e))?;
+    std::fs::rename(&temp_path, model_path).map_err(|e| format!("Failed to rename file: {}", e))?;
     Ok(())
 }
 

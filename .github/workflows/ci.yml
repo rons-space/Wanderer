@@ -1,0 +1,127 @@
+name: CI
+
+# Until this existed, a green pull request meant only that nothing ran. Everything
+# below is a check that was previously left to whoever remembered to run it locally.
+#
+# Two things shape this file. The Rust side compiles ONNX Runtime, bundled SQLite and
+# the image stack, which is expensive enough that the cache matters more than the
+# parallelism, so `fmt`, `clippy` and `test` share one job and one target directory
+# rather than fanning out and paying that cost three times. The frontend side is cheap
+# and runs as its own job so a failing type check reports in under a minute.
+
+on:
+  pull_request:
+    branches: [ dev, main ]
+  push:
+    branches: [ dev, main ]
+  workflow_dispatch:
+
+# A second push to the same pull request makes the first run irrelevant. Runs on a
+# branch ref are cancelled the same way, but never for `dev` or `main` themselves,
+# where every commit's result is worth keeping.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/dev' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failing build does not need a debuginfo-laden target directory, and the cache
+  # is faster to save and restore without one.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # `npm run build` is `tsc && vite build`, so this is the type check as well as
+      # the bundle. It is not the desktop build; that is `npm run tauri build`.
+      - name: Type check and bundle
+        run: npm run build
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  rust:
+    name: Rust
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup component add rustfmt clippy
+
+      # Tauri needs the GTK/WebKit development headers on Linux even though the
+      # application ships on Windows, because `tauri` itself compiles against them.
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            patchelf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          cache-all-crates: true
+
+      - name: Format
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test
+
+  audit:
+    name: Audit
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Run from src-tauri rather than through a wrapper action, because the ignore
+      # list lives in src-tauri/.cargo/audit.toml and cargo-audit discovers that
+      # relative to the working directory. Advisories that cannot be cleared by a
+      # lockfile update are listed there with their reasoning; anything else fails.
+      - name: Rust advisories
+        working-directory: src-tauri
+        run: cargo audit
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The npm advisories that have appeared here so far are all build tooling
+      # rather than shipped runtime code, so this covers dev dependencies too.
+      - name: npm advisories
+        run: npm audit --audit-level=moderate

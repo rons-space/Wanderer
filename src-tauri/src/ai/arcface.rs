@@ -1,4 +1,3 @@
-use image::GenericImageView;
 use ndarray::Array4;
 use tract_onnx::prelude::*;
 
@@ -27,6 +26,13 @@ impl ArcFace {
             ));
         }
 
+        // Verified here rather than only at download time, because this is the last
+        // point before the bytes reach the ONNX parser, and the file could have been
+        // replaced on disk since it was fetched.
+        crate::model_integrity::ARCFACE
+            .verify(&model_path)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
         let model = tract_onnx::onnx()
             .model_for_path(&model_path)?
             // ArcFace input: 112x112
@@ -52,7 +58,7 @@ impl ArcFace {
 
         let tensor: Tensor = Array4::from_shape_fn((1, 3, 112, 112), |(_, c, y, x)| {
             let pixel = resized.get_pixel(x as u32, y as u32);
-            let val = pixel[c as usize] as f32;
+            let val = pixel[c] as f32;
             (val - 127.5) / 128.0
         })
         .into();

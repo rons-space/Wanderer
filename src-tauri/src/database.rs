@@ -34,6 +34,10 @@ pub struct MediaItem {
     pub is_cloud_only: bool, // Local file removed, exists only on Telegram
 }
 
+/// One row of `get_uploaded_unencrypted_media`: media id, local path, Telegram media id
+/// and the thumbnail path where the item has one.
+pub type UnencryptedUpload = (i64, String, String, Option<String>);
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueueItem {
     pub id: i64,
@@ -198,6 +202,11 @@ impl Database {
         }
     }
 
+    // Every step in the chain closes with `version = N;` so the next one can be appended
+    // without reading the one above it. That makes the final assignment dead by
+    // construction, and deleting it would leave the last step shaped differently from
+    // all the others and the next author with a silently skipped migration.
+    #[allow(unused_assignments)]
     fn migrate(conn: &Connection) -> Result<()> {
         let mut version: i32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         log::info!("Database schema version: {}", version);
@@ -354,7 +363,7 @@ impl Database {
                  PRAGMA user_version = 5;
                  COMMIT;",
             )?;
-            // version = 5;
+            version = 5;
         }
 
         if version < 6 {
@@ -389,6 +398,7 @@ impl Database {
                  PRAGMA user_version = 7;
                  COMMIT;",
             )?;
+            version = 7;
         }
 
         // Migration 8: Add is_archived column for Archive feature
@@ -400,6 +410,7 @@ impl Database {
                  PRAGMA user_version = 8;
                  COMMIT;",
             )?;
+            version = 8;
         }
 
         // Migration 9: Add is_cloud_only column for Cloud-Only mode
@@ -410,6 +421,7 @@ impl Database {
                  PRAGMA user_version = 9;
                  COMMIT;",
             )?;
+            version = 9;
         }
 
         // Migration 10: Add clip_embedding and clip_status
@@ -421,6 +433,7 @@ impl Database {
                  PRAGMA user_version = 10;
                  COMMIT;",
             )?;
+            version = 10;
         }
 
         // Migration 11: Add tags and media_tags tables for object detection
@@ -444,6 +457,7 @@ impl Database {
                  PRAGMA user_version = 11;
                  COMMIT;",
             )?;
+            version = 11;
         }
 
         // Migration 12: Add embedding to faces and create persons table (FR-6)
@@ -492,6 +506,7 @@ impl Database {
                  PRAGMA user_version = 12;
                  COMMIT;",
             )?;
+            version = 12;
         }
 
         // Migration 13: Fix foreign key in persons table (rowid -> id)
@@ -515,6 +530,7 @@ impl Database {
                  COMMIT;
                  PRAGMA foreign_keys = ON;",
             )?;
+            version = 13;
         }
         if version < 14 {
             // Migration 14: Repair 'faces' table FK pointing to 'people' (should be 'persons')
@@ -545,13 +561,22 @@ impl Database {
         }
 
         if version < 15 {
-            // Migration 15: Cleanup ghost persons (created during failed FK runs)
+            // Migration 15: Cleanup ghost persons (created during failed FK runs).
+            //
+            // The EXISTS guard is load-bearing. `NOT IN` against an empty subquery is
+            // true for every row, so without it this deletes every named person on any
+            // library where no face has been assigned one yet, which is the normal
+            // state for a user who has not run face detection. The guard makes the
+            // statement a no-op in exactly that case, and leaves the intended cleanup
+            // untouched once at least one assignment exists.
             conn.execute_batch(
-                 "BEGIN;
-                  DELETE FROM persons WHERE id NOT IN (SELECT DISTINCT person_id FROM faces WHERE person_id IS NOT NULL);
+                "BEGIN;
+                  DELETE FROM persons
+                  WHERE EXISTS (SELECT 1 FROM faces WHERE person_id IS NOT NULL)
+                    AND id NOT IN (SELECT person_id FROM faces WHERE person_id IS NOT NULL);
                   PRAGMA user_version = 15;
                   COMMIT;",
-             )?;
+            )?;
             version = 15;
         }
 
@@ -752,7 +777,7 @@ impl Database {
             Ok(_) => {}
             Err(e) => {
                 println!("CRITICAL DB ERROR updating faces: {}", e);
-                return Err(e.into());
+                return Err(e);
             }
         }
 
@@ -858,6 +883,9 @@ impl Database {
         Ok(Some(new_id))
     }
 
+    // Superseded by `get_people`; `search_media` is the only caller of the broken
+    // `escape_like_pattern`. Both go in T55 (issue #63), which owns their removal.
+    #[allow(dead_code)]
     pub fn get_persons(&self) -> Result<Vec<Person>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -889,7 +917,7 @@ impl Database {
     // --- CLIP Operations ---
 
     pub fn store_clip_embedding(&self, media_id: i64, embedding: &[f32]) -> Result<()> {
-        let mut conn = self.get_conn()?;
+        let conn = self.get_conn()?;
 
         // Convert f32 vector to bytes (Little Endian)
         let mut bytes = Vec::with_capacity(embedding.len() * 4);
@@ -942,7 +970,7 @@ impl Database {
                 let bytes: Vec<u8> = row.get(1)?;
 
                 // Convert bytes back to f32
-                if bytes.len() % 4 != 0 {
+                if !bytes.len().is_multiple_of(4) {
                     // Return empty or handle error? silently skip bad data
                     return Ok((id, Vec::new()));
                 }
@@ -1071,6 +1099,10 @@ impl Database {
 
     // --- Media Operations ---
 
+    // Eight and nine positional arguments mirror the columns being inserted. The fix is
+    // a parameter struct, which belongs with the `database.rs` split in T58 (issue #66)
+    // rather than in a CI change.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_media(
         &self,
         file_path: &str,
@@ -1108,6 +1140,7 @@ impl Database {
         Ok(media_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_media_synced(
         &self,
         file_path: &str,
@@ -1168,13 +1201,13 @@ impl Database {
 
     pub fn mark_media_encrypted_by_id(&self, media_id: i64) -> Result<usize> {
         let conn = self.get_conn()?;
-        conn.execute("UPDATE media SET is_encrypted = 1 WHERE id = ?1", [media_id])
+        conn.execute(
+            "UPDATE media SET is_encrypted = 1 WHERE id = ?1",
+            [media_id],
+        )
     }
 
-    pub fn get_uploaded_unencrypted_media(
-        &self,
-        limit: i32,
-    ) -> Result<Vec<(i64, String, String, Option<String>)>> {
+    pub fn get_uploaded_unencrypted_media(&self, limit: i32) -> Result<Vec<UnencryptedUpload>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, file_path, telegram_media_id, thumbnail_path
@@ -1235,7 +1268,7 @@ impl Database {
 
     pub fn get_media(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
         // Validate and clamp pagination parameters
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -1385,7 +1418,7 @@ impl Database {
 
     /// Get all videos
     pub fn get_videos(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -1402,7 +1435,7 @@ impl Database {
 
     /// Get recent media (last 30 days)
     pub fn get_recent(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -1419,7 +1452,7 @@ impl Database {
 
     /// Get top rated media (4+ stars)
     pub fn get_top_rated(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -1470,9 +1503,12 @@ impl Database {
         })
     }
 
+    // Unreachable: FTS5 search replaced it. Removed in T55 (issue #63) together with
+    // `escape_like_pattern`, whose only caller it is.
+    #[allow(dead_code)]
     pub fn search_media(&self, query: &str, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
         // Validate and clamp pagination parameters
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -1538,7 +1574,7 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
 
@@ -1553,7 +1589,7 @@ impl Database {
         }
 
         if let Some(min_rating) = filters.min_rating {
-            conditions.push(format!("rating >= {}", min_rating.max(0).min(5)));
+            conditions.push(format!("rating >= {}", min_rating.clamp(0, 5)));
         }
 
         if let Some(date_from) = filters.date_from {
@@ -2009,7 +2045,7 @@ impl Database {
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
         // Validate and clamp pagination parameters
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2097,7 +2133,7 @@ impl Database {
 
     /// Get all favorite media items.
     pub fn get_favorites(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2175,7 +2211,7 @@ impl Database {
 
     /// Get all items in trash.
     pub fn get_trash(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2231,6 +2267,10 @@ impl Database {
     }
 
     /// Permanently delete items that have been in trash for more than 30 days.
+    // No command or worker calls this yet, so trash grows without bound. Wiring it up
+    // is behaviour work, not lint work, so it keeps the retention policy documented here
+    // until then.
+    #[allow(dead_code)]
     pub fn empty_old_trash(&self) -> Result<usize> {
         let thirty_days_ago = OffsetDateTime::now_utc().unix_timestamp() - (30 * 24 * 60 * 60);
         let conn = self.get_conn()?;
@@ -2456,7 +2496,10 @@ impl Database {
         let mut updated = 0usize;
         for (media_id, file_path) in candidates {
             if !Path::new(&file_path).exists() {
-                conn.execute("UPDATE media SET is_cloud_only = 1 WHERE id = ?1", [media_id])?;
+                conn.execute(
+                    "UPDATE media SET is_cloud_only = 1 WHERE id = ?1",
+                    [media_id],
+                )?;
                 updated += 1;
             }
         }
@@ -2527,7 +2570,7 @@ impl Database {
 
     /// Get all archived media items.
     pub fn get_archived_media(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2683,12 +2726,9 @@ impl Database {
         let mut grouped: std::collections::HashMap<usize, Vec<MediaItem>> =
             std::collections::HashMap::new();
 
-        for idx in 0..n {
+        for (idx, candidate) in candidates.iter().enumerate() {
             let root = find(&mut parent, idx);
-            grouped
-                .entry(root)
-                .or_default()
-                .push(candidates[idx].0.clone());
+            grouped.entry(root).or_default().push(candidate.0.clone());
         }
 
         let mut groups: Vec<Vec<MediaItem>> = grouped
@@ -2700,7 +2740,7 @@ impl Database {
             group.sort_by_key(|item| item.created_at);
         }
 
-        groups.sort_by(|a, b| b.len().cmp(&a.len()));
+        groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
         Ok(groups)
     }
 
@@ -2851,7 +2891,7 @@ impl Database {
         match result {
             Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -3032,7 +3072,7 @@ impl Database {
         match result {
             Ok(item) => Ok(Some(item)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -3055,7 +3095,7 @@ impl Database {
         match result {
             Ok(album) => Ok(Some(album)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -3174,6 +3214,9 @@ impl Database {
         Ok(())
     }
 
+    // The tag worker logs failures instead of recording them, so nothing calls this.
+    // Kept as the counterpart to `mark_clip_failed` until the worker uses it.
+    #[allow(dead_code)]
     pub fn mark_tags_failed(&self, media_id: i64) -> Result<()> {
         let conn = self.get_conn()?;
         conn.execute(
@@ -3222,6 +3265,10 @@ impl Database {
         Ok(())
     }
 
+    // Recovery helper with no caller: the startup path requeues through
+    // `queue_pending_tag_scans` instead. Kept because the NULL-embedding case it repairs
+    // is real and undetected elsewhere.
+    #[allow(dead_code)]
     pub fn reset_stuck_scans(&self) -> Result<usize> {
         let conn = self.get_conn()?;
 
@@ -3281,5 +3328,185 @@ impl Database {
 
         let tags_iter = stmt.query_map([media_id], |row| row.get(0))?;
         tags_iter.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The schema version the chain is expected to reach. Update this together with a
+    /// new migration, which is the point: forgetting makes the test fail loudly here
+    /// rather than quietly at a user's next startup.
+    const CURRENT_SCHEMA_VERSION: i32 = 19;
+
+    fn migrated() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        Database::migrate(&conn).expect("migration chain should run on an empty database");
+        conn
+    }
+
+    fn user_version(conn: &Connection) -> i32 {
+        conn.query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let names = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        names
+    }
+
+    #[test]
+    fn migrating_from_empty_reaches_the_current_version() {
+        let conn = migrated();
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    /// Every block assigns the local `version` after its `PRAGMA user_version`. When
+    /// they disagree, the chain still happens to work in one direction and breaks the
+    /// next time a migration is inserted, so assert they agree rather than waiting.
+    #[test]
+    fn running_the_chain_twice_is_a_no_op() {
+        let conn = migrated();
+        let before = table_names(&conn);
+        Database::migrate(&conn).expect("re-running the chain should be a no-op");
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert_eq!(before, table_names(&conn));
+    }
+
+    /// The bug this guards against: a migration block sets `PRAGMA user_version` in
+    /// SQL but forgets to assign the local `version` in Rust. Eight blocks had drifted
+    /// that way. Nothing breaks immediately, because the blocks run in order and each
+    /// one only widens the schema, so the omission sits latent until someone inserts a
+    /// migration whose guard then reads a stale version and skips or repeats work.
+    ///
+    /// Reading the source is unusual for a test, but the alternative is a runtime
+    /// assertion that cannot fire until the damage is already possible.
+    #[test]
+    fn every_migration_block_updates_the_local_version() {
+        let source = include_str!("database.rs");
+        for n in 1..=CURRENT_SCHEMA_VERSION {
+            assert!(
+                source.contains(&format!("PRAGMA user_version = {};", n)),
+                "migration {} does not set PRAGMA user_version",
+                n
+            );
+            // Matched as a whole line, because `contains` on "version = 12;" also
+            // matches the "PRAGMA user_version = 12;" two lines above it, which would
+            // make this assertion pass for exactly the code it exists to reject.
+            let assignment = format!("version = {};", n);
+            assert!(
+                source
+                    .lines()
+                    .any(|line| line.trim().starts_with(&assignment)),
+                "migration {} sets PRAGMA user_version but never assigns the local \
+                 `version`, so a later migration guard will read a stale value",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn the_expected_tables_exist() {
+        let conn = migrated();
+        let tables = table_names(&conn);
+        for required in [
+            "media",
+            "albums",
+            "album_media",
+            "upload_queue",
+            "tags",
+            "media_tags",
+            "faces",
+            "persons",
+            "config",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == required),
+                "missing table {}: {:?}",
+                required,
+                tables
+            );
+        }
+    }
+
+    /// Migration 15 deletes persons with no faces pointing at them. `NOT IN` against an
+    /// empty subquery matches every row, so without its guard this wipes every named
+    /// person on a library where face detection has not run, which is the normal state
+    /// for most users.
+    #[test]
+    fn ghost_person_cleanup_keeps_people_when_no_face_is_assigned() {
+        let conn = migrated();
+        conn.execute("INSERT INTO persons (name) VALUES ('Ana')", [])
+            .unwrap();
+        conn.execute("INSERT INTO persons (name) VALUES ('Bo')", [])
+            .unwrap();
+
+        // Re-run the cleanup exactly as migration 15 does.
+        conn.execute_batch(
+            "DELETE FROM persons
+             WHERE EXISTS (SELECT 1 FROM faces WHERE person_id IS NOT NULL)
+               AND id NOT IN (SELECT person_id FROM faces WHERE person_id IS NOT NULL);",
+        )
+        .unwrap();
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM persons", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 2,
+            "named people were deleted with no faces present"
+        );
+    }
+
+    /// The other half of the same guard: once assignments exist, the cleanup still
+    /// removes the persons that nothing points at.
+    #[test]
+    fn ghost_person_cleanup_still_removes_unreferenced_people() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO media (file_path, created_at) VALUES ('/tmp/a.jpg', 0)",
+            [],
+        )
+        .unwrap();
+        let media_id: i64 = conn.last_insert_rowid();
+        conn.execute("INSERT INTO persons (name) VALUES ('Ana')", [])
+            .unwrap();
+        let ana: i64 = conn.last_insert_rowid();
+        conn.execute("INSERT INTO persons (name) VALUES ('ghost')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO faces (media_id, x, y, width, height, score, person_id) VALUES (?, 0, 0, 1, 1, 1.0, ?)",
+            rusqlite::params![media_id, ana],
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "DELETE FROM persons
+             WHERE EXISTS (SELECT 1 FROM faces WHERE person_id IS NOT NULL)
+               AND id NOT IN (SELECT person_id FROM faces WHERE person_id IS NOT NULL);",
+        )
+        .unwrap();
+
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM persons ORDER BY name")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(names, vec!["Ana".to_string()]);
     }
 }

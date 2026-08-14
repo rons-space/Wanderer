@@ -88,7 +88,7 @@ const getTimelineTimestamp = (item: MediaItem): number => {
 };
 
 // --- Custom AutoSizer ---
-const useResizeObserver = (ref: React.RefObject<HTMLElement>) => {
+const useResizeObserver = (ref: React.RefObject<HTMLElement | null>) => {
     const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
 
     useLayoutEffect(() => {
@@ -641,7 +641,7 @@ interface MediaGridProps {
 
 export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage, ItemWrapper, onItemClick, onItemsChange }: MediaGridProps) {
     const containerRef = useRef<HTMLDivElement>(null);
-    const { width, height } = useResizeObserver(containerRef as any);
+    const { width, height } = useResizeObserver(containerRef);
     const { theme } = useTheme();
 
     const [albums, setAlbums] = useState<Album[]>([]);

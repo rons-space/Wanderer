@@ -249,6 +249,10 @@ pub async fn generate_video_thumbnail(
 }
 
 /// Escape special characters in LIKE patterns to prevent SQL injection issues.
+// Broken as written: it inserts backslashes without an `ESCAPE '\\'` clause, so the
+// pattern it produces matches literal backslashes. Its only caller,
+// `Database::search_media`, is itself dead, and T55 (issue #63) deletes both.
+#[allow(dead_code)]
 pub fn escape_like_pattern(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")

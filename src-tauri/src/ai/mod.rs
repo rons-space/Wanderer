@@ -1,3 +1,4 @@
+use crate::model_integrity::ARCFACE;
 use image::GenericImageView;
 use ndarray::{Array4, Axis, Ix2};
 use std::io::Cursor;
@@ -88,7 +89,7 @@ impl FaceDetector {
         // Preprocess: (x - 127) / 128
         let tensor: Tensor = Array4::from_shape_fn((1, 3, 240, 320), |(_, c, y, x)| {
             let pixel = resized.get_pixel(x as u32, y as u32);
-            let val = pixel[c as usize] as f32;
+            let val = pixel[c] as f32;
             (val - 127.0) / 128.0
         })
         .into();
@@ -203,13 +204,10 @@ pub async fn download_arcface_model<F>(
 where
     F: Fn(&str, u64, u64) + Send + 'static + Clone,
 {
-    use futures_util::StreamExt;
-    use std::io::Write;
-
     // List of mirrors to try.
     // The buffalo_l one seems to return 401 sometimes or is gated.
     // We can try other known hosting locations or mirrors.
-    let urls = vec![
+    let urls = [
         // Mirror 1: yakhyo GitHub Release (v0.0.1) - Verified public asset
         "https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_r50.onnx",
         // Mirror 2: "maze" HuggingFace (seems public/ungated)
@@ -223,21 +221,15 @@ where
     let model_path = models_dir.join("w600k_r50.onnx");
 
     if model_path.exists() {
-        // Check size
-        let metadata = std::fs::metadata(&model_path).map_err(|e| e.to_string())?;
-        if metadata.len() > 100_000_000 {
-            // > 100 MB
-            log::info!(
-                "ArcFace model already exists and looks valid ({} bytes)",
-                metadata.len()
-            );
-            return Ok(());
-        } else {
-            log::warn!(
-                "ArcFace model exists but is too small ({} bytes). Deleting and re-downloading...",
-                metadata.len()
-            );
-            std::fs::remove_file(&model_path).map_err(|e| e.to_string())?;
+        // A size threshold used to stand in for a real check here, which accepted any
+        // file over 100 MB. Verify the pin instead, and re-download anything that fails
+        // rather than trusting what is on disk.
+        match ARCFACE.verify_or_remove(&model_path) {
+            Ok(()) => {
+                log::info!("ArcFace model already present and verified");
+                return Ok(());
+            }
+            Err(e) => log::warn!("Discarding the existing ArcFace model: {}", e),
         }
     }
 
@@ -255,10 +247,19 @@ where
         );
 
         match download_from_url(&client, url, &model_path, progress_callback.clone()).await {
-            Ok(_) => {
-                log::info!("ArcFace download complete from URL {}", i + 1);
-                return Ok(());
-            }
+            Ok(_) => match ARCFACE.verify_or_remove(&model_path) {
+                Ok(()) => {
+                    log::info!("ArcFace download complete and verified from URL {}", i + 1);
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Treated like any other mirror failure: a mirror that no longer
+                    // serves the pinned bytes is a mirror we move on from.
+                    log::warn!("URL {} served an unexpected ArcFace model: {}", i + 1, e);
+                    last_error = e;
+                    continue;
+                }
+            },
             Err(e) => {
                 log::warn!("Failed to download from URL {}: {}", i + 1, e);
                 last_error = e;

@@ -3,7 +3,6 @@ use crate::media_utils;
 use crate::security::{self, RuntimeState};
 use crate::telegram::TelegramService;
 use log::{debug, error, info, warn};
-use mime_guess;
 use std::fs;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

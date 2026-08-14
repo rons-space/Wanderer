@@ -3,6 +3,7 @@ name = "tauri-app"
 version = "0.1.0"
 description = "Wander(er), a desktop media manager with encrypted Telegram backup"
 authors = ["rons-space"]
+license = "AGPL-3.0-only"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -29,6 +30,8 @@ rusqlite = { version = "0.38.0", features = ["bundled"] }
 # sqlite = "0.37.0"
 notify = "6.1.1"
 blake3 = "1.5.5"
+# Used to verify pinned SHA-256 digests for downloaded ONNX models.
+sha2 = "0.10"
 thiserror = "2.0.11"
 log = "0.4.25"
 env_logger = "0.11.6"

@@ -212,14 +212,23 @@ In `Encrypted` mode:
 - View cache is encrypted at rest
 - Database backup artifact is encrypted
 
-Important current limitation:
+Important current limitations. Encryption here protects what leaves the machine, and
+someone with access to your computer can still read most of what matters:
 
-- Local files in `backup/` are still plaintext at rest
-- This means anyone with local filesystem access can copy originals from `backup/`
+- Local files in `backup/` are plaintext at rest, so anyone with filesystem access can
+  copy the originals.
+- Decrypted copies are written to `%TEMP%` while you browse. Thumbnails and the view
+  cache are materialized there and are not purged when you lock encryption or close the
+  window ([#28](https://github.com/rons-space/Wanderer/issues/28)).
+- The metadata index in `library.db` is plaintext, including file paths, camera make and
+  model, and GPS coordinates. The photos are encrypted; where and when they were taken
+  is not.
+- The 8-character passphrase minimum is enforced when you first set one, but not on the
+  reset path ([#59](https://github.com/rons-space/Wanderer/issues/59)).
 
 Planned next improvement:
 
-- Full local at-rest encryption for `backup/` folder
+- Full local at-rest encryption for the `backup/` folder
 
 ---
 
@@ -341,8 +350,29 @@ so it is an opt-in, debug-only feature and is bound to localhost when enabled:
 npm run tauri dev -- --features mcp-bridge
 ```
 
-Production build:
+Checks, which are the same ones CI runs:
 
 ```bash
-npm run build
+npm run build     # tsc + vite: type check and bundle the frontend
+npm run lint      # eslint
+npm test          # vitest
+cd src-tauri && cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
+
+Production build. Note that `npm run build` above is only the frontend bundle: it
+produces no installer and does not compile any Rust, so it cannot tell you whether the
+desktop app builds. This is the one that does:
+
+```bash
+npm run tauri build
+```
+
+---
+
+## 📄 License
+
+[GNU Affero General Public License v3.0](LICENSE).
+
+The Affero clause is the point: if you run a modified Wander(er) as a network service,
+the people using it are entitled to your source. Running it on your own machine, which
+is what this application is for, carries no obligation at all.

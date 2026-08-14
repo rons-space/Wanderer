@@ -12,7 +12,7 @@ import { Slider } from "./ui/slider";
 import { Separator } from "./ui/separator";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { toast } from "sonner";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Progress } from "./ui/progress";
@@ -44,6 +44,12 @@ const DEFAULT_CONFIG: AppConfig = {
     ai_face_enabled: "false",
     ai_tags_enabled: "false",
     timeline_grouping: "day",
+};
+
+type ModelDownloadProgress = {
+    model: string;
+    current: number;
+    total: number;
 };
 
 const ABOUT_LINKS = {
@@ -94,7 +100,7 @@ export function Settings() {
     // CLIP State
     const [clipInstalled, setClipInstalled] = useState(false);
     const [isDownloadingModels, setIsDownloadingModels] = useState(false);
-    const [downloadProgress, setDownloadProgress] = useState<{ model: string, current: number, total: number } | null>(null);
+    const [downloadProgress, setDownloadProgress] = useState<ModelDownloadProgress | null>(null);
     const {
         theme,
         setTheme,
@@ -122,8 +128,8 @@ export function Settings() {
 
         window.addEventListener('auth-changed', handleAuthChange);
 
-        let unlisten: Function | undefined;
-        listen("model_download_progress", (event: any) => {
+        let unlisten: UnlistenFn | undefined;
+        listen<ModelDownloadProgress>("model_download_progress", (event) => {
             setDownloadProgress(event.payload);
         }).then(u => { unlisten = u; });
 
@@ -233,6 +239,7 @@ export function Settings() {
         try {
             await openUrl(url);
         } catch (e) {
+            console.error("Failed to open link:", e);
             toast.error("Failed to open link");
         }
     };
@@ -246,6 +253,7 @@ export function Settings() {
             await navigator.clipboard.writeText(value);
             toast.success(successMessage);
         } catch (e) {
+            console.error("Failed to copy to clipboard:", e);
             toast.error("Failed to copy");
         }
     };
@@ -257,6 +265,7 @@ export function Settings() {
             setConfig(prev => ({ ...prev, [key]: value }));
             toast.success("Settings saved");
         } catch (e) {
+            console.error("Failed to save setting:", e);
             toast.error("Failed to save setting");
         } finally {
             setIsSaving(false);
@@ -308,6 +317,7 @@ export function Settings() {
                 setStep('phone');
             }
         } catch (e) {
+            console.error("Failed to load the Telegram session:", e);
             setUser(null);
             setStep('phone');
         }
@@ -320,9 +330,9 @@ export function Settings() {
         try {
             await api.loginRequestCode(phone);
             setStep('code');
-        } catch (err: any) {
+        } catch (err) {
             console.error(err);
-            setError(err.toString() || "Failed to send code");
+            setError(String(err) || "Failed to send code");
         } finally {
             setIsLoading(false);
         }
@@ -337,9 +347,9 @@ export function Settings() {
             setUser(loggedInUser);
             setStep('authenticated');
             window.dispatchEvent(new Event('auth-changed'));
-        } catch (err: any) {
+        } catch (err) {
             console.error(err);
-            setError(err.toString() || "Failed to sign in");
+            setError(String(err) || "Failed to sign in");
         } finally {
             setIsLoading(false);
         }
@@ -800,6 +810,7 @@ export function Settings() {
                                                     await navigator.clipboard.writeText(backupPath);
                                                     toast.success("Backup path copied");
                                                 } catch (e) {
+                                                    console.error("Failed to copy backup path:", e);
                                                     toast.error("Failed to copy backup path");
                                                 }
                                             }}
@@ -1048,7 +1059,7 @@ export function Settings() {
                                                         await api.downloadClipModels();
                                                         setClipInstalled(true);
                                                         toast.success("CLIP models installed successfully!");
-                                                    } catch (e: any) {
+                                                    } catch (e) {
                                                         toast.error(`Download failed: ${e}`);
                                                     } finally {
                                                         setIsDownloadingModels(false);

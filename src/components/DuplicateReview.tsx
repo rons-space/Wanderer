@@ -113,6 +113,7 @@ export function DuplicateReview() {
             toast.success(`Moved ${toDelete.length} duplicate(s) to trash`);
             setGroups((prev) => prev.filter((_, i) => i !== groupIndex));
         } catch (e) {
+            console.error("Failed to delete duplicates:", e);
             toast.error("Failed to delete duplicates");
         } finally {
             setProcessingGroup(null);

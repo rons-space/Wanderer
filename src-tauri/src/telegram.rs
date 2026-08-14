@@ -135,11 +135,8 @@ impl TelegramService {
 
         let updates_handle = tokio::spawn(async move {
             while let Ok(update) = update_stream.next().await {
-                match update {
-                    Update::NewMessage(message) => {
-                        info!("New message: {:?}", message.text());
-                    }
-                    _ => {}
+                if let Update::NewMessage(message) = update {
+                    info!("New message: {:?}", message.text());
                 }
             }
         });
@@ -224,10 +221,7 @@ impl TelegramService {
     pub async fn is_authorized(&self) -> bool {
         let client_guard = self.client.lock().await;
         if let Some(client) = client_guard.as_ref() {
-            match client.is_authorized().await {
-                Ok(auth) => auth,
-                Err(_) => false,
-            }
+            client.is_authorized().await.unwrap_or(false)
         } else {
             false
         }
@@ -487,12 +481,10 @@ impl TelegramService {
         // 4. Delete Session File
         let session_path = app_data_dir.join("session.db");
         if session_path.exists() {
-            let mut deleted = false;
             for i in 0..5 {
                 match tokio::fs::remove_file(&session_path).await {
                     Ok(_) => {
                         info!("Deleted session file: {:?}", session_path);
-                        deleted = true;
                         break;
                     }
                     Err(e) => {

@@ -2,10 +2,8 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
 use argon2::{
-    password_hash::{
-        rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-    },
-    Argon2, Algorithm, Params, Version,
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Algorithm, Argon2, Params, Version,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
@@ -54,7 +52,7 @@ pub struct TelegramApiCredentials {
     pub api_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationStatus {
     pub running: bool,
@@ -63,19 +61,6 @@ pub struct MigrationStatus {
     pub succeeded: i64,
     pub failed: i64,
     pub last_error: Option<String>,
-}
-
-impl Default for MigrationStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            total: 0,
-            processed: 0,
-            succeeded: 0,
-            failed: 0,
-            last_error: None,
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -174,10 +159,7 @@ impl SecurityBundle {
         Ok((next, master_key))
     }
 
-    pub fn regenerate_recovery_key(
-        &self,
-        passphrase: &str,
-    ) -> Result<(Self, String, [u8; 32])> {
+    pub fn regenerate_recovery_key(&self, passphrase: &str) -> Result<(Self, String, [u8; 32])> {
         let master_key = self.unlock_with_passphrase(passphrase)?;
         let new_recovery_key = generate_recovery_key();
         let wrap = wrap_master_key_with_secret(new_recovery_key.as_bytes(), &master_key)?;
@@ -510,10 +492,10 @@ pub fn decrypt_file_if_needed(
 
 #[cfg(target_os = "windows")]
 pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Cryptography::{
         CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     };
-    use windows_sys::Win32::Foundation::LocalFree;
 
     let mut in_blob = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -538,8 +520,8 @@ pub fn dpapi_protect(data: &[u8], description: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("CryptProtectData failed"));
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }
-        .to_vec();
+    let bytes =
+        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();
     unsafe {
         let _ = LocalFree(out_blob.pbData as _);
     }
@@ -574,8 +556,8 @@ pub fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
         return Err(anyhow!("CryptUnprotectData failed"));
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }
-        .to_vec();
+    let bytes =
+        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize) }.to_vec();
 
     unsafe {
         if !out_blob.pbData.is_null() {
@@ -628,8 +610,8 @@ mod tests {
 
     #[test]
     fn security_bundle_encrypt_unlock_roundtrip() {
-        let (bundle, _, _) = SecurityBundle::new_encrypted("correct horse battery staple")
-            .expect("bundle");
+        let (bundle, _, _) =
+            SecurityBundle::new_encrypted("correct horse battery staple").expect("bundle");
         let key = bundle
             .unlock_with_passphrase("correct horse battery staple")
             .expect("unlock");
@@ -642,7 +624,9 @@ mod tests {
         let (bundle, recovery_key, key) =
             SecurityBundle::new_encrypted("correct horse battery staple").expect("bundle");
         assert_eq!(
-            bundle.unlock_with_recovery_key(&recovery_key).expect("unlock"),
+            bundle
+                .unlock_with_recovery_key(&recovery_key)
+                .expect("unlock"),
             key
         );
         assert!(bundle.unlock_with_recovery_key("WRONG-KEY").is_err());
@@ -713,6 +697,75 @@ mod tests {
         let mut wrong_key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut wrong_key);
         assert!(decrypt_file(&sealed, &dir.join("bad.bin"), &wrong_key).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two fixtures for the tamper tests: a multi-chunk `.wbenc` and its plaintext.
+    fn sealed_fixture(name: &str) -> (std::path::PathBuf, [u8; 32], Vec<u8>) {
+        let dir =
+            std::env::temp_dir().join(format!("wanderer-sec-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let plain = dir.join("plain.bin");
+        let sealed = dir.join("sealed.wbenc");
+
+        // Larger than one chunk, so truncation and tampering can be aimed at a chunk
+        // boundary rather than at the header.
+        let contents: Vec<u8> = (0..(DEFAULT_CHUNK_SIZE as usize * 2 + 77))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&plain, &contents).expect("write");
+
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        encrypt_file(&plain, &sealed, &key).expect("encrypt");
+
+        (sealed, key, contents)
+    }
+
+    /// A `.wbenc` cut short must fail rather than yielding the prefix it can decrypt.
+    /// Returning partial plaintext would be worse than failing: the caller cannot tell
+    /// a complete file from a truncated one, and a truncated media file looks like a
+    /// corrupt photo rather than an integrity failure.
+    #[test]
+    fn truncated_ciphertext_is_rejected() {
+        let (sealed, key, contents) = sealed_fixture("truncated");
+        let dir = sealed.parent().unwrap().to_path_buf();
+
+        let full = std::fs::read(&sealed).expect("read sealed");
+        // Drop the final chunk, keeping the header and the first chunk intact.
+        let cut = full.len() - (contents.len() / 2);
+        std::fs::write(&sealed, &full[..cut]).expect("truncate");
+
+        let out = dir.join("out.bin");
+        assert!(
+            decrypt_file(&sealed, &out, &key).is_err(),
+            "a truncated archive decrypted successfully"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Flipping a bit inside a chunk must fail the AEAD tag, not surface as altered
+    /// plaintext.
+    #[test]
+    fn tampered_chunk_is_rejected() {
+        let (sealed, key, _) = sealed_fixture("tampered");
+        let dir = sealed.parent().unwrap().to_path_buf();
+
+        let mut bytes = std::fs::read(&sealed).expect("read sealed");
+        // magic (6) + version (1) + chunk size (4) + base nonce (12), then the
+        // 4-byte length of the first chunk: anything past that is ciphertext.
+        const HEADER_LEN: usize = 6 + 1 + 4 + 12 + 4;
+        let target = HEADER_LEN + 64;
+        bytes[target] ^= 0b0000_0001;
+        std::fs::write(&sealed, &bytes).expect("write tampered");
+
+        let out = dir.join("out.bin");
+        assert!(
+            decrypt_file(&sealed, &out, &key).is_err(),
+            "a tampered chunk decrypted successfully"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
