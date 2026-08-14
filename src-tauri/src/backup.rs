@@ -16,8 +16,12 @@
 //! copy "the backup" to a new machine or upload it to Telegram.
 //!
 //! ```text
-//! "WBAK01" | u8 version | u32 header_len (LE) | header JSON | WBENC1 stream
+//! "WBAK01" | u8 version | u32 header_len (LE) | header JSON | WBENC2 stream
 //! ```
+//!
+//! The envelope version does not move when the inner stream format does: the
+//! stream is self-describing through its own magic, so archives written before
+//! `WBENC2` still restore without the envelope needing to say which one it holds.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};

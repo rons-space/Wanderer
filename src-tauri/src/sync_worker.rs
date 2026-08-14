@@ -162,10 +162,15 @@ impl SyncWorker {
                     let processing_path = if encrypted_mode {
                         let decrypt_tmp = std::path::Path::new(&self.backup_path)
                             .join(format!("tg_{}.{}.dec.tmp", msg_id, extension));
+                        // `Unknown`, not `Encrypted`: an encrypted library still holds
+                        // blobs uploaded before encryption was turned on, until the
+                        // migration reaches them, and sync has no per-media row here to
+                        // tell the two apart.
                         match security::decrypt_file_if_needed(
                             &temp_path_buf,
                             &decrypt_tmp,
                             master_key.as_ref(),
+                            security::Expect::Unknown,
                         ) {
                             Ok(_) => {
                                 let _ = fs::remove_file(&temp_path_buf);
