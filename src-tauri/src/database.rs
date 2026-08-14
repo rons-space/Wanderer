@@ -3348,7 +3348,7 @@ mod tests {
 
         // A photo in no album has no entry at all, rather than an empty one, which is
         // what the export's lookup relies on to skip it.
-        assert!(by_media.get(&lonely).is_none());
+        assert!(!by_media.contains_key(&lonely));
     }
 
     /// A `MediaItem` with only the fields the clustering reads set.
