@@ -41,7 +41,14 @@ export function asAppError(error: unknown): AppError | null {
 
 /** The message to show for a rejection, whatever shape it arrived in. */
 export function errorMessage(error: unknown): string {
-    return asAppError(error)?.message ?? String(error);
+    const raw =
+        asAppError(error)?.message ?? (error instanceof Error ? error.message : String(error));
+
+    // A rejection that never reached the AppError shape, a panic in a command or
+    // a throw from the webview side, stringifies with an "Error:" prefix. Inside
+    // a toast that already begins "Failed to save credentials" that prefix is
+    // noise, so it comes off here rather than at each of the call sites.
+    return raw.startsWith("Error:") ? raw.slice(6).trim() : raw;
 }
 
 export function hasErrorCode(error: unknown, code: ErrorCode): boolean {
@@ -60,6 +67,27 @@ export interface MigrationStatus {
 }
 
 export const api = {
+    /**
+     * Sends a webview crash to the backend log.
+     *
+     * Deliberately swallows its own failure: this is called from an error
+     * boundary and from the global handlers, and a throw here would either
+     * replace the crash being reported or start a loop of reports about
+     * failing to report.
+     */
+    reportFrontendError: async (context: string, message: string, stack?: string): Promise<void> => {
+        try {
+            await invoke("report_frontend_error", { context, message, stack });
+        } catch (e) {
+            console.error("Failed to report a frontend error:", e);
+        }
+    },
+
+    /** Absolute path of the log file, for telling the user what to attach. */
+    getLogPath: async (): Promise<string | null> => {
+        return await invoke("get_log_path");
+    },
+
     getSecurityStatus: async (): Promise<{
         onboardingComplete: boolean;
         securityMode: string;
@@ -87,8 +115,23 @@ export const api = {
         return await invoke("lock_encryption");
     },
 
-    recoverEncryption: async (recoveryKey: string, newPassphrase: string): Promise<void> => {
+    /**
+     * Reset the passphrase with the recovery key.
+     *
+     * Returns a *new* recovery key: the one just used is retired, because it
+     * has been typed into a machine and came from wherever the user was keeping
+     * it. Callers must show what comes back, since nothing can produce it again.
+     */
+    recoverEncryption: async (
+        recoveryKey: string,
+        newPassphrase: string,
+    ): Promise<{ recoveryKey: string }> => {
         return await invoke("recover_encryption", { recoveryKey, newPassphrase });
+    },
+
+    /** Change the passphrase for someone who still knows the current one. */
+    changePassphrase: async (currentPassphrase: string, newPassphrase: string): Promise<void> => {
+        return await invoke("change_passphrase", { currentPassphrase, newPassphrase });
     },
 
     regenerateRecoveryKey: async (passphrase: string): Promise<{ recoveryKey: string }> => {

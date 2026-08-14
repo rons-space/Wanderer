@@ -1,4 +1,4 @@
-import { useState, useRef, useLayoutEffect, ComponentType, ReactNode, useMemo } from "react";
+import { useState, useRef, useLayoutEffect, useCallback, memo, ComponentType, ReactNode, useMemo, useEffect } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { MediaItem, Album } from "../types";
@@ -16,76 +16,24 @@ import {
     ContextMenuSeparator,
 } from "@/components/ui/context-menu";
 import { api, errorMessage } from "@/lib/api";
+import type { MediaActions } from "@/hooks/use-media-actions";
+import { handleImageError } from "@/lib/placeholder";
+import {
+    buildDisplayRows,
+    describeItem,
+    findRowIndexAtOffset,
+    firstItemIndexFromRow,
+    formatDateKey,
+    getDateKey,
+    getTimelineTimestamp,
+    measureRows,
+    withLoadingCell,
+    type DisplayRow,
+    type TimelineGrouping,
+} from "@/lib/timeline";
 import { toast } from "sonner";
-import { useEffect } from "react";
 import { useTheme, type ThemeVariant } from "@/contexts/ThemeContext";
 import { Play, Heart, Star, Trash2, Archive, ArchiveRestore, Download, Cloud, Share2, Calendar } from "lucide-react";
-
-// --- Date Separator Helpers ---
-type TimelineGrouping = 'day' | 'month' | 'year';
-type SeparatorRow = {
-    type: 'separator';
-    dateKey: string;
-    label: string;
-    firstItemIndex: number;
-};
-type ItemsRow = {
-    type: 'items';
-    dateKey: string;
-    startIndex: number;
-    count: number;
-};
-type DisplayRow = SeparatorRow | ItemsRow;
-
-const getDateKey = (timestamp: number, grouping: TimelineGrouping): string => {
-    const date = new Date(timestamp * 1000);
-    switch (grouping) {
-        case 'year':
-            return date.getFullYear().toString();
-        case 'month':
-            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-        case 'day':
-        default:
-            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    }
-};
-
-const formatDateKey = (dateKey: string, grouping: TimelineGrouping): string => {
-    const parts = dateKey.split('-');
-    const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-
-    switch (grouping) {
-        case 'year':
-            return parts[0];
-        case 'month':
-            return `${monthNames[parseInt(parts[1]) - 1]} ${parts[0]}`;
-        case 'day':
-        default:
-            return `${monthNames[parseInt(parts[1]) - 1]} ${parseInt(parts[2])}, ${parts[0]}`;
-    }
-};
-
-const parseDateTakenToTimestamp = (dateTaken?: string): number | null => {
-    if (!dateTaken) {
-        return null;
-    }
-
-    // Support "YYYY-MM-DD HH:mm:ss" and "YYYY:MM:DD HH:mm:ss" variants.
-    const normalized = dateTaken
-        .trim()
-        .replace(/^(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3")
-        .replace(" ", "T");
-    const parsed = Date.parse(normalized);
-    if (Number.isNaN(parsed)) {
-        return null;
-    }
-
-    return Math.floor(parsed / 1000);
-};
-
-const getTimelineTimestamp = (item: MediaItem): number => {
-    return parseDateTakenToTimestamp(item.date_taken) ?? item.created_at;
-};
 
 // --- Custom AutoSizer ---
 const useResizeObserver = (ref: React.RefObject<HTMLElement | null>) => {
@@ -121,6 +69,7 @@ interface VirtualGridProps {
     isNextPageLoading: boolean;
     onScroll: (scrollTop: number, clientHeight: number, scrollHeight: number, visibleItemIndex?: number) => void;
     ItemWrapper?: ComponentType<{ item: MediaItem; children: ReactNode }>;
+    contextMenuExtras?: (item: MediaItem) => ReactNode;
     albums: Album[];
     onAddToAlbum: (mediaId: number, albumId: number) => void;
     onItemClick?: (item: MediaItem, e?: React.MouseEvent) => void;
@@ -145,6 +94,7 @@ const VirtualGrid = ({
     isNextPageLoading,
     onScroll,
     ItemWrapper,
+    contextMenuExtras,
     albums,
     onAddToAlbum,
     onItemClick,
@@ -159,6 +109,17 @@ const VirtualGrid = ({
 }: VirtualGridProps) => {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const [scrollTop, setScrollTop] = useState(0);
+    const scrollFrameRef = useRef<number | null>(null);
+    const pendingScrollRef = useRef<{ scrollTop: number; clientHeight: number; scrollHeight: number } | null>(null);
+
+    useEffect(
+        () => () => {
+            if (scrollFrameRef.current !== null) {
+                cancelAnimationFrame(scrollFrameRef.current);
+            }
+        },
+        [],
+    );
 
     const SEPARATOR_ROW_HEIGHT = 36;
     const ITEM_ROW_HEIGHT = columnWidth + gap;
@@ -166,84 +127,20 @@ const VirtualGrid = ({
     // Buffer for smooth scrolling
     const OVERSCAN = 3;
 
-    const rowsWithLoading = useMemo<DisplayRow[]>(() => {
-        if (!isNextPageLoading) {
-            return rows;
-        }
-
-        if (rows.length === 0) {
-            return [{ type: 'items', dateKey: '', startIndex: items.length, count: 1 }];
-        }
-
-        const nextRows = [...rows];
-        const lastRow = nextRows[nextRows.length - 1];
-
-        if (lastRow.type === 'items' && lastRow.count < columnCount) {
-            nextRows[nextRows.length - 1] = {
-                ...lastRow,
-                count: lastRow.count + 1,
-            };
-            return nextRows;
-        }
-
-        nextRows.push({
-            type: 'items',
-            dateKey: lastRow.dateKey,
-            startIndex: items.length,
-            count: 1,
-        });
-        return nextRows;
-    }, [rows, isNextPageLoading, items.length, columnCount]);
-
-    const rowHeights = useMemo(
-        () => rowsWithLoading.map((row) => (row.type === 'separator' ? SEPARATOR_ROW_HEIGHT : ITEM_ROW_HEIGHT)),
-        [rowsWithLoading, ITEM_ROW_HEIGHT]
+    const rowsWithLoading = useMemo<DisplayRow[]>(
+        () => (isNextPageLoading ? withLoadingCell(rows, items.length, columnCount) : rows),
+        [rows, isNextPageLoading, items.length, columnCount],
     );
 
-    const rowOffsets = useMemo(() => {
-        const offsets: number[] = [];
-        let offset = 0;
-
-        for (const rowHeight of rowHeights) {
-            offsets.push(offset);
-            offset += rowHeight;
-        }
-
-        return offsets;
-    }, [rowHeights]);
-
-    const totalHeight = rowHeights.length > 0
-        ? rowOffsets[rowOffsets.length - 1] + rowHeights[rowHeights.length - 1]
-        : 0;
-
-    const findRowIndexAtOffset = (offset: number): number => {
-        if (rowHeights.length === 0) {
-            return -1;
-        }
-
-        let low = 0;
-        let high = rowHeights.length - 1;
-
-        while (low <= high) {
-            const mid = Math.floor((low + high) / 2);
-            const rowStart = rowOffsets[mid];
-            const rowEnd = rowStart + rowHeights[mid];
-
-            if (offset < rowStart) {
-                high = mid - 1;
-            } else if (offset >= rowEnd) {
-                low = mid + 1;
-            } else {
-                return mid;
-            }
-        }
-
-        return Math.max(0, Math.min(rowHeights.length - 1, low));
-    };
+    const layout = useMemo(
+        () => measureRows(rowsWithLoading, SEPARATOR_ROW_HEIGHT, ITEM_ROW_HEIGHT),
+        [rowsWithLoading, ITEM_ROW_HEIGHT]
+    );
+    const totalHeight = layout.totalHeight;
 
     // Calculate visible range
-    const rawVisibleStart = findRowIndexAtOffset(scrollTop);
-    const rawVisibleEnd = findRowIndexAtOffset(scrollTop + height);
+    const rawVisibleStart = findRowIndexAtOffset(layout, scrollTop);
+    const rawVisibleEnd = findRowIndexAtOffset(layout, scrollTop + height);
     const visibleRowStart = rawVisibleStart === -1 ? 0 : Math.max(0, rawVisibleStart - OVERSCAN);
     const visibleRowEnd = rawVisibleEnd === -1 ? -1 : Math.min(rowsWithLoading.length - 1, rawVisibleEnd + OVERSCAN);
 
@@ -255,32 +152,48 @@ const VirtualGrid = ({
     }
 
 
-    const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
-        const { scrollTop, clientHeight, scrollHeight } = e.currentTarget;
-        setScrollTop(scrollTop);
-
-        const visibleRowIndex = findRowIndexAtOffset(scrollTop);
-        let visibleItemIndex: number | undefined;
-
-        if (visibleRowIndex >= 0) {
-            for (let index = visibleRowIndex; index < rowsWithLoading.length; index += 1) {
-                const row = rowsWithLoading[index];
-
-                if (row.type === 'separator') {
-                    visibleItemIndex = row.firstItemIndex;
-                    break;
-                }
-
-                if (items.length > 0) {
-                    visibleItemIndex = Math.min(row.startIndex, items.length - 1);
-                }
-                break;
-            }
+    // A viewport taller than the loaded content never fires a scroll event, so
+    // pagination driven purely by scrolling deadlocks on a large window: the
+    // first page does not fill the screen, and nothing asks for the second.
+    // Report the metrics directly whenever the content stops overflowing.
+    useEffect(() => {
+        if (height <= 0 || totalHeight <= 0 || totalHeight > height) {
+            return;
         }
 
-        onScroll(scrollTop, clientHeight, scrollHeight, visibleItemIndex);
-    };
+        onScroll(0, height, totalHeight, 0);
+    }, [totalHeight, height, onScroll]);
 
+    /**
+     * Coalesced onto the next animation frame. A trackpad flick fires scroll
+     * events far faster than the display refreshes, and each one used to
+     * re-render every visible cell and restart the floating date header's
+     * timer. One frame's worth of work per frame is all that can be shown.
+     */
+    const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+        const { scrollTop, clientHeight, scrollHeight } = e.currentTarget;
+        pendingScrollRef.current = { scrollTop, clientHeight, scrollHeight };
+
+        if (scrollFrameRef.current !== null) {
+            return;
+        }
+
+        scrollFrameRef.current = requestAnimationFrame(() => {
+            scrollFrameRef.current = null;
+            const pending = pendingScrollRef.current;
+            if (!pending) {
+                return;
+            }
+            pendingScrollRef.current = null;
+
+            setScrollTop(pending.scrollTop);
+
+            const visibleRowIndex = findRowIndexAtOffset(layout, pending.scrollTop);
+            const visibleItemIndex = firstItemIndexFromRow(rowsWithLoading, visibleRowIndex, items.length);
+
+            onScroll(pending.scrollTop, pending.clientHeight, pending.scrollHeight, visibleItemIndex);
+        });
+    };
 
 
     return (
@@ -293,8 +206,8 @@ const VirtualGrid = ({
             <div style={{ height: totalHeight, width: "100%", position: "relative" }}>
                 {visibleRows.map((rowIndex) => {
                     const row = rowsWithLoading[rowIndex];
-                    const rowTop = rowOffsets[rowIndex];
-                    const rowHeight = rowHeights[rowIndex];
+                    const rowTop = layout.offsets[rowIndex];
+                    const rowHeight = layout.heights[rowIndex];
 
                     if (row.type === 'separator') {
                         return (
@@ -331,8 +244,12 @@ const VirtualGrid = ({
                         const top = rowTop;
 
                         columns.push(
+                            // Keyed by identity, not position: keying by index
+                            // makes React reuse a cell's DOM for a different
+                            // photo after any insertion or removal, so the old
+                            // image stays on screen until the new one decodes.
                             <div
-                                key={itemIndex}
+                                key={item ? `item-${item.id}` : `placeholder-${itemIndex}`}
                                 style={{
                                     position: "absolute",
                                     left,
@@ -345,6 +262,7 @@ const VirtualGrid = ({
                                     item={item}
                                     isLoading={isLoadingItem}
                                     ItemWrapper={ItemWrapper}
+                                    contextMenuExtras={contextMenuExtras}
                                     albums={albums}
                                     onAddToAlbum={onAddToAlbum}
                                     onItemClick={onItemClick}
@@ -367,10 +285,17 @@ const VirtualGrid = ({
 };
 
 // --- Cell Component ---
-const Cell = ({
+/**
+ * Memoised because the grid re-renders on every scroll frame while the cells it
+ * draws almost never change. This only pays off while every prop below keeps a
+ * stable identity, which is why the handlers arrive from `useMediaActions` and
+ * `ItemWrapper` lives at module scope rather than being redefined per render.
+ */
+const Cell = memo(({
     item,
     isLoading,
     ItemWrapper,
+    contextMenuExtras,
     albums,
     onAddToAlbum,
     onItemClick,
@@ -386,6 +311,7 @@ const Cell = ({
     item?: MediaItem;
     isLoading: boolean;
     ItemWrapper?: ComponentType<{ item: MediaItem; children: ReactNode }>;
+    contextMenuExtras?: (item: MediaItem) => ReactNode;
     albums: Album[];
     onAddToAlbum: (mediaId: number, albumId: number) => void;
     onItemClick?: (item: MediaItem, e?: React.MouseEvent) => void;
@@ -407,26 +333,35 @@ const Cell = ({
 
     const imagePath = item.thumbnail_path || item.file_path;
     const src = convertFileSrc(imagePath);
+    const label = describeItem(item);
 
     const content = (
+        // A div rather than a button because the cell contains its own buttons,
+        // which cannot be nested inside one. The role, tabindex and key handler
+        // are what a button would have given us for free.
         <div
-            className="group relative w-full h-full overflow-hidden rounded-xl border bg-muted shadow-sm transition-all hover:shadow-md cursor-pointer"
+            role="button"
+            tabIndex={0}
+            aria-label={label}
+            className="group focus-visible:ring-ring relative h-full w-full cursor-pointer overflow-hidden rounded-xl border bg-muted shadow-sm transition-all hover:shadow-md focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
             onClick={(e) => onItemClick && item && onItemClick(item, e)}
+            onKeyDown={(e) => {
+                if (e.key !== "Enter" && e.key !== " ") {
+                    return;
+                }
+                // Space scrolls the grid otherwise, which moves the cell the
+                // user was about to open out from under the focus ring.
+                e.preventDefault();
+                onItemClick?.(item);
+            }}
         >
             <img
                 src={src}
-                alt={`Media ${item.id}`}
+                alt=""
                 loading="lazy"
                 decoding="async"
                 className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
-                onError={(e) => {
-                    console.error("Image load failed", {
-                        id: item.id,
-                        src,
-                        path: imagePath
-                    });
-                    e.currentTarget.style.display = 'none';
-                }}
+                onError={handleImageError}
             />
 
             {/* Overlay Gradient */}
@@ -434,6 +369,9 @@ const Cell = ({
 
             {/* Favorite Heart Icon - Always visible if favorited, otherwise on hover */}
             <button
+                type="button"
+                aria-label={item.is_favorite ? "Remove from favorites" : "Add to favorites"}
+                aria-pressed={item.is_favorite}
                 className={`absolute top-2 left-2 flex items-center justify-center rounded-full p-1.5 backdrop-blur-sm transition-all ${item.is_favorite
                     ? 'bg-red-500/80 opacity-100'
                     : 'bg-black/50 opacity-0 group-hover:opacity-100'
@@ -481,6 +419,12 @@ const Cell = ({
                 {wrappedContent}
             </ContextMenuTrigger>
             <ContextMenuContent>
+                {/* View-specific entries (Trash contributes Restore here). They live
+                    in this menu rather than in a wrapper of their own: a second
+                    ContextMenu around the same cell nests the two triggers and the
+                    inner menu swallows the outer one. */}
+                {contextMenuExtras?.(item)}
+
                 {/* Favorite Toggle */}
                 <ContextMenuItem onClick={() => onToggleFavorite(item)}>
                     <Heart className={`mr-2 h-4 w-4 ${item.is_favorite ? 'fill-red-500 text-red-500' : ''}`} />
@@ -625,7 +569,8 @@ const Cell = ({
             </ContextMenuContent>
         </ContextMenu>
     );
-};
+});
+Cell.displayName = "Cell";
 
 // --- Main MediaGrid Export ---
 
@@ -635,148 +580,60 @@ interface MediaGridProps {
     isNextPageLoading: boolean;
     loadNextPage: (startIndex: number, stopIndex: number) => Promise<void>;
     ItemWrapper?: ComponentType<{ item: MediaItem; children: ReactNode }>;
+    contextMenuExtras?: (item: MediaItem) => ReactNode;
     onItemClick?: (item: MediaItem, e?: React.MouseEvent) => void;
-    onItemsChange?: () => void; // Callback to refresh items after changes
+    /** Item mutations, owned by whoever owns `items`. */
+    actions: MediaActions;
 }
 
-export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage, ItemWrapper, onItemClick, onItemsChange }: MediaGridProps) {
+export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage, ItemWrapper, contextMenuExtras, onItemClick, actions }: MediaGridProps) {
     const containerRef = useRef<HTMLDivElement>(null);
     const { width, height } = useResizeObserver(containerRef);
     const { theme } = useTheme();
 
     const [albums, setAlbums] = useState<Album[]>([]);
-    const [localItems, setLocalItems] = useState<MediaItem[]>(items);
     const [timelineGrouping, setTimelineGrouping] = useState<TimelineGrouping>('day');
     const [currentDateHeader, setCurrentDateHeader] = useState<string | null>(null);
     const [showDateHeader, setShowDateHeader] = useState(false);
     const hideHeaderTimeout = useRef<NodeJS.Timeout | null>(null);
 
-    // Sync local items with props
-    useEffect(() => {
-        setLocalItems(items);
-    }, [items]);
+    // The floating date header schedules a hide on every scroll event. Without
+    // this, the last one outlives the component and fires setState on it.
+    useEffect(
+        () => () => {
+            if (hideHeaderTimeout.current) {
+                clearTimeout(hideHeaderTimeout.current);
+            }
+        },
+        [],
+    );
 
     // Load timeline grouping config
     useEffect(() => {
+        let cancelled = false;
+
         api.getAllConfig().then((data) => {
+            if (cancelled) return;
             const grouping = data?.timeline_grouping as TimelineGrouping || 'day';
             setTimelineGrouping(grouping);
         }).catch(console.error);
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     useEffect(() => {
-        api.getAlbums().then(setAlbums).catch(console.error);
+        let cancelled = false;
+
+        api.getAlbums().then((loaded) => {
+            if (!cancelled) setAlbums(loaded);
+        }).catch(console.error);
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
-
-    const handleAddToAlbum = async (mediaId: number, albumId: number) => {
-        try {
-            await api.addMediaToAlbum(albumId, mediaId);
-            toast.success("Added to album");
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to add to album");
-        }
-    };
-
-    const handleToggleFavorite = async (item: MediaItem) => {
-        try {
-            const newFavoriteState = await api.toggleFavorite(item.id);
-            // Optimistic update
-            setLocalItems(prev =>
-                prev.map(i =>
-                    i.id === item.id ? { ...i, is_favorite: newFavoriteState } : i
-                )
-            );
-            toast.success(newFavoriteState ? "Added to favorites" : "Removed from favorites");
-            // Notify parent to refresh (especially important for Favorites view)
-            if (!newFavoriteState) {
-                onItemsChange?.();
-            }
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to update favorite");
-        }
-    };
-
-    const handleSetRating = async (mediaId: number, rating: number) => {
-        try {
-            await api.setRating(mediaId, rating);
-            // Optimistic update
-            setLocalItems(prev =>
-                prev.map(i =>
-                    i.id === mediaId ? { ...i, rating } : i
-                )
-            );
-            toast.success(rating > 0 ? `Rated ${rating} stars` : "Rating removed");
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to set rating");
-        }
-    };
-
-    const handleDelete = async (mediaId: number) => {
-        try {
-            await api.softDeleteMedia(mediaId);
-            // Remove from local state
-            setLocalItems(prev => prev.filter(i => i.id !== mediaId));
-            toast.success("Moved to trash");
-            onItemsChange?.();
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to move to trash");
-        }
-    };
-
-    const handleArchive = async (mediaId: number) => {
-        try {
-            await api.archiveMedia(mediaId);
-            // Remove from view immediately (instead of just setting flag)
-            setLocalItems(prev => prev.filter(i => i.id !== mediaId));
-            toast.success("Archived");
-            onItemsChange?.();
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to archive");
-        }
-    };
-
-    const handleUnarchive = async (mediaId: number) => {
-        try {
-            await api.unarchiveMedia(mediaId);
-            setLocalItems(prev => prev.map(i => i.id === mediaId ? { ...i, is_archived: false } : i));
-            toast.success("Unarchived");
-            onItemsChange?.();
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to unarchive");
-        }
-    };
-
-    const handleRemoveLocalCopy = async (mediaId: number) => {
-        try {
-            await api.removeLocalCopy(mediaId);
-            setLocalItems(prev => prev.map(i => i.id === mediaId ? { ...i, is_cloud_only: true } : i));
-            toast.success("Local copy removed (Cloud Only)");
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to remove local copy");
-        }
-    };
-
-    const handleDownloadLocalCopy = async (mediaId: number) => {
-        try {
-            toast.promise(api.downloadLocalCopy(mediaId), {
-                loading: 'Downloading...',
-                success: () => {
-                    setLocalItems(prev => prev.map(i => i.id === mediaId ? { ...i, is_cloud_only: false } : i));
-                    return "Downloaded local copy";
-                },
-                error: (err) => `Failed to download: ${errorMessage(err)}`
-            });
-        } catch (e) {
-            console.error(e);
-        }
-    };
 
     const GAP = 16;
     const MIN_COLUMN_WIDTH = 180;
@@ -793,61 +650,25 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
     // columnWidth = (contentWidth - (columnCount - 1) * gap) / columnCount
     const columnWidth = Math.floor((contentWidth - ((columnCount - 1) * GAP)) / columnCount);
 
-    const displayRows = useMemo<DisplayRow[]>(() => {
-        if (localItems.length === 0 || columnCount <= 0) {
-            return [];
-        }
+    const displayRows = useMemo<DisplayRow[]>(
+        () => buildDisplayRows(items, timelineGrouping, columnCount),
+        [items, timelineGrouping, columnCount],
+    );
 
-        const rows: DisplayRow[] = [];
-        let index = 0;
-
-        while (index < localItems.length) {
-            const dateKey = getDateKey(getTimelineTimestamp(localItems[index]), timelineGrouping);
-            rows.push({
-                type: 'separator',
-                dateKey,
-                label: formatDateKey(dateKey, timelineGrouping),
-                firstItemIndex: index,
-            });
-
-            let groupEnd = index + 1;
-            while (
-                groupEnd < localItems.length &&
-                getDateKey(getTimelineTimestamp(localItems[groupEnd]), timelineGrouping) === dateKey
-            ) {
-                groupEnd += 1;
-            }
-
-            let rowStart = index;
-            while (rowStart < groupEnd) {
-                const count = Math.min(columnCount, groupEnd - rowStart);
-                rows.push({
-                    type: 'items',
-                    dateKey,
-                    startIndex: rowStart,
-                    count,
-                });
-                rowStart += count;
-            }
-
-            index = groupEnd;
-        }
-
-        return rows;
-    }, [localItems, timelineGrouping, columnCount]);
-
-    const handleScroll = (scrollTop: number, clientHeight: number, scrollHeight: number, visibleItemIndex?: number) => {
+    // Stable identity: VirtualGrid depends on this in an effect to break the
+    // no-overflow deadlock, and a fresh function each render would re-run it.
+    const handleScroll = useCallback((scrollTop: number, clientHeight: number, scrollHeight: number, visibleItemIndex?: number) => {
         if (!hasNextPage || isNextPageLoading) return;
 
         // Load more when near bottom (e.g. 2 screens away)
         if (scrollHeight - (scrollTop + clientHeight) < clientHeight * 2) {
-            loadNextPage(localItems.length, localItems.length + 20);
+            loadNextPage(items.length, items.length + 20);
         }
 
         // Calculate current visible item for date header
-        if (localItems.length > 0) {
-            const index = Math.max(0, Math.min(visibleItemIndex ?? 0, localItems.length - 1));
-            const visibleItem = localItems[index];
+        if (items.length > 0) {
+            const index = Math.max(0, Math.min(visibleItemIndex ?? 0, items.length - 1));
+            const visibleItem = items[index];
             if (visibleItem) {
                 const dateKey = getDateKey(getTimelineTimestamp(visibleItem), timelineGrouping);
                 const formatted = formatDateKey(dateKey, timelineGrouping);
@@ -863,7 +684,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
                 }, 1500);
             }
         }
-    };
+    }, [hasNextPage, isNextPageLoading, loadNextPage, items, timelineGrouping]);
 
     return (
         <div ref={containerRef} className="w-full h-full flex-1 min-h-0 overflow-hidden bg-background relative">
@@ -880,7 +701,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
 
             {width > 0 && height > 0 ? (
                 <VirtualGrid
-                    items={localItems || []}
+                    items={items || []}
                     rows={displayRows}
                     columnCount={columnCount}
                     columnWidth={columnWidth}
@@ -890,16 +711,17 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
                     isNextPageLoading={isNextPageLoading}
                     onScroll={handleScroll}
                     ItemWrapper={ItemWrapper}
+                    contextMenuExtras={contextMenuExtras}
                     albums={albums}
-                    onAddToAlbum={handleAddToAlbum}
+                    onAddToAlbum={actions.addToAlbum}
                     onItemClick={onItemClick}
-                    onToggleFavorite={handleToggleFavorite}
-                    onSetRating={handleSetRating}
-                    onDelete={handleDelete}
-                    onArchive={handleArchive}
-                    onUnarchive={handleUnarchive}
-                    onRemoveLocalCopy={handleRemoveLocalCopy}
-                    onDownloadLocalCopy={handleDownloadLocalCopy}
+                    onToggleFavorite={actions.toggleFavorite}
+                    onSetRating={actions.setRating}
+                    onDelete={actions.remove}
+                    onArchive={actions.archive}
+                    onUnarchive={actions.unarchive}
+                    onRemoveLocalCopy={actions.removeLocalCopy}
+                    onDownloadLocalCopy={actions.downloadLocalCopy}
                     theme={theme}
                 />
             ) : (

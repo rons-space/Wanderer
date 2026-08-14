@@ -1,5 +1,8 @@
 import { useState, useEffect } from "react";
+import { useLatestRequest } from "@/hooks/use-latest-request";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "@/lib/api";
+import { PLACEHOLDER_SRC, handleImageError } from "@/lib/placeholder";
 import { MediaItem, Tag as TagData } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +15,7 @@ export function Tags() {
     const [isLoading, setIsLoading] = useState(true);
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
     const [tagMedia, setTagMedia] = useState<MediaItem[]>([]);
+    const beginTagRequest = useLatestRequest();
 
     const loadTags = async () => {
         setIsLoading(true);
@@ -32,10 +36,15 @@ export function Tags() {
 
     const handleSelectTag = async (tag: string) => {
         setSelectedTag(tag);
+        // Clicking through tags faster than they load used to leave whichever
+        // request finished last on screen, under whichever tag was selected last.
+        const isCurrent = beginTagRequest();
         try {
             const media = await api.getMediaByTag(tag, 100, 0);
+            if (!isCurrent()) return;
             setTagMedia(media);
         } catch (e) {
+            if (!isCurrent()) return;
             console.error("Failed to load photos for this tag:", e);
             toast.error("Failed to load photos for this tag");
         }
@@ -59,7 +68,7 @@ export function Tags() {
         return (
             <div className="h-full w-full flex flex-col">
                 <div className="flex items-center gap-4 p-4 border-b">
-                    <Button variant="ghost" size="icon" onClick={handleBack}>
+                    <Button variant="ghost" size="icon" onClick={handleBack} aria-label="Back to tags">
                         <ChevronLeft className="h-5 w-5" />
                     </Button>
                     <div className="flex items-center gap-3">
@@ -84,11 +93,12 @@ export function Tags() {
                                 <img
                                     src={
                                         item.thumbnail_path
-                                            ? `asset://localhost/${encodeURIComponent(item.thumbnail_path)}`
-                                            : "/placeholder.jpg"
+                                            ? convertFileSrc(item.thumbnail_path)
+                                            : PLACEHOLDER_SRC
                                     }
                                     alt=""
                                     className="w-full h-full object-cover"
+                                    onError={handleImageError}
                                 />
                             </div>
                         ))}

@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Person, MediaItem } from "../types";
 import { api } from "../lib/api";
+import { useMediaActions } from "@/hooks/use-media-actions";
 import { MediaGrid } from "./MediaGrid";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -24,6 +25,12 @@ interface PersonDetailProps {
 
 export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
     const [items, setItems] = useState<MediaItem[]>([]);
+    // The grid mutates items through their owner rather than a copy of its own.
+    const updateItems = useCallback(
+        (updater: (current: MediaItem[]) => MediaItem[]) => setItems(updater),
+        [],
+    );
+    const actions = useMediaActions(updateItems);
     const [hasNextPage, setHasNextPage] = useState(true);
     const [isNextPageLoading, setIsNextPageLoading] = useState(false);
 
@@ -144,7 +151,7 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
     return (
         <div className="h-full w-full flex flex-col">
             <div className="flex items-center gap-2 p-4 border-b">
-                <Button variant="ghost" size="icon" onClick={() => onBack()}>
+                <Button variant="ghost" size="icon" onClick={() => onBack()} aria-label="Back to people">
                     <ArrowLeft className="h-4 w-4" />
                 </Button>
 
@@ -160,10 +167,10 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
                                     if (e.key === "Escape") setIsEditing(false);
                                 }}
                             />
-                            <Button size="icon" variant="ghost" onClick={handleRename} disabled={isSavingName}>
+                            <Button size="icon" variant="ghost" onClick={handleRename} disabled={isSavingName} aria-label="Save name">
                                 <Save className="h-4 w-4 text-green-500" />
                             </Button>
-                            <Button size="icon" variant="ghost" onClick={() => setIsEditing(false)}>
+                            <Button size="icon" variant="ghost" onClick={() => setIsEditing(false)} aria-label="Cancel renaming">
                                 <X className="h-4 w-4 text-red-500" />
                             </Button>
                         </div>
@@ -175,6 +182,7 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
                             <Button
                                 size="icon"
                                 variant="ghost"
+                                aria-label="Rename person"
                                 className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity"
                                 onClick={() => {
                                     setNewName(person.name || "");
@@ -199,6 +207,7 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
                     isNextPageLoading={isNextPageLoading}
                     loadNextPage={loadNextPage}
                     onItemClick={handleItemClick}
+                    actions={actions}
                 />
             </div>
 
@@ -206,6 +215,8 @@ export function PersonDetail({ person, onBack, onUpdate }: PersonDetailProps) {
                 item={selectedMedia}
                 open={isViewerOpen}
                 onClose={() => setIsViewerOpen(false)}
+                items={items}
+                onNavigate={setSelectedMedia}
             />
 
             <Dialog open={isMergeDialogOpen} onOpenChange={setIsMergeDialogOpen}>

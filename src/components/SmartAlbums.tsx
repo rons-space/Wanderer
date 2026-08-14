@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
+import { useLatestRequest } from "@/hooks/use-latest-request";
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { PLACEHOLDER_SRC, handleImageError } from '@/lib/placeholder';
 import { api } from "@/lib/api";
 import { MediaItem } from "@/types";
 import { Card, CardContent } from "@/components/ui/card";
@@ -45,6 +47,7 @@ export function SmartAlbums() {
     const [selectedAlbum, setSelectedAlbum] = useState<SmartAlbumType | null>(null);
     const [albumItems, setAlbumItems] = useState<MediaItem[]>([]);
     const [selectedItem, setSelectedItem] = useState<MediaItem | null>(null);
+    const beginAlbumRequest = useLatestRequest();
 
     const loadCounts = useCallback(async () => {
         try {
@@ -64,6 +67,9 @@ export function SmartAlbums() {
 
     const loadAlbum = async (type: SmartAlbumType) => {
         setSelectedAlbum(type);
+        // Switching albums while one is loading used to render the slower album's
+        // contents under the newer album's heading.
+        const isCurrent = beginAlbumRequest();
         try {
             let items: MediaItem[];
             switch (type) {
@@ -77,8 +83,10 @@ export function SmartAlbums() {
                     items = await api.getTopRated(100, 0);
                     break;
             }
+            if (!isCurrent()) return;
             setAlbumItems(items);
         } catch (e) {
+            if (!isCurrent()) return;
             console.error("Failed to load album contents:", e);
             toast.error("Failed to load album contents");
         }
@@ -105,7 +113,7 @@ export function SmartAlbums() {
         return (
             <div className="h-full w-full flex flex-col">
                 <div className="flex items-center gap-4 p-4 border-b">
-                    <Button variant="ghost" size="icon" onClick={handleBack}>
+                    <Button variant="ghost" size="icon" onClick={handleBack} aria-label="Back to smart albums">
                         <ChevronLeft className="h-5 w-5" />
                     </Button>
                     <div className="flex items-center gap-3">
@@ -139,6 +147,7 @@ export function SmartAlbums() {
                                                 src={convertFileSrc(item.thumbnail_path)}
                                                 alt=""
                                                 className="w-full h-full object-cover"
+                                                onError={handleImageError}
                                             />
                                         ) : item.mime_type?.startsWith('video/') ? (
                                             <div className="w-full h-full flex items-center justify-center bg-muted">
@@ -146,7 +155,7 @@ export function SmartAlbums() {
                                             </div>
                                         ) : (
                                             <img
-                                                src="/placeholder.jpg"
+                                                src={PLACEHOLDER_SRC}
                                                 alt=""
                                                 className="w-full h-full object-cover"
                                             />
@@ -164,6 +173,8 @@ export function SmartAlbums() {
                         item={selectedItem}
                         open={!!selectedItem}
                         onClose={() => setSelectedItem(null)}
+                        items={albumItems}
+                        onNavigate={setSelectedItem}
                     />
                 )}
             </div>

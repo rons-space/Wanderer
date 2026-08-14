@@ -113,16 +113,13 @@ pub fn hash_file_streaming(path: &Path) -> std::io::Result<String> {
 /// Perceptual hashes are similar for visually similar images,
 /// enabling duplicate detection regardless of resolution/compression.
 pub fn generate_phash(path: &Path) -> Option<String> {
-    use img_hash::{HasherConfig, ImageHash};
+    use image_hasher::HasherConfig;
 
-    // Decode via explicitly configured image 0.23 dependency (with codecs enabled).
-    // This matches img_hash's expected image types while ensuring JPEG/PNG decode works.
-    let img = image_023::open(path).ok()?;
+    let img = image::open(path).ok()?;
     let hasher = HasherConfig::new()
         .hash_size(8, 8) // 64-bit hash
         .to_hasher();
-    let hash: ImageHash = hasher.hash_image(&img);
-    Some(hash.to_base64())
+    Some(hasher.hash_image(&img).to_base64())
 }
 
 /// Generate a thumbnail for an image file.
@@ -328,28 +325,9 @@ pub async fn generate_video_thumbnail(
     }
 }
 
-/// Escape special characters in LIKE patterns to prevent SQL injection issues.
-// Broken as written: it inserts backslashes without an `ESCAPE '\\'` clause, so the
-// pattern it produces matches literal backslashes. Its only caller,
-// `Database::search_media`, is itself dead, and T55 (issue #63) deletes both.
-#[allow(dead_code)]
-pub fn escape_like_pattern(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_escape_like_pattern() {
-        assert_eq!(escape_like_pattern("test"), "test");
-        assert_eq!(escape_like_pattern("100%"), "100\\%");
-        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
-        assert_eq!(escape_like_pattern("c:\\path"), "c:\\\\path");
-    }
 
     /// A directory that removes itself, so the executable-lookup tests leave nothing
     /// behind in the temp directory.

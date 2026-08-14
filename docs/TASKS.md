@@ -40,26 +40,42 @@ Findings by severity in the source review: **4 Critical, 26 High, 26 Medium, 13 
 
 ## Status snapshot
 
-Stages 0, 1 and 2 are complete and promoted to `main`, except T17, which needs a signing
-certificate and an updater keypair that are not in this repository. Stage 3 has not started.
+Stages 0, 1, 2 and 3 are complete on `dev`. T17 is the one task from the earlier stages that is
+not, because it needs a signing certificate and an updater keypair that are not in this
+repository ([#25](https://github.com/rons-space/Wanderer/issues/25)).
 
-Stage 2 left two things behind, both filed rather than forgotten: the Windows DPAPI paths added
-for the Telegram session (#30) are compile-checked only, because CI runs on Linux, and
-deduplicating `media.file_path` so its index can be `UNIQUE` is [#98](https://github.com/rons-space/Wanderer/issues/98).
+Four follow-ups filed during those stages are also closed on `dev`: the `media.file_path`
+deduplication and its `UNIQUE` index ([#98](https://github.com/rons-space/Wanderer/issues/98)),
+a size bound on the thumbnail cache that gives `cache_size_mb` a meaning
+([#73](https://github.com/rons-space/Wanderer/issues/73)), the removal of the unused filesystem
+plugin and its capability grants ([#110](https://github.com/rons-space/Wanderer/issues/110)), and
+the move from the unmaintained `img_hash` to `image_hasher`
+([#82](https://github.com/rons-space/Wanderer/issues/82)), which clears RUSTSEC-2023-0080 and
+collapses three copies of the `image` crate into one.
+
+Still open, and deliberately so: installer signing and the updater
+([#25](https://github.com/rons-space/Wanderer/issues/25)), the restore-from-backup entry point in
+onboarding ([#70](https://github.com/rons-space/Wanderer/issues/70)), moving the file picker into
+Rust so a path the user never chose cannot reach the import loop
+([#78](https://github.com/rons-space/Wanderer/issues/78)), and the tract 0.23 upgrade that would
+clear RUSTSEC-2026-0217 ([#81](https://github.com/rons-space/Wanderer/issues/81)), which needs the
+face detection path re-tested against real images rather than merely compiled. The Windows DPAPI
+paths added for the Telegram session (#30) remain compile-checked only, because CI runs on
+Linux.
 
 | Check | Result |
 | --- | --- |
 | `tauri_plugin_mcp_bridge::init()` gated | Yes. Opt-in `mcp-bridge` feature, debug builds only, bound to localhost |
-| Thumbnail eviction listener deletes files | No. `cache.rs` and the `moka` dependency are gone |
+| Thumbnail eviction listener deletes files | No. Eviction clears `media.thumbnail_path` before it unlinks (#73) |
 | Encrypted backup is recoverable | Yes. `WBAK01` carries wrapped key material, openable with passphrase or recovery key |
 | Caller-supplied paths confined | Yes, through `paths::confine` and `Database::delete_managed_file` |
-| `Tags.tsx` hand-built `asset://` URL | Yes, still at `src/components/Tags.tsx:86` (T38, Stage 3) |
+| `Tags.tsx` hand-built `asset://` URL | No. It goes through `convertFileSrc` (T38) |
 | CI workflow (build / lint / test) | Yes. `.github/workflows/ci.yml`: frontend, Rust, audit |
-| ESLint / `rustfmt.toml` / `clippy.toml` | Present. 0 lint errors, 47 warnings pinned as a ratchet |
+| ESLint / `rustfmt.toml` / `clippy.toml` | Present. 0 lint errors, 34 warnings pinned as a ratchet |
 | `LICENSE` / `SECURITY.md` | Present. AGPL-3.0 |
 | Lockfiles committed | One (`package-lock.json`) |
 | Stray files | Removed, with the unused 1.2 MB ONNX model |
-| Rust advisories | 11 of 15 cleared; 4 ignored with reasoning in `src-tauri/.cargo/audit.toml` |
+| Rust advisories | 12 of 15 cleared; 3 ignored with reasoning in `src-tauri/.cargo/audit.toml` |
 | Downloaded models verified | Yes. SHA-256 and length pinned, checked before the parser sees the bytes |
 | Telegram session at rest | Encrypted. DPAPI with entropy on Windows, master-key sealed elsewhere |
 | Command errors | Typed. `AppError` carries a code; library causes are logged, not displayed |
@@ -299,102 +315,102 @@ of this stage is additive and low-risk.
 
 ## Stage 3: Quality and maintainability
 
-- [ ] [#46](https://github.com/rons-space/Wanderer/issues/46) **T38: `Tags.tsx` must use `convertFileSrc`** (Finding 6.8, Medium)
+- [x] [#46](https://github.com/rons-space/Wanderer/issues/46) **T38: `Tags.tsx` must use `convertFileSrc`** (Finding 6.8, Medium)
   `src/components/Tags.tsx:86` hand-builds `asset://localhost/...`, which does not resolve on Windows.
   Likely user-visible today; ~15 minutes.
 
-- [ ] [#47](https://github.com/rons-space/Wanderer/issues/47) **T39: Five functional frontend bugs** (Finding 6.9, **High**/Medium)
+- [x] [#47](https://github.com/rons-space/Wanderer/issues/47) **T39: Five functional frontend bugs** (Finding 6.9, **High**/Medium)
   Infinite-scroll deadlock on large viewports (`MediaGrid.tsx:839-845` with the 20-item initial load
   at `Gallery.tsx:66`); `media-added` resetting pagination (`Gallery.tsx:75-80`); nested Trash context
   menus (`Trash.tsx:39-50`); `FLOOD_WAIT` progress going negative past 60s (`UploadQueue.tsx:198`);
   missing `public/placeholder.jpg` with a self-retriggering `onError` (`DuplicateReview.tsx:26,229`).
 
-- [ ] [#48](https://github.com/rons-space/Wanderer/issues/48) **T40: One `<EnableEncryption>` component** (Finding 6.1, **High**)
+- [x] [#48](https://github.com/rons-space/Wanderer/issues/48) **T40: One `<EnableEncryption>` component** (Finding 6.1, **High**)
   The Settings path (`Settings.tsx:601-609`) has no verification gate and no download/print/copy
   affordances, so a user can enable encryption and permanently lose recoverability. Extract the safe
   onboarding flow (`Onboarding.tsx:170-194`) and use it in both places.
 
-- [ ] [#49](https://github.com/rons-space/Wanderer/issues/49) **T41: Recovery-key handling in onboarding** (Findings 6.2, 6.9, **High**)
+- [x] [#49](https://github.com/rons-space/Wanderer/issues/49) **T41: Recovery-key handling in onboarding** (Findings 6.2, 6.9, **High**)
   Close the print window and surface a blocked `window.open` (`Onboarding.tsx:101-111`); handle the
   clipboard rejection (`:526-528`); defer the blob revoke (`:89-99`); mask the `apiHash` input
   (`:620-627`).
 
-- [ ] [#50](https://github.com/rons-space/Wanderer/issues/50) **T42: Stop remounting every grid cell** (Finding 6.4, **High**)
+- [x] [#50](https://github.com/rons-space/Wanderer/issues/50) **T42: Stop remounting every grid cell** (Finding 6.4, **High**)
   Hoist `SelectableItemWrapper` (`Gallery.tsx:158`) and `ItemWrapper` (`Trash.tsx:124`) to module
   scope; `memo()` the `Cell`; `useCallback` the ten handler props; key by `item.id` rather than array
   index (`MediaGrid.tsx:335`, `DuplicateReview.tsx:206`); throttle scroll state through `rAF`.
 
-- [ ] [#51](https://github.com/rons-space/Wanderer/issues/51) **T43: Add a request guard to the shared fetch path** (Finding 6.10, Medium)
+- [x] [#51](https://github.com/rons-space/Wanderer/issues/51) **T43: Add a request guard to the shared fetch path** (Finding 6.10, Medium)
   There are zero `AbortController`s or request guards; a monotonic request id fixes `Search.tsx`,
   `Tags.tsx`, `SmartAlbums.tsx` and `MediaViewer.tsx` at once. In encrypted mode the viewer can
   currently display the wrong decrypted photo.
 
-- [ ] [#52](https://github.com/rons-space/Wanderer/issues/52) **T44: Accessibility** (Finding 6.5, **High**)
+- [x] [#52](https://github.com/rons-space/Wanderer/issues/52) **T44: Accessibility** (Finding 6.5, **High**)
   Zero `aria-label` in app code against 26 icon buttons; the photo grid is a click-only `<div>`
   (`MediaGrid.tsx:412-415`) and is unreachable by keyboard; `MediaViewer` has no arrow-key navigation
   because it receives a single item rather than a list and an index.
 
-- [ ] [#53](https://github.com/rons-space/Wanderer/issues/53) **T45: Delete dead code and de-duplicate the copied flows** (Finding 6.6, Medium)
+- [x] [#53](https://github.com/rons-space/Wanderer/issues/53) **T45: Delete dead code and de-duplicate the copied flows** (Finding 6.6, Medium)
   Remove `LoginView.tsx`, `Sidebar.tsx`, `ThemeSwitcher.tsx`; extract one `<TelegramLogin>` from the
   three implementations; replace the seven copy-pasted pagination blocks with one
   `usePaginatedMedia(fetcher)` hook plus a `MediaListView` shell (~400 lines deleted, and it fixes the
   duplicate-React-key bug in `Favorites`/`Archive`/`Trash`).
 
-- [ ] [#54](https://github.com/rons-space/Wanderer/issues/54) **T46: Apply the existing `map_media_row` helper** (Finding 4.6, Medium)
+- [x] [#54](https://github.com/rons-space/Wanderer/issues/54) **T46: Apply the existing `map_media_row` helper** (Finding 4.6, Medium)
   It exists at `database.rs:1401-1434` and is used 3 times; the 24-field mapping is written inline 17
   more times. Roughly 500 lines deleted with no behaviour change: the highest-value, lowest-risk
   refactor in the repository.
 
-- [ ] [#55](https://github.com/rons-space/Wanderer/issues/55) **T47: Fix the error boundary** (Finding 6.7, Medium)
+- [x] [#55](https://github.com/rons-space/Wanderer/issues/55) **T47: Fix the error boundary** (Finding 6.7, Medium)
   Move it outermost in `main.tsx` so `ThemeProvider` is covered, add a reload button, add per-view
   boundaries, and report crashes instead of `console.error`.
 
-- [ ] [#56](https://github.com/rons-space/Wanderer/issues/56) **T48: Frontend lifecycle correctness** (Findings 6.7, 6.6, Medium)
+- [x] [#56](https://github.com/rons-space/Wanderer/issues/56) **T48: Frontend lifecycle correctness** (Findings 6.7, 6.6, Medium)
   Fix the two broken Tauri listener cleanups (`Settings.tsx:125-133`, `Gallery.tsx:60-87`; the correct
   pattern is at `UploadQueue.tsx:80-86`); clear the scroll timeout (`MediaGrid.tsx:861`); remove the
   prop-mirroring `localItems` state and lift the eight mutation handlers out of `MediaGrid`.
 
-- [ ] [#57](https://github.com/rons-space/Wanderer/issues/57) **T49: Duplicate detection and the N+1 queries** (Finding 4.3, **High**)
+- [x] [#57](https://github.com/rons-space/Wanderer/issues/57) **T49: Duplicate detection and the N+1 queries** (Finding 4.3, **High**)
   Parse each phash once and bucket by prefix instead of the O(n^2) pairwise scan under the connection
   lock (`database.rs:2653-2660`, `113-131`); fix the four N+1 patterns (`lib.rs:2291-2302`,
   `1562-1573`, `1504-1514`, `database.rs:2436-2441`).
 
-- [ ] [#58](https://github.com/rons-space/Wanderer/issues/58) **T50: Decide the map question** (Finding 6.7, Medium)
+- [x] [#58](https://github.com/rons-space/Wanderer/issues/58) **T50: Decide the map question** (Finding 6.7, Medium)
   `MapView` loads OSM tiles and unpkg marker icons that the CSP blocks, so the map cannot render, and
   the requests contradict the privacy positioning. Either vendor the Leaflet assets and allow the tile
   host in `img-src`, or remove the map.
 
-- [ ] [#59](https://github.com/rons-space/Wanderer/issues/59) **T51: Passphrase and recovery-key lifecycle** (Findings 1.7, 1.8, Medium)
+- [x] [#59](https://github.com/rons-space/Wanderer/issues/59) **T51: Passphrase and recovery-key lifecycle** (Findings 1.7, 1.8, Medium)
   Rotate the recovery wrap and verifier inside `recover_and_rewrap` and return a fresh key; add
   `change_passphrase(old, new)`; hoist the 8-character check into one shared validator that also
   covers the reset path and resolves the trim inconsistency (`security/mod.rs:100-107, 143-166`).
 
-- [ ] [#60](https://github.com/rons-space/Wanderer/issues/60) **T52: Widen the nonce** (Finding 1.6, Medium)
+- [x] [#60](https://github.com/rons-space/Wanderer/issues/60) **T52: Widen the nonce** (Finding 1.6, Medium)
   The chunk counter overwrites the last 4 bytes of the random base nonce (`security/mod.rs:289-293`),
   leaving 64 bits of per-file entropy. Store a random `file_id` in the header and derive a per-file
   subkey; composes with T21.
 
-- [ ] [#61](https://github.com/rons-space/Wanderer/issues/61) **T53: Trim the bundle** (Finding 7.7, Medium/Low)
+- [x] [#61](https://github.com/rons-space/Wanderer/issues/61) **T53: Trim the bundle** (Finding 7.7, Medium/Low)
   Delete the unused `react-window*`, `react-virtualized-auto-sizer`, `motion`, `date-fns` and
   `@tauri-apps/plugin-fs` dependencies and the stale `optimizeDeps` block (`vite.config.ts:16-18`);
   add code splitting to the single 876 kB chunk.
 
-- [ ] [#62](https://github.com/rons-space/Wanderer/issues/62) **T54: Add error reporting** (Findings 7.7, 4.7, Medium)
+- [x] [#62](https://github.com/rons-space/Wanderer/issues/62) **T54: Add error reporting** (Findings 7.7, 4.7, Medium)
   Nothing is reportable from a shipped build today: `println!` goes to a discarded stdout and
   `console.*` is invisible in a packaged desktop app. Add reporting on both sides and audit the
   payload for PII.
 
-- [ ] [#63](https://github.com/rons-space/Wanderer/issues/63) **T55: Remove broken and dead helpers** (Finding 4.7, Low)
+- [x] [#63](https://github.com/rons-space/Wanderer/issues/63) **T55: Remove broken and dead helpers** (Finding 4.7, Low)
   `escape_like_pattern` (`media_utils.rs:252-256`) inserts literal backslashes with no `ESCAPE '\'`
   clause, so it breaks searches rather than escaping them; its only caller `Database::search_media` is
   dead. Also delete `Database::get_persons`, the `debug_reset_faces` command, and the LLM
   self-dialogue comments at `lib.rs:878-901`.
 
-- [ ] [#64](https://github.com/rons-space/Wanderer/issues/64) **T56: Release profile and target gating** (Findings 7.6, 4.7, Medium)
+- [x] [#64](https://github.com/rons-space/Wanderer/issues/64) **T56: Release profile and target gating** (Findings 7.6, 4.7, Medium)
   Add `[profile.release]` with `lto` and `strip`; target-gate `windows-sys` (`Cargo.toml:63`) so
   non-Windows builds are possible.
 
-- [ ] [#65](https://github.com/rons-space/Wanderer/issues/65) **T57: Extend the Vitest suite** (Finding 7.4, Medium)
+- [x] [#65](https://github.com/rons-space/Wanderer/issues/65) **T57: Extend the Vitest suite** (Finding 7.4, Medium)
   Next targets are the pure functions still buried in components: `parseDateTakenToTimestamp` and the
   grouping helpers (`MediaGrid.tsx:40-88`), `buildDisplayRows` and `findRowIndexAtOffset`
   (`MediaGrid.tsx:198-242, 796-837`), the search-history helpers (`Search.tsx:23-37`), `createFilters`
@@ -402,7 +418,7 @@ of this stage is additive and low-risk.
   against a mocked fetcher, asserting dedupe, `hasNextPage=false` on an empty page, and the T43 race
   guard.
 
-- [ ] [#66](https://github.com/rons-space/Wanderer/issues/66) **T58: Split the god files** (Findings 4.6, 6.6, Medium)
+- [x] [#66](https://github.com/rons-space/Wanderer/issues/66) **T58: Split the god files** (Findings 4.6, 6.6, Medium)
   `database.rs` (3,264 lines, 89 public methods, three unlabelled `impl` blocks) and `lib.rs` (2,545
   lines, all 74 command handlers) split cleanly along domain lines; `Settings.tsx` (1,302 lines, 17
   `useState`, five unrelated concerns) splits per tab.

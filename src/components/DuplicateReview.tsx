@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { subscribe, subscribeAll } from "@/lib/events";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { PLACEHOLDER_SRC, handleImageError } from "@/lib/placeholder";
 import { api } from "@/lib/api";
 import { MediaItem } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -24,7 +25,7 @@ const getPreviewSrc = (item: MediaItem): string => {
     if (item.file_path) {
         return convertFileSrc(item.file_path);
     }
-    return "/placeholder.jpg";
+    return PLACEHOLDER_SRC;
 };
 
 const getFileType = (item: MediaItem): string => getFileTypeFromPath(item.file_path, item.mime_type);
@@ -59,22 +60,18 @@ export function DuplicateReview() {
         loadDuplicates();
 
         // Listen for scan progress events
-        const unlistenProgress = listen<[number, number]>("scan-duplicates-progress", (event) => {
-            setScanProgress({ current: event.payload[0], total: event.payload[1] });
-        });
-
-        const unlistenFinished = listen<number>("scan-duplicates-finished", (event) => {
-            setIsScanning(false);
-            if (event.payload > 0) {
-                toast.success(`Scanned ${event.payload} images`);
-                loadDuplicates(); // Reload to find new duplicates
-            }
-        });
-
-        return () => {
-            unlistenProgress.then(fn => fn());
-            unlistenFinished.then(fn => fn());
-        };
+        return subscribeAll([
+            subscribe<[number, number]>("scan-duplicates-progress", (event) => {
+                setScanProgress({ current: event.payload[0], total: event.payload[1] });
+            }),
+            subscribe<number>("scan-duplicates-finished", (event) => {
+                setIsScanning(false);
+                if (event.payload > 0) {
+                    toast.success(`Scanned ${event.payload} images`);
+                    loadDuplicates(); // Reload to find new duplicates
+                }
+            }),
+        ]);
     }, []);
 
     const handleScanLibrary = async () => {
@@ -180,7 +177,10 @@ export function DuplicateReview() {
             <ScrollArea className="flex-1 p-4">
                 <div className="space-y-6">
                     {groups.map((group, groupIndex) => (
-                        <Card key={groupIndex}>
+                        // Keyed by the group's first photo: the index shifts as
+                        // groups are resolved, which would hand one group's
+                        // state to another.
+                        <Card key={group.items[0]?.id ?? groupIndex}>
                             <CardHeader className="py-3">
                                 <CardTitle className="text-sm flex items-center gap-2">
                                     <Copy className="h-4 w-4" />
@@ -190,9 +190,12 @@ export function DuplicateReview() {
                             <CardContent className="py-0">
                                 <div className="flex gap-3 overflow-x-auto pb-3">
                                     {group.items.map((item, itemIndex) => (
-                                        <div
+                                        <button
                                             key={item.id}
-                                            className={`relative flex-shrink-0 cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${itemIndex === group.keepIndex
+                                            type="button"
+                                            aria-pressed={itemIndex === group.keepIndex}
+                                            aria-label={`Keep ${getFileName(item)}, ${getFileType(item)}, ${formatBytes(item.size_bytes)}`}
+                                            className={`focus-visible:ring-ring relative flex-shrink-0 cursor-pointer overflow-hidden rounded-lg border-2 transition-all focus-visible:ring-2 focus-visible:outline-none ${itemIndex === group.keepIndex
                                                 ? "border-green-500 ring-2 ring-green-500/30"
                                                 : "border-transparent hover:border-muted-foreground"
                                                 }`}
@@ -202,9 +205,7 @@ export function DuplicateReview() {
                                                 src={getPreviewSrc(item)}
                                                 alt=""
                                                 className="w-32 h-32 object-cover"
-                                                onError={(e) => {
-                                                    e.currentTarget.src = "/placeholder.jpg";
-                                                }}
+                                                onError={handleImageError}
                                             />
                                             {itemIndex === group.keepIndex ? (
                                                 <Badge className="absolute top-1 right-1 bg-green-600">
@@ -224,7 +225,7 @@ export function DuplicateReview() {
                                                     {getFileName(item)}
                                                 </div>
                                             </div>
-                                        </div>
+                                        </button>
                                     ))}
                                 </div>
                             </CardContent>

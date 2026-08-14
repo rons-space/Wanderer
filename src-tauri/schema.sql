@@ -1,6 +1,6 @@
 -- Generated from the migration chain in src/database.rs. Do not edit by hand.
 -- Refresh with: WANDERER_BLESS_SCHEMA=1 cargo test schema
--- PRAGMA user_version = 20;
+-- PRAGMA user_version = 22;
 
 CREATE TABLE album_media (
     album_id INTEGER NOT NULL,
@@ -111,7 +111,7 @@ CREATE INDEX idx_media_date_taken ON media(date_taken);
 
 CREATE INDEX idx_media_face_status ON media(face_status);
 
-CREATE INDEX idx_media_file_path ON media(file_path);
+CREATE UNIQUE INDEX idx_media_file_path ON media(file_path);
 
 CREATE INDEX idx_media_is_archived ON media(is_archived);
 

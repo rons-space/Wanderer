@@ -1,6 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Album, MediaItem } from "../types";
 import { api } from "../lib/api";
+import { useMediaActions } from "@/hooks/use-media-actions";
 import { MediaGrid } from "./MediaGrid";
 import { Button } from "./ui/button";
 import { ArrowLeft } from "lucide-react";
@@ -12,6 +13,12 @@ interface AlbumDetailProps {
 
 export function AlbumDetail({ album, onBack }: AlbumDetailProps) {
     const [items, setItems] = useState<MediaItem[]>([]);
+    // The grid mutates items through their owner rather than a copy of its own.
+    const updateItems = useCallback(
+        (updater: (current: MediaItem[]) => MediaItem[]) => setItems(updater),
+        [],
+    );
+    const actions = useMediaActions(updateItems);
     const [hasNextPage, setHasNextPage] = useState(true);
     const [isNextPageLoading, setIsNextPageLoading] = useState(false);
 
@@ -60,7 +67,7 @@ export function AlbumDetail({ album, onBack }: AlbumDetailProps) {
     return (
         <div className="h-full w-full flex flex-col">
             <div className="flex items-center gap-2 p-4 border-b">
-                <Button variant="ghost" size="icon" onClick={onBack}>
+                <Button variant="ghost" size="icon" onClick={onBack} aria-label="Back to albums">
                     <ArrowLeft className="h-4 w-4" />
                 </Button>
                 <h1 className="text-xl font-bold">{album.name}</h1>
@@ -75,6 +82,7 @@ export function AlbumDetail({ album, onBack }: AlbumDetailProps) {
                     hasNextPage={hasNextPage}
                     isNextPageLoading={isNextPageLoading}
                     loadNextPage={loadNextPage}
+                    actions={actions}
                 />
             </div>
         </div>
