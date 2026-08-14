@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from "react";
 import { useLatestRequest } from "@/hooks/use-latest-request";
 import { MediaItem, SearchFilters, Tag } from "../types";
 import { api } from "../lib/api";
+import { useMediaActions } from "@/hooks/use-media-actions";
 import { MediaGrid } from "./MediaGrid";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
@@ -39,6 +40,12 @@ function saveSearchHistory(history: string[]) {
 
 export function Search() {
     const [items, setItems] = useState<MediaItem[]>([]);
+    // The grid mutates items through their owner rather than a copy of its own.
+    const updateItems = useCallback(
+        (updater: (current: MediaItem[]) => MediaItem[]) => setItems(updater),
+        [],
+    );
+    const actions = useMediaActions(updateItems);
     const [query, setQuery] = useState("");
     const [hasNextPage, setHasNextPage] = useState(true);
     const [isNextPageLoading, setIsNextPageLoading] = useState(false);
@@ -430,6 +437,7 @@ export function Search() {
                         hasNextPage={hasNextPage}
                         isNextPageLoading={isNextPageLoading}
                         loadNextPage={loadNextPage}
+                        actions={actions}
                     />
                 )}
             </div>

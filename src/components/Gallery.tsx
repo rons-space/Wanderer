@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { MediaItem } from "../types";
 import { api } from "../lib/api";
+import { useMediaActions } from "@/hooks/use-media-actions";
 import { subscribe } from "@/lib/events";
 import { toast } from "sonner";
 import { MediaGrid } from "./MediaGrid";
@@ -21,6 +22,11 @@ const MAX_REFRESH = 1000;
 
 export function Gallery() {
     const [items, setItems] = useState<MediaItem[]>([]);
+    // The grid mutates items through their owner rather than a copy of its own.
+    const updateItems = useCallback(
+        (updater: (current: MediaItem[]) => MediaItem[]) => setItems(updater),
+        [],
+    );
     const [hasNextPage, setHasNextPage] = useState(true);
     const [isNextPageLoading, setIsNextPageLoading] = useState(false);
     const { theme } = useTheme();
@@ -79,6 +85,8 @@ export function Gallery() {
             console.error("Failed to refresh:", e);
         }
     }, []);
+
+    const actions = useMediaActions(updateItems, refreshItems);
 
     // Initial load, separate from the subscription so neither waits on the other.
     useEffect(() => {
@@ -240,7 +248,7 @@ export function Gallery() {
                 loadNextPage={loadNextPage}
                 onItemClick={(item, e) => handleItemClick(item, e)}
                 ItemWrapper={isSelectionMode ? SelectableItemWrapper : undefined}
-                onItemsChange={refreshItems}
+                actions={actions}
             />
 
             <MediaViewer

@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { api, errorMessage, MigrationStatus } from "../lib/api";
+import { TelegramLoginForm, useTelegramLogin } from "./TelegramLogin";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "./ui/card";
 import { Label } from "./ui/label";
 import { Input } from "./ui/input";
@@ -61,11 +62,14 @@ const ABOUT_LINKS = {
 
 export function Settings() {
     const [user, setUser] = useState<string | null>(null);
-    const [phone, setPhone] = useState("");
-    const [code, setCode] = useState("");
     const [isLoading, setIsLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
-    const [step, setStep] = useState<'phone' | 'code' | 'authenticated'>('phone');
+    const [authenticated, setAuthenticated] = useState(false);
+    const login = useTelegramLogin({
+        onAuthenticated: (loggedInUser) => {
+            setUser(loggedInUser);
+            setAuthenticated(true);
+        },
+    });
     const [config, setConfig] = useState<AppConfig>(DEFAULT_CONFIG);
     const [isSaving, setIsSaving] = useState(false);
     const [backupPath, setBackupPath] = useState<string>("");
@@ -134,7 +138,7 @@ export function Settings() {
         try {
             await api.logout();
             setUser(null);
-            setStep('phone');
+            setAuthenticated(false);
             toast.success("Disconnected successfully");
             window.dispatchEvent(new Event('auth-changed'));
         } catch (e) {
@@ -298,49 +302,12 @@ export function Settings() {
     const checkAuth = async () => {
         try {
             const me = await api.getMe();
-            if (me) {
-                setUser(me);
-                setStep('authenticated');
-            } else {
-                setUser(null);
-                setStep('phone');
-            }
+            setUser(me ?? null);
+            setAuthenticated(Boolean(me));
         } catch (e) {
             console.error("Failed to load the Telegram session:", e);
             setUser(null);
-            setStep('phone');
-        }
-    };
-
-    const handleRequestCode = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setIsLoading(true);
-        setError(null);
-        try {
-            await api.loginRequestCode(phone);
-            setStep('code');
-        } catch (err) {
-            console.error(err);
-            setError(String(err) || "Failed to send code");
-        } finally {
-            setIsLoading(false);
-        }
-    };
-
-    const handleSignIn = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setIsLoading(true);
-        setError(null);
-        try {
-            const loggedInUser = await api.loginSignIn(code);
-            setUser(loggedInUser);
-            setStep('authenticated');
-            window.dispatchEvent(new Event('auth-changed'));
-        } catch (err) {
-            console.error(err);
-            setError(String(err) || "Failed to sign in");
-        } finally {
-            setIsLoading(false);
+            setAuthenticated(false);
         }
     };
 
@@ -394,20 +361,20 @@ export function Settings() {
                             <CardHeader>
                                 <CardTitle>Telegram Account</CardTitle>
                                 <CardDescription>
-                                    {step === 'authenticated'
+                                    {authenticated
                                         ? "Your account is connected to Telegram"
                                         : "Connect your Telegram account to backup photos"}
                                 </CardDescription>
                             </CardHeader>
                             <CardContent>
-                                {step === 'authenticated' ? (
+                                {authenticated ? (
                                     <div className="space-y-4">
                                         <div className="space-y-2">
                                             <Label>Logged in as</Label>
                                             <div className="bg-muted p-3 rounded-md font-mono">{user}</div>
                                         </div>
                                         <Alert>
-                                            <AlertTitle>✓ Telegram Connected</AlertTitle>
+                                            <AlertTitle>Telegram Connected</AlertTitle>
                                             <AlertDescription>Your photos are being backed up to Saved Messages.</AlertDescription>
                                         </Alert>
                                         <Button
@@ -419,53 +386,21 @@ export function Settings() {
                                             Disconnect Account
                                         </Button>
                                     </div>
-                                ) : step === 'phone' ? (
-                                    <form onSubmit={handleRequestCode} className="space-y-4">
-                                        {error && (
-                                            <div className="bg-red-50 text-red-500 p-3 rounded text-sm">{error}</div>
-                                        )}
-                                        <div className="space-y-2">
-                                            <Label htmlFor="phone">Phone Number</Label>
-                                            <Input
-                                                id="phone"
-                                                placeholder="+1234567890"
-                                                value={phone}
-                                                onChange={(e) => setPhone(e.target.value)}
-                                                required
-                                            />
-                                            <p className="text-xs text-muted-foreground">Include country code</p>
-                                        </div>
-                                        <Button type="submit" className="w-full" disabled={isLoading}>
-                                            {isLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                                            Send Code
-                                        </Button>
-                                    </form>
                                 ) : (
-                                    <form onSubmit={handleSignIn} className="space-y-4">
-                                        {error && (
-                                            <div className="bg-red-50 text-red-500 p-3 rounded text-sm">{error}</div>
-                                        )}
-                                        <div className="space-y-2">
-                                            <Label htmlFor="code">Verification Code</Label>
-                                            <Input
-                                                id="code"
-                                                placeholder="123456"
-                                                value={code}
-                                                onChange={(e) => setCode(e.target.value)}
-                                                required
-                                            />
-                                        </div>
-                                        <Button type="submit" className="w-full" disabled={isLoading}>
-                                            {isLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                                            Sign In
-                                        </Button>
-                                        <Button variant="link" onClick={() => setStep('phone')} type="button" className="w-full">
-                                            Back to Phone Number
-                                        </Button>
-                                    </form>
+                                    <TelegramLoginForm
+                                        login={login}
+                                        idPrefix="settings"
+                                        banner={
+                                            login.error ? (
+                                                <div className="bg-destructive/10 text-destructive rounded p-3 text-sm">
+                                                    {login.error}
+                                                </div>
+                                            ) : null
+                                        }
+                                    />
                                 )}
                             </CardContent>
-                            {step === 'authenticated' && (
+                            {authenticated && (
                                 <CardFooter>
                                     <Button variant="outline" className="w-full" disabled>
                                         Log Out (Not Implemented)
