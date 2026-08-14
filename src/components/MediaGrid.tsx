@@ -1,4 +1,4 @@
-import { useState, useRef, useLayoutEffect, ComponentType, ReactNode, useMemo } from "react";
+import { useState, useRef, useLayoutEffect, useCallback, ComponentType, ReactNode, useMemo, useEffect } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { MediaItem, Album } from "../types";
@@ -16,8 +16,8 @@ import {
     ContextMenuSeparator,
 } from "@/components/ui/context-menu";
 import { api, errorMessage } from "@/lib/api";
+import { handleImageError } from "@/lib/placeholder";
 import { toast } from "sonner";
-import { useEffect } from "react";
 import { useTheme, type ThemeVariant } from "@/contexts/ThemeContext";
 import { Play, Heart, Star, Trash2, Archive, ArchiveRestore, Download, Cloud, Share2, Calendar } from "lucide-react";
 
@@ -121,6 +121,7 @@ interface VirtualGridProps {
     isNextPageLoading: boolean;
     onScroll: (scrollTop: number, clientHeight: number, scrollHeight: number, visibleItemIndex?: number) => void;
     ItemWrapper?: ComponentType<{ item: MediaItem; children: ReactNode }>;
+    contextMenuExtras?: (item: MediaItem) => ReactNode;
     albums: Album[];
     onAddToAlbum: (mediaId: number, albumId: number) => void;
     onItemClick?: (item: MediaItem, e?: React.MouseEvent) => void;
@@ -145,6 +146,7 @@ const VirtualGrid = ({
     isNextPageLoading,
     onScroll,
     ItemWrapper,
+    contextMenuExtras,
     albums,
     onAddToAlbum,
     onItemClick,
@@ -255,6 +257,18 @@ const VirtualGrid = ({
     }
 
 
+    // A viewport taller than the loaded content never fires a scroll event, so
+    // pagination driven purely by scrolling deadlocks on a large window: the
+    // first page does not fill the screen, and nothing asks for the second.
+    // Report the metrics directly whenever the content stops overflowing.
+    useEffect(() => {
+        if (height <= 0 || totalHeight <= 0 || totalHeight > height) {
+            return;
+        }
+
+        onScroll(0, height, totalHeight, 0);
+    }, [totalHeight, height, onScroll]);
+
     const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
         const { scrollTop, clientHeight, scrollHeight } = e.currentTarget;
         setScrollTop(scrollTop);
@@ -345,6 +359,7 @@ const VirtualGrid = ({
                                     item={item}
                                     isLoading={isLoadingItem}
                                     ItemWrapper={ItemWrapper}
+                                    contextMenuExtras={contextMenuExtras}
                                     albums={albums}
                                     onAddToAlbum={onAddToAlbum}
                                     onItemClick={onItemClick}
@@ -371,6 +386,7 @@ const Cell = ({
     item,
     isLoading,
     ItemWrapper,
+    contextMenuExtras,
     albums,
     onAddToAlbum,
     onItemClick,
@@ -386,6 +402,7 @@ const Cell = ({
     item?: MediaItem;
     isLoading: boolean;
     ItemWrapper?: ComponentType<{ item: MediaItem; children: ReactNode }>;
+    contextMenuExtras?: (item: MediaItem) => ReactNode;
     albums: Album[];
     onAddToAlbum: (mediaId: number, albumId: number) => void;
     onItemClick?: (item: MediaItem, e?: React.MouseEvent) => void;
@@ -419,14 +436,7 @@ const Cell = ({
                 loading="lazy"
                 decoding="async"
                 className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
-                onError={(e) => {
-                    console.error("Image load failed", {
-                        id: item.id,
-                        src,
-                        path: imagePath
-                    });
-                    e.currentTarget.style.display = 'none';
-                }}
+                onError={handleImageError}
             />
 
             {/* Overlay Gradient */}
@@ -481,6 +491,12 @@ const Cell = ({
                 {wrappedContent}
             </ContextMenuTrigger>
             <ContextMenuContent>
+                {/* View-specific entries (Trash contributes Restore here). They live
+                    in this menu rather than in a wrapper of their own: a second
+                    ContextMenu around the same cell nests the two triggers and the
+                    inner menu swallows the outer one. */}
+                {contextMenuExtras?.(item)}
+
                 {/* Favorite Toggle */}
                 <ContextMenuItem onClick={() => onToggleFavorite(item)}>
                     <Heart className={`mr-2 h-4 w-4 ${item.is_favorite ? 'fill-red-500 text-red-500' : ''}`} />
@@ -635,11 +651,12 @@ interface MediaGridProps {
     isNextPageLoading: boolean;
     loadNextPage: (startIndex: number, stopIndex: number) => Promise<void>;
     ItemWrapper?: ComponentType<{ item: MediaItem; children: ReactNode }>;
+    contextMenuExtras?: (item: MediaItem) => ReactNode;
     onItemClick?: (item: MediaItem, e?: React.MouseEvent) => void;
     onItemsChange?: () => void; // Callback to refresh items after changes
 }
 
-export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage, ItemWrapper, onItemClick, onItemsChange }: MediaGridProps) {
+export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage, ItemWrapper, contextMenuExtras, onItemClick, onItemsChange }: MediaGridProps) {
     const containerRef = useRef<HTMLDivElement>(null);
     const { width, height } = useResizeObserver(containerRef);
     const { theme } = useTheme();
@@ -836,7 +853,9 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
         return rows;
     }, [localItems, timelineGrouping, columnCount]);
 
-    const handleScroll = (scrollTop: number, clientHeight: number, scrollHeight: number, visibleItemIndex?: number) => {
+    // Stable identity: VirtualGrid depends on this in an effect to break the
+    // no-overflow deadlock, and a fresh function each render would re-run it.
+    const handleScroll = useCallback((scrollTop: number, clientHeight: number, scrollHeight: number, visibleItemIndex?: number) => {
         if (!hasNextPage || isNextPageLoading) return;
 
         // Load more when near bottom (e.g. 2 screens away)
@@ -863,7 +882,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
                 }, 1500);
             }
         }
-    };
+    }, [hasNextPage, isNextPageLoading, loadNextPage, localItems, timelineGrouping]);
 
     return (
         <div ref={containerRef} className="w-full h-full flex-1 min-h-0 overflow-hidden bg-background relative">
@@ -890,6 +909,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
                     isNextPageLoading={isNextPageLoading}
                     onScroll={handleScroll}
                     ItemWrapper={ItemWrapper}
+                    contextMenuExtras={contextMenuExtras}
                     albums={albums}
                     onAddToAlbum={handleAddToAlbum}
                     onItemClick={onItemClick}

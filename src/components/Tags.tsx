@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "@/lib/api";
+import { PLACEHOLDER_SRC, handleImageError } from "@/lib/placeholder";
 import { MediaItem, Tag as TagData } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -84,11 +86,12 @@ export function Tags() {
                                 <img
                                     src={
                                         item.thumbnail_path
-                                            ? `asset://localhost/${encodeURIComponent(item.thumbnail_path)}`
-                                            : "/placeholder.jpg"
+                                            ? convertFileSrc(item.thumbnail_path)
+                                            : PLACEHOLDER_SRC
                                     }
                                     alt=""
                                     className="w-full h-full object-cover"
+                                    onError={handleImageError}
                                 />
                             </div>
                         ))}
