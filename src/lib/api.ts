@@ -1,6 +1,53 @@
 import { invoke } from "@tauri-apps/api/core";
 import { MediaItem, Album, QueueItem, Face, QueueCounts, SearchFilters, Tag, Person } from "../types";
 
+/**
+ * Stable classification of a backend failure, mirroring `ErrorCode` in errors.rs.
+ *
+ * Branch on these rather than on the message: the message is written for a person and
+ * gets reworded, and for failures that came out of a library it is deliberately vague,
+ * because the real cause names database columns and absolute paths and stays in the log.
+ */
+export type ErrorCode =
+    | "databaseNotInitialized"
+    | "vaultLocked"
+    | "notFound"
+    | "invalidInput"
+    | "unavailable"
+    | "database"
+    | "io"
+    | "telegram"
+    | "internal";
+
+export interface AppError {
+    code: ErrorCode;
+    message: string;
+}
+
+/** Tauri rejects with whatever the command serialized, so this narrows an unknown. */
+export function asAppError(error: unknown): AppError | null {
+    if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        "message" in error &&
+        typeof (error as { code: unknown }).code === "string" &&
+        typeof (error as { message: unknown }).message === "string"
+    ) {
+        return error as AppError;
+    }
+    return null;
+}
+
+/** The message to show for a rejection, whatever shape it arrived in. */
+export function errorMessage(error: unknown): string {
+    return asAppError(error)?.message ?? String(error);
+}
+
+export function hasErrorCode(error: unknown, code: ErrorCode): boolean {
+    return asAppError(error)?.code === code;
+}
+
 export interface MigrationStatus {
     running: boolean;
     total: number;

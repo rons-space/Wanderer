@@ -15,7 +15,7 @@ import {
     ContextMenuSubTrigger,
     ContextMenuSeparator,
 } from "@/components/ui/context-menu";
-import { api } from "@/lib/api";
+import { api, errorMessage } from "@/lib/api";
 import { toast } from "sonner";
 import { useEffect } from "react";
 import { useTheme, type ThemeVariant } from "@/contexts/ThemeContext";
@@ -547,7 +547,7 @@ const Cell = ({
                                     toast.error("Export failed: file unavailable locally and in cloud");
                                 }
                             } catch (e) {
-                                toast.error(`Export failed: ${e}`);
+                                toast.error(`Export failed: ${errorMessage(e)}`);
                             }
                         }
                     }}
@@ -564,7 +564,7 @@ const Cell = ({
                             await navigator.clipboard.writeText(link);
                             toast.success("Share link copied to clipboard");
                         } catch (e) {
-                            toast.error(`Failed to generate share link: ${e}`);
+                            toast.error(`Failed to generate share link: ${errorMessage(e)}`);
                         }
                     }}
                     disabled={!item.telegram_media_id}
@@ -771,7 +771,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
                     setLocalItems(prev => prev.map(i => i.id === mediaId ? { ...i, is_cloud_only: false } : i));
                     return "Downloaded local copy";
                 },
-                error: (err) => `Failed to download: ${err}`
+                error: (err) => `Failed to download: ${errorMessage(err)}`
             });
         } catch (e) {
             console.error(e);
