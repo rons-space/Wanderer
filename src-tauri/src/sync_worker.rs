@@ -62,7 +62,10 @@ impl SyncWorker {
         let encrypted_mode = match crate::encryption_required(&self.db) {
             Ok(v) => v,
             Err(e) => {
-                warn!("SyncWorker: cannot determine encryption state, skipping cycle: {e}");
+                warn!(
+                    "SyncWorker: cannot determine encryption state, skipping cycle: {}",
+                    e
+                );
                 return Ok(());
             }
         };
