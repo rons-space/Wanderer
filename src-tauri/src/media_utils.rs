@@ -328,28 +328,9 @@ pub async fn generate_video_thumbnail(
     }
 }
 
-/// Escape special characters in LIKE patterns to prevent SQL injection issues.
-// Broken as written: it inserts backslashes without an `ESCAPE '\\'` clause, so the
-// pattern it produces matches literal backslashes. Its only caller,
-// `Database::search_media`, is itself dead, and T55 (issue #63) deletes both.
-#[allow(dead_code)]
-pub fn escape_like_pattern(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_escape_like_pattern() {
-        assert_eq!(escape_like_pattern("test"), "test");
-        assert_eq!(escape_like_pattern("100%"), "100\\%");
-        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
-        assert_eq!(escape_like_pattern("c:\\path"), "c:\\\\path");
-    }
 
     /// A directory that removes itself, so the executable-lookup tests leave nothing
     /// behind in the temp directory.

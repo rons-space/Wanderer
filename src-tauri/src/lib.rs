@@ -1173,15 +1173,6 @@ async fn get_faces(state: State<'_, AppState>, media_id: i64) -> Result<Vec<ai::
     db.get_faces(media_id).map_err(AppError::from)
 }
 
-#[tauri::command]
-async fn debug_reset_faces(state: State<'_, AppState>) -> Result<usize, AppError> {
-    let db_guard = state.db.lock().await;
-    let db = db_guard
-        .as_ref()
-        .ok_or_else(AppError::database_not_initialized)?;
-    db.reset_all_scans().map_err(AppError::from)
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // TODO: Load from config/env
@@ -1496,7 +1487,6 @@ pub fn run() {
             get_queue_status,
             detect_faces,
             get_faces,
-            debug_reset_faces,
             // Phase 2: Favorites & Ratings
             toggle_favorite,
             set_rating,
