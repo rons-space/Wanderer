@@ -133,7 +133,7 @@ pub async fn run_upload_worker(
                 let mut encrypted_temp: Option<PathBuf> = None;
 
                 if should_encrypt {
-                    let maybe_key = security_runtime.lock().await.master_key;
+                    let maybe_key = security_runtime.lock().await.master_key.clone();
                     let key = match maybe_key {
                         Some(k) => k,
                         None => {
@@ -147,7 +147,7 @@ pub async fn run_upload_worker(
                         }
                     };
 
-                    let temp_dir = std::env::temp_dir().join("wanderer-encrypted-uploads");
+                    let temp_dir = crate::paths::encrypted_uploads_dir();
                     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
                         let err_msg = format!("Failed to create temp encrypted upload dir: {}", e);
                         let _ = db.update_queue_status(item.id, "failed", Some(&err_msg));
@@ -173,7 +173,7 @@ pub async fn run_upload_worker(
                     }
 
                     // Last line of defence before bytes leave the machine: the
-                    // artifact must actually be a WBENC1 file. Without this,
+                    // artifact must actually carry a Wanderer magic. Without this,
                     // any future bug in the branch above sends plaintext and
                     // nothing notices.
                     let is_sealed = security::is_encrypted_file(std::path::Path::new(&upload_path))

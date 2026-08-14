@@ -9,7 +9,9 @@ mod model_integrity;
 mod paths;
 mod progress_stream;
 mod raw_support;
+mod secret_store;
 mod security;
+mod session_store;
 mod sync_manifest;
 mod sync_worker;
 mod telegram;
@@ -18,6 +20,7 @@ mod view_cache;
 mod watcher;
 
 use database::Database;
+use errors::AppError;
 use security::{
     EncryptionMode, MigrationStatus, RuntimeState, SecurityBundle, TelegramApiCredentials,
 };
@@ -27,7 +30,19 @@ use tauri::{Emitter, Manager, State};
 use telegram::TelegramService;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
+/// Shared state behind every command.
+///
+/// Two rules keep the mutexes here from deadlocking or serialising the application:
+///
+/// 1. `db` is a slot, not a lock over database work. `Database` is `Sync` and does its
+///    own locking, so the guard exists only long enough to clone the `Arc` out of it.
+///    Holding it across an `.await` blocks all 74 commands behind whatever that await
+///    is waiting for, which in the worst case was a Telegram transfer.
+/// 2. Where two of these are needed at once, take `db` first and `security_runtime`
+///    second. Both orders were in use, which is a deadlock waiting for the two paths
+///    to run concurrently.
 struct AppState {
     telegram: Arc<TelegramService>,
     db: Mutex<Option<Arc<Database>>>,
@@ -59,13 +74,13 @@ fn is_security_key(key: &str) -> bool {
     key.starts_with(SECURITY_KEY_PREFIX)
 }
 
-fn fallback_app_data_dir() -> Result<std::path::PathBuf, String> {
-    let base =
-        dirs::data_local_dir().ok_or_else(|| "Could not find local data directory".to_string())?;
+fn fallback_app_data_dir() -> Result<std::path::PathBuf, AppError> {
+    let base = dirs::data_local_dir()
+        .ok_or_else(|| AppError::internal("Could not find local data directory"))?;
     Ok(base.join(APP_DATA_FALLBACK_DIR_NAME))
 }
 
-fn resolve_app_data_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+fn resolve_app_data_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, AppError> {
     let app_data_dir = match app.path().app_local_data_dir() {
         Ok(path) => path,
         Err(e) => {
@@ -79,7 +94,7 @@ fn resolve_app_data_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, St
         }
     };
 
-    std::fs::create_dir_all(&app_data_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&app_data_dir).map_err(AppError::from)?;
     log::debug!("Using app data directory at {:?}", app_data_dir);
     Ok(app_data_dir)
 }
@@ -118,28 +133,26 @@ struct RegenerateRecoveryResponse {
 ///
 /// Returns `Err` when the bundle cannot be read or parsed. Callers must fail
 /// closed on that: defer the work, never fall back to sending plaintext.
-pub(crate) fn encryption_required(db: &Database) -> Result<bool, String> {
+pub(crate) fn encryption_required(db: &Database) -> Result<bool, AppError> {
     Ok(load_security_bundle(db)?
         .map(|b| b.mode == EncryptionMode::Encrypted)
         .unwrap_or(false))
 }
 
-pub(crate) fn load_security_bundle(db: &Database) -> Result<Option<SecurityBundle>, String> {
-    let raw = db
-        .get_config(SECURITY_BUNDLE_KEY)
-        .map_err(|e| e.to_string())?;
+pub(crate) fn load_security_bundle(db: &Database) -> Result<Option<SecurityBundle>, AppError> {
+    let raw = db.get_config(SECURITY_BUNDLE_KEY).map_err(AppError::from)?;
     match raw {
         Some(json) => serde_json::from_str::<SecurityBundle>(&json)
             .map(Some)
-            .map_err(|e| format!("Invalid security bundle: {}", e)),
+            .map_err(AppError::from),
         None => Ok(None),
     }
 }
 
-fn save_security_bundle(db: &Database, bundle: &SecurityBundle) -> Result<(), String> {
-    let json = serde_json::to_string(bundle).map_err(|e| e.to_string())?;
+fn save_security_bundle(db: &Database, bundle: &SecurityBundle) -> Result<(), AppError> {
+    let json = serde_json::to_string(bundle).map_err(AppError::from)?;
     db.set_config(SECURITY_BUNDLE_KEY, &json)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     let mode = match bundle.mode {
         EncryptionMode::Encrypted => "encrypted",
         EncryptionMode::Unencrypted => "unencrypted",
@@ -148,7 +161,7 @@ fn save_security_bundle(db: &Database, bundle: &SecurityBundle) -> Result<(), St
     // expects. Nothing in this codebase reads it as a decision input any more:
     // use `encryption_required`, which reads the bundle above.
     db.set_config(SECURITY_MODE_KEY, mode)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     Ok(())
 }
 
@@ -160,46 +173,51 @@ fn load_migration_status(db: &Database) -> MigrationStatus {
         .unwrap_or_default()
 }
 
-fn save_migration_status(db: &Database, status: &MigrationStatus) -> Result<(), String> {
-    let json = serde_json::to_string(status).map_err(|e| e.to_string())?;
+fn save_migration_status(db: &Database, status: &MigrationStatus) -> Result<(), AppError> {
+    let json = serde_json::to_string(status).map_err(AppError::from)?;
     db.set_config(SECURITY_MIGRATION_STATUS_KEY, &json)
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
 }
 
 fn ensure_thumbnail_encrypted(
     thumb_path: &str,
-    key: &[u8; 32],
+    key: &security::MasterKey,
     roots: &[std::path::PathBuf],
-) -> Result<Option<std::path::PathBuf>, String> {
+) -> Result<Option<std::path::PathBuf>, AppError> {
     let path = std::path::Path::new(thumb_path);
 
     // `thumbnail_path` is a text column, and this function deletes the file it
     // reads, so a poisoned row would mean encrypting and then unlinking an
     // arbitrary file.
     if !paths::is_within_any(roots, path) {
-        return Err(format!(
+        return Err(AppError::invalid_input(format!(
             "Refusing to encrypt a thumbnail outside the managed library: {}",
             thumb_path
-        ));
+        )));
     }
 
     if !path.exists() {
         return Ok(None);
     }
 
-    if security::is_encrypted_file(path).map_err(|e| e.to_string())? {
+    if security::is_encrypted_file(path).map_err(AppError::from)? {
         return Ok(Some(path.to_path_buf()));
     }
 
     let encrypted_path = path.with_extension("wbenc");
-    security::encrypt_file(path, &encrypted_path, key).map_err(|e| e.to_string())?;
+    security::encrypt_file(path, &encrypted_path, key).map_err(AppError::from)?;
     let _ = std::fs::remove_file(path);
     Ok(Some(encrypted_path))
 }
 
-async fn materialize_thumbnail_path_for_response(
+/// Decrypt one thumbnail into the cache, returning the path the UI should load.
+///
+/// Synchronous and free of any lock: every caller runs it inside `spawn_blocking`,
+/// because decrypting a thumbnail reads and writes a file and is repeated for every
+/// item in a response.
+fn materialize_thumbnail_path(
     thumbnail_path: Option<String>,
-    state: &State<'_, AppState>,
+    key: Option<&security::MasterKey>,
 ) -> Option<String> {
     let thumbnail_path = thumbnail_path?;
     let src = std::path::PathBuf::from(&thumbnail_path);
@@ -212,8 +230,8 @@ async fn materialize_thumbnail_path_for_response(
         return Some(thumbnail_path);
     }
 
-    let key = state.security_runtime.lock().await.master_key?;
-    let cache_dir = std::env::temp_dir().join("wanderer-thumb-cache");
+    let key = key?;
+    let cache_dir = paths::thumb_cache_dir();
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return None;
     }
@@ -234,39 +252,68 @@ async fn materialize_thumbnail_path_for_response(
         true
     };
 
-    if needs_refresh && security::decrypt_file(&src, &output, &key).is_err() {
+    if needs_refresh && security::decrypt_file(&src, &output, key).is_err() {
         return None;
     }
 
     Some(output.to_string_lossy().to_string())
 }
 
+/// Prepare a response's thumbnails, off the async runtime.
+///
+/// Every media-returning command ends here, and for an encrypted library this decrypts
+/// one file per item. Doing that inline stalled the runtime for the length of a whole
+/// page of thumbnails, which is why a scroll could freeze unrelated commands. The page
+/// is handed to a single blocking task rather than one task per item, since the work is
+/// short and the spawns would cost more than the decryptions.
 async fn materialize_media_items_for_response(
     mut items: Vec<database::MediaItem>,
     state: &State<'_, AppState>,
 ) -> Vec<database::MediaItem> {
-    for item in &mut items {
-        item.thumbnail_path =
-            materialize_thumbnail_path_for_response(item.thumbnail_path.clone(), state).await;
+    let key = get_active_master_key(state).await;
+    let thumbnails: Vec<Option<String>> = items
+        .iter()
+        .map(|item| item.thumbnail_path.clone())
+        .collect();
+
+    let materialized = tokio::task::spawn_blocking(move || {
+        thumbnails
+            .into_iter()
+            .map(|path| materialize_thumbnail_path(path, key.as_ref()))
+            .collect::<Vec<_>>()
+    })
+    .await;
+
+    match materialized {
+        Ok(paths) => {
+            for (item, path) in items.iter_mut().zip(paths) {
+                item.thumbnail_path = path;
+            }
+        }
+        // A panic in the blocking task must not take the response with it: the items
+        // are still correct, they just point at paths the UI may not be able to read.
+        Err(e) => log::error!("Thumbnail materialization task failed: {}", e),
     }
     items
 }
 
-async fn get_active_master_key(state: &State<'_, AppState>) -> Option<[u8; 32]> {
-    state.security_runtime.lock().await.master_key
+/// A clone rather than a borrow, because the guard cannot be held across the awaits
+/// that follow. The copy is a `MasterKey`, so it zeroizes when the caller drops it.
+async fn get_active_master_key(state: &State<'_, AppState>) -> Option<security::MasterKey> {
+    state.security_runtime.lock().await.master_key.clone()
 }
 
 async fn download_and_materialize_media(
     state: &State<'_, AppState>,
     msg_id: i32,
     final_path: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     if let Some(parent) = final_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(AppError::from)?;
     }
 
-    let temp_dir = std::env::temp_dir().join("wanderer-download-staging");
-    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    let temp_dir = paths::download_staging_dir();
+    std::fs::create_dir_all(&temp_dir).map_err(AppError::from)?;
     let temp_path = temp_dir.join(format!(
         "msg_{}_{}.bin",
         msg_id,
@@ -281,22 +328,45 @@ async fn download_and_materialize_media(
         .map_err(|e| format!("Failed to download from Telegram: {}", e))?;
 
     let maybe_key = get_active_master_key(state).await;
-    let result = security::decrypt_file_if_needed(&temp_path, final_path, maybe_key.as_ref())
-        .map_err(|e| e.to_string());
+    // `Unknown`: this downloads by message id, with no media row in hand, and an
+    // encrypted library can still contain pre-migration plaintext blobs. Decrypting a
+    // media file is whole-file crypto, so it runs on a blocking thread.
+    let decrypt_src = temp_path.clone();
+    let decrypt_dst = final_path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        security::decrypt_file_if_needed(
+            &decrypt_src,
+            &decrypt_dst,
+            maybe_key.as_ref(),
+            security::Expect::Unknown,
+        )
+    })
+    .await
+    .map_err(|e| format!("Decrypt task failed: {}", e))?
+    .map_err(AppError::from);
 
-    let _ = std::fs::remove_file(&temp_path);
+    let _ = tokio::fs::remove_file(&temp_path).await;
     result.map(|_| ())
 }
 
 async fn get_security_status_inner(
     state: &State<'_, AppState>,
-) -> Result<SecurityStatusResponse, String> {
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+) -> Result<SecurityStatusResponse, AppError> {
+    // Cloned out of the slot: this function locks `security_runtime` twice below, and
+    // holding the database guard across those awaits is the ordering hazard described
+    // on `AppState`.
+    let db = {
+        let db_guard = state.db.lock().await;
+        db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?
+            .clone()
+    };
+    let db = db.as_ref();
 
     let onboarding_complete = db
         .get_config(SECURITY_ONBOARDING_COMPLETE_KEY)
-        .map_err(|e| e.to_string())?
+        .map_err(AppError::from)?
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
@@ -322,7 +392,7 @@ async fn get_security_status_inner(
 
     let telegram_credentials_configured = db
         .get_config(TELEGRAM_CREDS_KEY)
-        .map_err(|e| e.to_string())?
+        .map_err(AppError::from)?
         .is_some();
 
     let runtime_migration = state.security_runtime.lock().await.migration.clone();
@@ -347,23 +417,29 @@ async fn get_security_status_inner(
 }
 
 #[tauri::command]
-async fn get_security_status(state: State<'_, AppState>) -> Result<SecurityStatusResponse, String> {
+async fn get_security_status(
+    state: State<'_, AppState>,
+) -> Result<SecurityStatusResponse, AppError> {
     get_security_status_inner(&state).await
 }
 
 #[tauri::command]
-async fn initialize_unencrypted_mode(state: State<'_, AppState>) -> Result<(), String> {
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    if let Some(bundle) = load_security_bundle(db)? {
-        if bundle.mode == EncryptionMode::Encrypted {
-            return Err(
-                "Encryption is already enabled and cannot be downgraded in-place".to_string(),
-            );
+async fn initialize_unencrypted_mode(state: State<'_, AppState>) -> Result<(), AppError> {
+    {
+        let db_guard = state.db.lock().await;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
+        if let Some(bundle) = load_security_bundle(db)? {
+            if bundle.mode == EncryptionMode::Encrypted {
+                return Err(AppError::invalid_input(
+                    "Encryption is already enabled and cannot be downgraded in-place",
+                ));
+            }
         }
+        let bundle = SecurityBundle::unencrypted();
+        save_security_bundle(db, &bundle)?;
     }
-    let bundle = SecurityBundle::unencrypted();
-    save_security_bundle(db, &bundle)?;
     state.security_runtime.lock().await.master_key = None;
     Ok(())
 }
@@ -372,49 +448,104 @@ async fn initialize_unencrypted_mode(state: State<'_, AppState>) -> Result<(), S
 async fn initialize_encryption(
     passphrase: String,
     state: State<'_, AppState>,
-) -> Result<InitializeEncryptionResponse, String> {
+) -> Result<InitializeEncryptionResponse, AppError> {
+    // Rebound rather than taken as `Zeroizing<String>` directly: a Tauri command
+    // parameter has to deserialize, and moving the `String` in here keeps the same
+    // heap buffer, so the secret is wiped when this returns. Whatever copies serde
+    // made while parsing the IPC payload are outside our reach either way.
+    let passphrase = Zeroizing::new(passphrase);
     {
         let db_guard = state.db.lock().await;
-        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
         if let Some(bundle) = load_security_bundle(db)? {
             if bundle.mode == EncryptionMode::Encrypted {
-                return Err("Encryption is already enabled".to_string());
+                return Err(AppError::invalid_input("Encryption is already enabled"));
             }
         }
     }
 
     let (bundle, recovery_key, master_key) =
-        SecurityBundle::new_encrypted(&passphrase).map_err(|e| e.to_string())?;
+        SecurityBundle::new_encrypted(&passphrase).map_err(AppError::from)?;
 
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    save_security_bundle(db, &bundle)?;
+    {
+        let db_guard = state.db.lock().await;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
+        save_security_bundle(db, &bundle)?;
+    }
 
     state.security_runtime.lock().await.master_key = Some(master_key);
 
-    Ok(InitializeEncryptionResponse { recovery_key })
+    // The recovery key has to reach the user, who is expected to write it down, so
+    // this is the one copy that cannot be zeroized: past the serializer it belongs to
+    // the frontend.
+    Ok(InitializeEncryptionResponse {
+        recovery_key: recovery_key.to_string(),
+    })
+}
+
+/// Connect Telegram now that the vault holds a master key.
+///
+/// Outside Windows the session file is sealed with that key, so startup cannot open it
+/// while the library is locked and unlocking is the first moment a connection becomes
+/// possible. Best effort by design: the user asked to unlock, not to go online, and a
+/// network or session failure must not turn a successful unlock into an error.
+async fn connect_telegram_after_unlock(state: &State<'_, AppState>, app: &tauri::AppHandle) {
+    if !state.telegram.has_credentials().await || state.telegram.is_connected().await {
+        return;
+    }
+    let app_dir = match resolve_app_data_dir(app) {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::warn!("Cannot connect to Telegram after unlock: {}", e);
+            return;
+        }
+    };
+    let master_key = state.security_runtime.lock().await.master_key.clone();
+    if let Err(e) = state.telegram.connect(app_dir, master_key).await {
+        log::warn!("Failed to connect to Telegram after unlock: {}", e);
+    }
 }
 
 #[tauri::command]
-async fn unlock_encryption(passphrase: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn unlock_encryption(
+    passphrase: String,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), AppError> {
+    let passphrase = Zeroizing::new(passphrase);
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let bundle = load_security_bundle(db)?
-        .ok_or_else(|| "Encryption is not initialized for this library".to_string())?;
+        .ok_or_else(|| AppError::invalid_input("Encryption is not initialized for this library"))?;
     if bundle.mode != EncryptionMode::Encrypted {
-        return Err("Encryption mode is not enabled".to_string());
+        return Err(AppError::invalid_input("Encryption mode is not enabled"));
     }
     let key = bundle
         .unlock_with_passphrase(&passphrase)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     drop(db_guard);
     state.security_runtime.lock().await.master_key = Some(key);
+    connect_telegram_after_unlock(&state, &app).await;
     Ok(())
 }
 
 #[tauri::command]
-async fn lock_encryption(state: State<'_, AppState>) -> Result<(), String> {
+async fn lock_encryption(state: State<'_, AppState>) -> Result<(), AppError> {
     state.security_runtime.lock().await.master_key = None;
+    // Clearing the key in memory was the whole of "lock" before this, which left every
+    // thumbnail and every media file the user had viewed sitting decrypted in %TEMP%.
+    // Locking has to mean the plaintext is gone, not just the key.
+    let purged = paths::purge_scratch_dirs();
+    log::info!(
+        "Locked encryption and purged {} scratch directories",
+        purged
+    );
     Ok(())
 }
 
@@ -423,17 +554,23 @@ async fn recover_encryption(
     recovery_key: String,
     new_passphrase: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+    app: tauri::AppHandle,
+) -> Result<(), AppError> {
+    let recovery_key = Zeroizing::new(recovery_key);
+    let new_passphrase = Zeroizing::new(new_passphrase);
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let bundle = load_security_bundle(db)?
-        .ok_or_else(|| "Encryption is not initialized for this library".to_string())?;
+        .ok_or_else(|| AppError::invalid_input("Encryption is not initialized for this library"))?;
     let (next_bundle, key) = bundle
         .recover_and_rewrap(&recovery_key, &new_passphrase)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     save_security_bundle(db, &next_bundle)?;
     drop(db_guard);
     state.security_runtime.lock().await.master_key = Some(key);
+    connect_telegram_after_unlock(&state, &app).await;
     Ok(())
 }
 
@@ -441,26 +578,33 @@ async fn recover_encryption(
 async fn regenerate_recovery_key(
     passphrase: String,
     state: State<'_, AppState>,
-) -> Result<RegenerateRecoveryResponse, String> {
+) -> Result<RegenerateRecoveryResponse, AppError> {
+    let passphrase = Zeroizing::new(passphrase);
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let bundle = load_security_bundle(db)?
-        .ok_or_else(|| "Encryption is not initialized for this library".to_string())?;
+        .ok_or_else(|| AppError::invalid_input("Encryption is not initialized for this library"))?;
     let (next_bundle, recovery_key, key) = bundle
         .regenerate_recovery_key(&passphrase)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     save_security_bundle(db, &next_bundle)?;
     drop(db_guard);
     state.security_runtime.lock().await.master_key = Some(key);
-    Ok(RegenerateRecoveryResponse { recovery_key })
+    Ok(RegenerateRecoveryResponse {
+        recovery_key: recovery_key.to_string(),
+    })
 }
 
 #[tauri::command]
-async fn complete_onboarding(state: State<'_, AppState>) -> Result<(), String> {
+async fn complete_onboarding(state: State<'_, AppState>) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     db.set_config(SECURITY_ONBOARDING_COMPLETE_KEY, "true")
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -468,12 +612,12 @@ async fn set_telegram_api_credentials(
     api_id: i32,
     api_hash: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     if api_id <= 0 {
-        return Err("API ID must be a positive integer".to_string());
+        return Err(AppError::invalid_input("API ID must be a positive integer"));
     }
     if api_hash.trim().len() < 8 {
-        return Err("API hash is invalid".to_string());
+        return Err(AppError::invalid_input("API hash is invalid"));
     }
 
     let creds = TelegramApiCredentials {
@@ -482,12 +626,14 @@ async fn set_telegram_api_credentials(
     };
 
     let protected_blob = security::serialize_and_protect(&creds, "wanderer-telegram-credentials")
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
 
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     db.set_config(TELEGRAM_CREDS_KEY, &protected_blob)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     drop(db_guard);
 
     state
@@ -501,12 +647,14 @@ async fn set_telegram_api_credentials(
 async fn clear_telegram_api_credentials(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     {
         let db_guard = state.db.lock().await;
-        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
         db.remove_config(TELEGRAM_CREDS_KEY)
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::from)?;
     }
     let app_dir = resolve_app_data_dir(&app)?;
     let _ = state.telegram.logout(app_dir).await;
@@ -517,7 +665,7 @@ async fn clear_telegram_api_credentials(
 #[tauri::command]
 async fn get_encryption_migration_status(
     state: State<'_, AppState>,
-) -> Result<MigrationStatus, String> {
+) -> Result<MigrationStatus, AppError> {
     let runtime_status = state.security_runtime.lock().await.migration.clone();
     if runtime_status.total == 0
         && runtime_status.processed == 0
@@ -525,27 +673,79 @@ async fn get_encryption_migration_status(
         && runtime_status.failed == 0
     {
         let db_guard = state.db.lock().await;
-        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
         Ok(load_migration_status(db))
     } else {
         Ok(runtime_status)
     }
 }
 
+/// Retry deleting the plaintext copies the migration could not confirm gone.
+///
+/// Returns how many are confirmed deleted by this attempt. The backlog is the only
+/// record that unencrypted media is still in the cloud, so it is rewritten from what
+/// survived rather than simply cleared.
+#[tauri::command]
+async fn retry_plaintext_purge(state: State<'_, AppState>) -> Result<usize, AppError> {
+    let pending = state
+        .security_runtime
+        .lock()
+        .await
+        .migration
+        .unpurged_plaintext
+        .clone();
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    if !state.telegram.is_connected().await {
+        return Err(AppError::unavailable(
+            "Connect to Telegram before retrying the purge",
+        ));
+    }
+
+    let surviving = state.telegram.purge_messages(&pending).await?;
+    let purged = pending.len() - surviving.len();
+
+    let status = {
+        let mut guard = state.security_runtime.lock().await;
+        // Ids that were not part of this attempt are left alone: a migration running
+        // alongside this may have added one since the list was copied.
+        guard
+            .migration
+            .unpurged_plaintext
+            .retain(|id| surviving.contains(id) || !pending.contains(id));
+        guard.migration.clone()
+    };
+
+    let db_guard = state.db.lock().await;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    save_migration_status(db, &status)?;
+
+    log::info!("Retried the plaintext purge: {} confirmed deleted", purged);
+    Ok(purged)
+}
+
 #[tauri::command]
 async fn start_encryption_migration(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let db = {
         let db_guard = state.db.lock().await;
-        db_guard.as_ref().ok_or("Database not initialized")?.clone()
+        db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?
+            .clone()
     };
 
     let bundle = load_security_bundle(&db)?
-        .ok_or_else(|| "Encryption is not initialized for this library".to_string())?;
+        .ok_or_else(|| AppError::invalid_input("Encryption is not initialized for this library"))?;
     if bundle.mode != EncryptionMode::Encrypted {
-        return Err("Encryption mode is not enabled".to_string());
+        return Err(AppError::invalid_input("Encryption mode is not enabled"));
     }
 
     let key = state
@@ -553,7 +753,8 @@ async fn start_encryption_migration(
         .lock()
         .await
         .master_key
-        .ok_or_else(|| "Unlock encryption before starting migration".to_string())?;
+        .clone()
+        .ok_or_else(|| AppError::vault_locked("Unlock encryption before starting migration"))?;
 
     // Resolved once here and moved into the worker below, so every unlink the
     // migration performs is confined to the managed library.
@@ -561,10 +762,10 @@ async fn start_encryption_migration(
 
     let cloud_items = db
         .get_uploaded_unencrypted_media(1_000_000)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     let thumb_items = db
         .get_unencrypted_thumbnail_paths(1_000_000)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
 
     {
         let mut runtime = state.security_runtime.lock().await;
@@ -579,6 +780,9 @@ async fn start_encryption_migration(
             succeeded: 0,
             failed: 0,
             last_error: None,
+            // Carried across runs: an unpurged plaintext copy is not something a
+            // fresh migration pass fixes, so starting over must not forget it.
+            unpurged_plaintext: runtime.migration.unpurged_plaintext.clone(),
         };
         let _ = save_migration_status(&db, &runtime.migration);
     }
@@ -594,7 +798,7 @@ async fn start_encryption_migration(
                     let new_path_str = new_path.to_string_lossy().to_string();
                     if new_path_str != thumb_path {
                         db.update_thumbnail_path(media_id, &new_path_str)
-                            .map_err(|e| e.to_string())
+                            .map_err(AppError::from)
                             .map(|_| ())
                     } else {
                         Ok(())
@@ -610,7 +814,9 @@ async fn start_encryption_migration(
                 Ok(_) => state_guard.migration.succeeded += 1,
                 Err(err) => {
                     state_guard.migration.failed += 1;
-                    state_guard.migration.last_error = Some(err);
+                    // The status is persisted and shown, so it keeps the message the
+                    // user can act on rather than the error object.
+                    state_guard.migration.last_error = Some(err.to_string());
                 }
             }
             let _ = save_migration_status(&db, &state_guard.migration);
@@ -619,7 +825,9 @@ async fn start_encryption_migration(
         for (media_id, file_path, previous_tg_id, thumbnail_path) in cloud_items {
             let pending_key = format!("{}{}", pending_prefix, media_id);
 
-            let result: Result<(), String> = async {
+            // `Ok(Some(id))` means the media itself migrated but the old plaintext
+            // message is still in Telegram.
+            let result: Result<Option<i32>, AppError> = async {
                 if let Some(thumb_path) = thumbnail_path.as_deref() {
                     if let Some(new_thumb) =
                         ensure_thumbnail_encrypted(thumb_path, &key, &managed_roots)?
@@ -627,14 +835,14 @@ async fn start_encryption_migration(
                         let new_thumb_str = new_thumb.to_string_lossy().to_string();
                         if new_thumb_str != thumb_path {
                             db.update_thumbnail_path(media_id, &new_thumb_str)
-                                .map_err(|e| e.to_string())?;
+                                .map_err(AppError::from)?;
                         }
                     }
                 }
 
                 let maybe_pending = db
                     .get_config(&pending_key)
-                    .map_err(|e| e.to_string())?
+                    .map_err(AppError::from)?
                     .and_then(|v| v.parse::<i32>().ok());
 
                 let new_msg_id = if let Some(id) = maybe_pending {
@@ -642,13 +850,26 @@ async fn start_encryption_migration(
                 } else {
                     let source = std::path::Path::new(&file_path);
                     if !source.exists() {
-                        return Err("Local file is missing; cannot migrate cloud blob".to_string());
+                        return Err(AppError::not_found(
+                            "Local file is missing; cannot migrate cloud blob",
+                        ));
                     }
 
-                    let temp_dir = std::env::temp_dir().join("wanderer-migration");
-                    std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+                    let temp_dir = paths::migration_staging_dir();
+                    std::fs::create_dir_all(&temp_dir).map_err(AppError::from)?;
                     let temp_path = temp_dir.join(format!("media_{}_enc.wbenc", media_id));
-                    security::encrypt_file(source, &temp_path, &key).map_err(|e| e.to_string())?;
+                    // Encrypting the original is whole-file crypto on a media file, and
+                    // this worker shares the runtime with every command the user is
+                    // still issuing while the migration runs.
+                    let encrypt_src = source.to_path_buf();
+                    let encrypt_dst = temp_path.clone();
+                    let encrypt_key = key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        security::encrypt_file(&encrypt_src, &encrypt_dst, &encrypt_key)
+                    })
+                    .await
+                    .map_err(|e| format!("Encrypt task failed: {}", e))?
+                    .map_err(AppError::from)?;
 
                     let temp_path_str = temp_path.to_string_lossy().to_string();
                     let upload_res = telegram
@@ -656,35 +877,65 @@ async fn start_encryption_migration(
                         .await;
                     let _ = std::fs::remove_file(&temp_path);
 
-                    let uploaded_id = upload_res.map_err(|e| e.to_string())?;
+                    let uploaded_id = upload_res.map_err(|e| AppError::telegram(e.to_string()))?;
                     db.set_config(&pending_key, &uploaded_id.to_string())
-                        .map_err(|e| e.to_string())?;
+                        .map_err(AppError::from)?;
                     uploaded_id
                 };
 
                 db.update_telegram_id_by_path(&file_path, &new_msg_id.to_string())
-                    .map_err(|e| e.to_string())?;
+                    .map_err(AppError::from)?;
                 db.mark_media_encrypted_by_id(media_id)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(AppError::from)?;
 
+                // The old message holds the unencrypted original. Deleting it is the
+                // point of the migration, so its result is checked rather than
+                // discarded, and an id that survives is handed back to be recorded.
+                let mut unpurged = None;
                 if let Ok(old_id) = previous_tg_id.parse::<i32>() {
                     if old_id != new_msg_id {
-                        let _ = telegram.delete_messages(&[old_id]).await;
+                        match telegram.purge_messages(&[old_id]).await {
+                            Ok(surviving) if surviving.is_empty() => {}
+                            Ok(_) => {
+                                log::error!(
+                                    "Plaintext copy of media {} is still in Telegram",
+                                    media_id
+                                );
+                                unpurged = Some(old_id);
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Could not confirm the plaintext purge for media {}: {}",
+                                    media_id,
+                                    e
+                                );
+                                unpurged = Some(old_id);
+                            }
+                        }
                     }
                 }
 
                 let _ = db.remove_config(&pending_key);
-                Ok(())
+                Ok(unpurged)
             }
             .await;
 
             let mut state_guard = runtime.lock().await;
             state_guard.migration.processed += 1;
             match result {
-                Ok(_) => state_guard.migration.succeeded += 1,
+                Ok(unpurged) => {
+                    state_guard.migration.succeeded += 1;
+                    if let Some(id) = unpurged {
+                        if !state_guard.migration.unpurged_plaintext.contains(&id) {
+                            state_guard.migration.unpurged_plaintext.push(id);
+                        }
+                    }
+                }
                 Err(err) => {
                     state_guard.migration.failed += 1;
-                    state_guard.migration.last_error = Some(err);
+                    // The status is persisted and shown, so it keeps the message the
+                    // user can act on rather than the error object.
+                    state_guard.migration.last_error = Some(err.to_string());
                 }
             }
             let _ = save_migration_status(&db, &state_guard.migration);
@@ -704,38 +955,53 @@ async fn login_request_code(
     phone: String,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     if !state.telegram.has_credentials().await {
-        return Err(
-            "Telegram API credentials are not configured. Complete onboarding first.".to_string(),
-        );
+        return Err(AppError::unavailable(
+            "Telegram API credentials are not configured. Complete onboarding first.",
+        ));
     }
     let app_dir = resolve_app_data_dir(&app)?;
+    let master_key = state.security_runtime.lock().await.master_key.clone();
 
-    match state.telegram.request_code(&phone, app_dir).await {
+    match state
+        .telegram
+        .request_code(&phone, app_dir, master_key)
+        .await
+    {
         Ok(_) => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(AppError::telegram(e.to_string())),
     }
 }
 
 #[tauri::command]
-async fn login_sign_in(code: String, state: State<'_, AppState>) -> Result<String, String> {
-    state.telegram.sign_in(&code).await
+async fn login_sign_in(code: String, state: State<'_, AppState>) -> Result<String, AppError> {
+    state
+        .telegram
+        .sign_in(&code)
+        .await
+        .map_err(AppError::telegram)
 }
 
 #[tauri::command]
-async fn get_me(state: State<'_, AppState>) -> Result<String, String> {
+async fn get_me(state: State<'_, AppState>) -> Result<String, AppError> {
     if !state.telegram.has_credentials().await {
-        return Err("Telegram API credentials are not configured".to_string());
+        return Err(AppError::unavailable(
+            "Telegram API credentials are not configured",
+        ));
     }
-    state.telegram.get_me().await
+    state.telegram.get_me().await.map_err(AppError::telegram)
 }
 
 #[tauri::command]
-async fn logout(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
+async fn logout(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), AppError> {
     let app_dir = resolve_app_data_dir(&app)?;
 
-    state.telegram.logout(app_dir).await
+    state
+        .telegram
+        .logout(app_dir)
+        .await
+        .map_err(AppError::telegram)
 }
 
 #[tauri::command]
@@ -743,18 +1009,17 @@ async fn get_media(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let _db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let _db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
-    println!(
-        "Command: get_media called with limit={}, offset={}",
-        limit, offset
-    );
-    let result = _db.get_media(limit, offset).map_err(|e| e.to_string());
+    log::debug!("get_media: limit={}, offset={}", limit, offset);
+    let result = _db.get_media(limit, offset).map_err(AppError::from);
     match &result {
-        Ok(items) => println!("Command: get_media returning {} items", items.len()),
-        Err(e) => println!("Command: get_media failed: {}", e),
+        Ok(items) => log::debug!("get_media: returning {} items", items.len()),
+        Err(e) => log::warn!("get_media failed: {}", e),
     }
     let items = result?;
     drop(db_guard);
@@ -767,13 +1032,15 @@ async fn search_media(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let filters = database::SearchFilters::default();
     let items = db
         .search_fts(&query, &filters, limit, offset)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -785,20 +1052,26 @@ async fn search_fts(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
-    println!(
-        "Command: search_fts called with query='{}', has_location={:?}",
-        query, filters.has_location
+) -> Result<Vec<database::MediaItem>, AppError> {
+    // The query text is the user's own words about their own library, so only its
+    // shape is logged. It is the one command argument that is content rather than an
+    // identifier.
+    log::debug!(
+        "search_fts: {}-character query, has_location={:?}",
+        query.chars().count(),
+        filters.has_location
     );
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let result = db
         .search_fts(&query, &filters, limit, offset)
-        .map_err(|e| e.to_string());
+        .map_err(AppError::from);
 
     match &result {
-        Ok(items) => println!("Command: search_fts returning {} items", items.len()),
-        Err(e) => println!("Command: search_fts failed: {}", e),
+        Ok(items) => log::debug!("search_fts: returning {} items", items.len()),
+        Err(e) => log::warn!("search_fts failed: {}", e),
     }
     let items = result?;
     drop(db_guard);
@@ -806,17 +1079,21 @@ async fn search_fts(
 }
 
 #[tauri::command]
-async fn create_album(name: String, state: State<'_, AppState>) -> Result<i64, String> {
+async fn create_album(name: String, state: State<'_, AppState>) -> Result<i64, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.create_album(&name).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.create_album(&name).map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn get_albums(state: State<'_, AppState>) -> Result<Vec<database::Album>, String> {
+async fn get_albums(state: State<'_, AppState>) -> Result<Vec<database::Album>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_albums().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_albums().map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -824,15 +1101,18 @@ async fn add_media_to_album(
     album_id: i64,
     media_id: i64,
     state: State<'_, AppState>,
-) -> Result<(), String> {
-    println!(
-        "Command: add_media_to_album called with album_id={}, media_id={}",
-        album_id, media_id
+) -> Result<(), AppError> {
+    log::debug!(
+        "add_media_to_album: album_id={}, media_id={}",
+        album_id,
+        media_id
     );
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     db.add_media_to_album(album_id, media_id)
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -841,19 +1121,23 @@ async fn get_album_media(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
-    println!(
-        "Command: get_album_media called with album_id={}, limit={}, offset={}",
-        album_id, limit, offset
+) -> Result<Vec<database::MediaItem>, AppError> {
+    log::debug!(
+        "get_album_media: album_id={}, limit={}, offset={}",
+        album_id,
+        limit,
+        offset
     );
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let result = db
         .get_album_media(album_id, limit, offset)
-        .map_err(|e| e.to_string());
+        .map_err(AppError::from);
     match &result {
-        Ok(items) => println!("Command: get_album_media returning {} items", items.len()),
-        Err(e) => println!("Command: get_album_media failed: {}", e),
+        Ok(items) => log::debug!("get_album_media: returning {} items", items.len()),
+        Err(e) => log::warn!("get_album_media failed: {}", e),
     }
     let items = result?;
     drop(db_guard);
@@ -861,10 +1145,10 @@ async fn get_album_media(
 }
 
 #[tauri::command]
-async fn detect_faces(state: State<'_, AppState>, path: String) -> Result<Vec<ai::Face>, String> {
+async fn detect_faces(state: State<'_, AppState>, path: String) -> Result<Vec<ai::Face>, AppError> {
     let detector = match &state.face_detector {
         Some(d) => d.clone(),
-        None => return Err("AI face detection is not available".to_string()),
+        None => return Err(AppError::unavailable("AI face detection is not available")),
     };
     let path_buf = std::path::PathBuf::from(path);
 
@@ -875,23 +1159,27 @@ async fn detect_faces(state: State<'_, AppState>, path: String) -> Result<Vec<ai
     });
 
     match join_handle.await {
-        Ok(detection_res) => detection_res.map_err(|e: anyhow::Error| e.to_string()),
-        Err(e) => Err(e.to_string()),
+        Ok(detection_res) => detection_res.map_err(AppError::from),
+        Err(e) => Err(AppError::from(e)),
     }
 }
 
 #[tauri::command]
-async fn get_faces(state: State<'_, AppState>, media_id: i64) -> Result<Vec<ai::Face>, String> {
+async fn get_faces(state: State<'_, AppState>, media_id: i64) -> Result<Vec<ai::Face>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_faces(media_id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_faces(media_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn debug_reset_faces(state: State<'_, AppState>) -> Result<usize, String> {
+async fn debug_reset_faces(state: State<'_, AppState>) -> Result<usize, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.reset_all_scans().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.reset_all_scans().map_err(AppError::from)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -946,37 +1234,24 @@ pub fn run() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
 
+            // Before anything else, and before the vault can be unlocked again: a crash
+            // or a kill leaves decrypted scratch behind that no lock handler ever ran
+            // for, and startup is the only moment nothing is using it.
+            let purged = paths::purge_scratch_dirs();
+            if purged > 0 {
+                log::info!(
+                    "Purged {} scratch directories left by a previous run",
+                    purged
+                );
+            }
+
             tauri::async_runtime::spawn(async move {
-                // Initialize State with cache
-                // Note: We need to manage how state is initialized if we changed the struct
-                // actually `manage` call is usually done before setup or passed via .manage()
-                // But here we are accessing state that was managed?
-                // Wait, tauri::Builder::default().manage(AppState { ... }) is missing in the visible code!
-                // Ah, the view showed `.setup`.
-                // I need to see where `AppState` is created.
-                // Usually it's `.manage(AppState::default())` or similar.
-
-                // Let's look at the full file content of lib.rs again to check `manage`.
-                // If I can't find it, I will assume I need to add it or modify it.
-                // Assuming `manage` is called with initial state.
-
-                // Wait, the previous view of lib.rs showed:
-                // let state: tauri::State<AppState> = app_handle.state();
-                // This means state is ALREADY managed.
-                // I need to find where `.manage` is called to update the INITIALIZATION.
-
-                // If I change AppState struct, I MUST update the `.manage(...)` call.
-                // Let's find it.
-
-                // I will do a `view_file` regarding this in next step if I can't find it.
-                // But let's look at lines 100-150 relative to previous view.
-
                 let state: tauri::State<AppState> = app_handle.state();
 
                 let app_dir = match resolve_app_data_dir(&app_handle) {
                     Ok(dir) => dir,
                     Err(e) => {
-                        eprintln!("Failed to resolve app data directory: {}", e);
+                        log::error!("Failed to resolve app data directory: {}", e);
                         return;
                     }
                 };
@@ -988,11 +1263,12 @@ pub fn run() {
                     Ok(db) => {
                         let arc = Arc::new(db);
                         *state.db.lock().await = Some(arc.clone());
-                        println!("Database initialized at {:?}", db_path);
+                        log::info!("Database initialized");
+                        log::debug!("Database path: {:?}", db_path);
                         Some(arc)
                     }
                     Err(e) => {
-                        eprintln!("Failed to initialize database: {}", e);
+                        log::error!("Failed to initialize database: {}", e);
                         None
                     }
                 };
@@ -1070,9 +1346,10 @@ pub fn run() {
                     ) {
                         Ok(w) => {
                             *state.watcher.lock().await = Some(w);
-                            println!("File Watcher started at {:?}", watch_path);
+                            log::info!("File watcher started");
+                            log::debug!("Watching {:?}", watch_path);
                         }
-                        Err(e) => eprintln!("Failed to start watcher: {}", e),
+                        Err(e) => log::error!("Failed to start watcher: {}", e),
                     }
 
                     // Start AI Worker
@@ -1088,7 +1365,7 @@ pub fn run() {
                     tokio::spawn(async move {
                         ai_worker.run(worker_cancel_clone).await;
                     });
-                    println!("AI Worker spawned");
+                    log::info!("AI worker spawned");
 
                     // Create cancellation token for graceful shutdown
                     let cancel_token = CancellationToken::new();
@@ -1167,14 +1444,28 @@ pub fn run() {
 
                 // Connect Telegram only when BYOK credentials are configured.
                 if state.telegram.has_credentials().await {
-                    if let Err(e) = state.telegram.connect(app_dir.clone()).await {
-                        eprintln!("Failed to connect to Telegram: {}", e);
+                    // Windows ignores this: DPAPI opens the session with nothing
+                    // unlocked. Elsewhere an encrypted library that has not been
+                    // unlocked yet cannot unseal the session, so this fails and
+                    // `unlock_encryption` connects instead once the key exists.
+                    let master_key = state.security_runtime.lock().await.master_key.clone();
+                    if let Err(e) = state.telegram.connect(app_dir.clone(), master_key).await {
+                        log::warn!("Not connecting to Telegram yet: {}", e);
                     }
                 } else {
                     log::info!("Telegram API credentials not configured yet; skipping connect");
                 }
             });
             Ok(())
+        })
+        // The last chance to clean up while the process is still alive. `Destroyed`
+        // rather than `CloseRequested`, because the latter can be cancelled and the
+        // viewer may still hold the very files being deleted.
+        .on_window_event(|_window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let purged = paths::purge_scratch_dirs();
+                log::info!("Window closed; purged {} scratch directories", purged);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_security_status,
@@ -1188,6 +1479,7 @@ pub fn run() {
             set_telegram_api_credentials,
             clear_telegram_api_credentials,
             get_encryption_migration_status,
+            retry_plaintext_purge,
             start_encryption_migration,
             login_request_code,
             login_sign_in,
@@ -1275,29 +1567,33 @@ pub fn run() {
 }
 
 #[tauri::command]
-async fn get_backup_path(app: tauri::AppHandle) -> Result<String, String> {
+async fn get_backup_path(app: tauri::AppHandle) -> Result<String, AppError> {
     let app_data = resolve_app_data_dir(&app)?;
     let backup_dir = app_data.join("backup");
-    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&backup_dir).map_err(AppError::from)?;
     Ok(backup_dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-async fn get_queue_status(state: State<'_, AppState>) -> Result<Vec<database::QueueItem>, String> {
+async fn get_queue_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<database::QueueItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_queue_status().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_queue_status().map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize, String> {
+async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize, AppError> {
     // Resolve backup directory in app data path
     let app_dir = resolve_app_data_dir(&app)?;
 
     let backup_dir = app_dir.join("backup");
 
     // Ensure it exists (should be created by setup, but safety check)
-    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&backup_dir).map_err(AppError::from)?;
 
     let mut success_count = 0;
 
@@ -1337,8 +1633,9 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
                 continue;
             }
 
-            // Copy the file
-            if let Err(e) = std::fs::copy(path, &dest_path) {
+            // Copy the file. `tokio::fs::copy` runs it on a blocking thread, which
+            // matters here: these are media files and the loop can be hundreds long.
+            if let Err(e) = tokio::fs::copy(path, &dest_path).await {
                 log::error!("Failed to copy file {:?} to {:?}: {}", path, dest_path, e);
             } else {
                 success_count += 1;
@@ -1359,17 +1656,25 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
 // --- Phase 2: Favorites & Ratings Commands ---
 
 #[tauri::command]
-async fn toggle_favorite(media_id: i64, state: State<'_, AppState>) -> Result<bool, String> {
+async fn toggle_favorite(media_id: i64, state: State<'_, AppState>) -> Result<bool, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.toggle_favorite(media_id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.toggle_favorite(media_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn set_rating(media_id: i64, rating: i32, state: State<'_, AppState>) -> Result<(), String> {
+async fn set_rating(
+    media_id: i64,
+    rating: i32,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.set_rating(media_id, rating).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.set_rating(media_id, rating).map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1377,10 +1682,12 @@ async fn get_favorites(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let items = db.get_favorites(limit, offset).map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let items = db.get_favorites(limit, offset).map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -1388,18 +1695,22 @@ async fn get_favorites(
 // --- Phase 2: Trash Commands ---
 
 #[tauri::command]
-async fn soft_delete_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    println!(">>> soft_delete_media CALLED for id={}", media_id);
+async fn soft_delete_media(media_id: i64, state: State<'_, AppState>) -> Result<(), AppError> {
+    log::debug!("soft_delete_media: media_id={}", media_id);
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.soft_delete(media_id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.soft_delete(media_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn restore_from_trash(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+async fn restore_from_trash(media_id: i64, state: State<'_, AppState>) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.restore_from_trash(media_id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.restore_from_trash(media_id).map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1407,14 +1718,13 @@ async fn get_trash(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
-    println!(
-        ">>> get_trash CALLED with limit={}, offset={}",
-        limit, offset
-    );
+) -> Result<Vec<database::MediaItem>, AppError> {
+    log::debug!("get_trash: limit={}, offset={}", limit, offset);
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let items = db.get_trash(limit, offset).map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let items = db.get_trash(limit, offset).map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -1422,24 +1732,32 @@ async fn get_trash(
 // --- Phase 3: Upload Queue Commands ---
 
 #[tauri::command]
-async fn get_upload_queue(state: State<'_, AppState>) -> Result<Vec<database::QueueItem>, String> {
+async fn get_upload_queue(
+    state: State<'_, AppState>,
+) -> Result<Vec<database::QueueItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_queue_status().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_queue_status().map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn get_queue_counts(state: State<'_, AppState>) -> Result<database::QueueCounts, String> {
+async fn get_queue_counts(state: State<'_, AppState>) -> Result<database::QueueCounts, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_queue_counts().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_queue_counts().map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn retry_upload(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+async fn retry_upload(id: i64, state: State<'_, AppState>) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.retry_failed_item(id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.retry_failed_item(id).map_err(AppError::from)
 }
 
 // --- Phase 5: Bulk Operations Commands ---
@@ -1449,18 +1767,22 @@ async fn bulk_set_favorite(
     media_ids: Vec<i64>,
     is_favorite: bool,
     state: State<'_, AppState>,
-) -> Result<usize, String> {
+) -> Result<usize, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     db.bulk_set_favorite(&media_ids, is_favorite)
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn bulk_delete(media_ids: Vec<i64>, state: State<'_, AppState>) -> Result<usize, String> {
+async fn bulk_delete(media_ids: Vec<i64>, state: State<'_, AppState>) -> Result<usize, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.bulk_soft_delete(&media_ids).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.bulk_soft_delete(&media_ids).map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1468,11 +1790,13 @@ async fn bulk_add_to_album(
     album_id: i64,
     media_ids: Vec<i64>,
     state: State<'_, AppState>,
-) -> Result<usize, String> {
+) -> Result<usize, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     db.bulk_add_to_album(album_id, &media_ids)
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
 }
 
 // --- Phase 6: Export & Advanced Features ---
@@ -1482,21 +1806,25 @@ async fn export_media(
     media_ids: Vec<i64>,
     destination: String,
     state: State<'_, AppState>,
-) -> Result<usize, String> {
+) -> Result<usize, AppError> {
     use std::path::Path;
     use time::OffsetDateTime;
 
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let items = db.get_media_by_ids(&media_ids).map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let items = db.get_media_by_ids(&media_ids).map_err(AppError::from)?;
     drop(db_guard);
 
     let dest_path = paths::normalize_lexically(Path::new(&destination));
     if !dest_path.is_absolute() {
-        return Err("Export destination must be an absolute path".to_string());
+        return Err(AppError::invalid_input(
+            "Export destination must be an absolute path",
+        ));
     }
     if !dest_path.exists() {
-        std::fs::create_dir_all(&dest_path).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&dest_path).map_err(AppError::from)?;
     }
     let dest_root = paths::resolve(&dest_path);
 
@@ -1526,10 +1854,12 @@ async fn export_media(
 
         let folder = dest_path.join(&year).join(&month);
         if !folder.exists() {
-            std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&folder).map_err(AppError::from)?;
         }
 
-        let file_name = source_hint.file_name().ok_or("Invalid file name")?;
+        let file_name = source_hint
+            .file_name()
+            .ok_or_else(|| AppError::invalid_input("Invalid file name"))?;
         let dest_file = folder.join(file_name);
 
         // Handle duplicate filenames
@@ -1564,7 +1894,9 @@ async fn export_media(
         let final_dest = paths::confine(&dest_root, &final_dest)?;
 
         if source.exists() {
-            std::fs::copy(source, &final_dest).map_err(|e| e.to_string())?;
+            tokio::fs::copy(source, &final_dest)
+                .await
+                .map_err(AppError::from)?;
             exported += 1;
             continue;
         }
@@ -1614,13 +1946,15 @@ async fn export_media(
 #[tauri::command]
 async fn find_duplicates(
     state: State<'_, AppState>,
-) -> Result<Vec<Vec<database::MediaItem>>, String> {
+) -> Result<Vec<Vec<database::MediaItem>>, AppError> {
     // Opportunistically fill missing pHashes so Refresh can recover even if
     // Scan Library was run before watcher ingestion completed.
     let items_to_scan = {
         let db_guard = state.db.lock().await;
-        let db = db_guard.as_ref().ok_or("Database not initialized")?;
-        db.get_media_without_phash().map_err(|e| e.to_string())?
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
+        db.get_media_without_phash().map_err(AppError::from)?
     };
 
     if !items_to_scan.is_empty() {
@@ -1636,8 +1970,10 @@ async fn find_duplicates(
     }
 
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let groups = db.find_duplicates().map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let groups = db.find_duplicates().map_err(AppError::from)?;
     drop(db_guard);
 
     let mut out = Vec::with_capacity(groups.len());
@@ -1653,7 +1989,7 @@ async fn find_duplicates(
 async fn scan_duplicates(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<usize, String> {
+) -> Result<usize, AppError> {
     use tauri::Emitter;
 
     // Prefer missing hashes first. If none are missing, run a full image rescan.
@@ -1661,11 +1997,12 @@ async fn scan_duplicates(
     // "Scan Library" behavior deterministic for QA workflows.
     let items_to_scan = {
         let db_guard = state.db.lock().await;
-        let db = db_guard.as_ref().ok_or("Database not initialized")?;
-        let missing = db.get_media_without_phash().map_err(|e| e.to_string())?;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
+        let missing = db.get_media_without_phash().map_err(AppError::from)?;
         if missing.is_empty() {
-            db.get_all_media_for_phash_scan()
-                .map_err(|e| e.to_string())?
+            db.get_all_media_for_phash_scan().map_err(AppError::from)?
         } else {
             missing
         }
@@ -1713,18 +2050,22 @@ async fn scan_duplicates(
 async fn get_tags_for_media(
     media_id: i64,
     state: State<'_, AppState>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_tags_for_media(media_id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_tags_for_media(media_id).map_err(AppError::from)
 }
 
 #[tauri::command]
 
-async fn get_persons(state: State<'_, AppState>) -> Result<Vec<database::Person>, String> {
+async fn get_persons(state: State<'_, AppState>) -> Result<Vec<database::Person>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_people().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_people().map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1732,11 +2073,13 @@ async fn update_person_name(
     person_id: i64,
     name: String,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     db.update_person_name(person_id, &name)
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1745,12 +2088,14 @@ async fn get_media_by_person(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let items = db
         .get_media_by_person(person_id, limit, offset)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -1760,20 +2105,24 @@ async fn merge_persons(
     target_id: i64,
     source_ids: Vec<i64>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     db.merge_persons(target_id, &source_ids)
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
 }
 
 // --- Phase 7: Tags / Object Detection ---
 
 #[tauri::command]
-async fn get_all_tags(state: State<'_, AppState>) -> Result<Vec<database::Tag>, String> {
+async fn get_all_tags(state: State<'_, AppState>) -> Result<Vec<database::Tag>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_all_tags().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_all_tags().map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1782,12 +2131,14 @@ async fn get_media_by_tag(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let items = db
         .get_media_by_tag(&tag, limit, offset)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -1799,10 +2150,12 @@ async fn get_media_by_tag(
 #[tauri::command]
 async fn get_all_config(
     state: State<'_, AppState>,
-) -> Result<std::collections::HashMap<String, String>, String> {
+) -> Result<std::collections::HashMap<String, String>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let mut config = db.get_all_config().map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let mut config = db.get_all_config().map_err(AppError::from)?;
     // Mirrors the guard in `set_config`. This command returned the entire config
     // table, so every `MediaGrid` mount handed the wrapped master key and the
     // DPAPI credential blob to JavaScript purely to read `timeline_grouping`.
@@ -1810,14 +2163,112 @@ async fn get_all_config(
     Ok(config)
 }
 
-#[tauri::command]
-async fn set_config(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
-    if is_security_key(&key) {
-        return Err("Security settings are managed by dedicated security commands".to_string());
+/// What a settings value is allowed to be.
+enum ConfigDomain {
+    /// `true` or `false`, in any case, stored lowercased.
+    Bool,
+    /// One of a fixed set of strings.
+    Choice(&'static [&'static str]),
+    /// A whole number in an inclusive range.
+    Integer { min: i64, max: i64 },
+}
+
+/// Every config key the frontend may write, with the domain of its value.
+///
+/// This replaces a `security_` denylist, which stopped script in the webview from
+/// overwriting the key material but left every other row writable: the AI opt-ins that
+/// decide whether the user's photos are analysed, the cache sizes that decide how much
+/// plaintext is kept on disk, and any key at all, including ones no code reads, since
+/// an unknown key was simply inserted. Anything the backend writes for itself
+/// (`device_id`, the per-media sync markers, the security rows) goes through
+/// `Database::set_config` directly and is not reachable from here.
+const WRITABLE_CONFIG: &[(&str, ConfigDomain)] = &[
+    (
+        "cache_size_mb",
+        ConfigDomain::Integer {
+            min: 100,
+            max: 1_000_000,
+        },
+    ),
+    (
+        "view_cache_max_size_mb",
+        ConfigDomain::Integer {
+            min: 100,
+            max: 1_000_000,
+        },
+    ),
+    (
+        "view_cache_retention_hours",
+        ConfigDomain::Integer { min: 1, max: 8760 },
+    ),
+    ("ai_face_enabled", ConfigDomain::Bool),
+    ("ai_tags_enabled", ConfigDomain::Bool),
+    (
+        "timeline_grouping",
+        ConfigDomain::Choice(&["day", "month", "year"]),
+    ),
+];
+
+/// Check a settings write and return the value to store.
+///
+/// Returns the normalized form rather than the input, so `"TRUE"` and `"true"` cannot
+/// both end up in the table and disagree with the `eq_ignore_ascii_case` readers.
+fn validate_config_write(key: &str, value: &str) -> Result<String, AppError> {
+    let Some((_, domain)) = WRITABLE_CONFIG.iter().find(|(name, _)| *name == key) else {
+        return Err(AppError::invalid_input(format!(
+            "'{}' is not a writable setting",
+            key
+        )));
+    };
+
+    match domain {
+        ConfigDomain::Bool => match value.to_ascii_lowercase().as_str() {
+            "true" => Ok("true".to_string()),
+            "false" => Ok("false".to_string()),
+            _ => Err(AppError::invalid_input(format!(
+                "'{}' must be true or false",
+                key
+            ))),
+        },
+        ConfigDomain::Choice(allowed) => {
+            let lowered = value.to_ascii_lowercase();
+            if allowed.contains(&lowered.as_str()) {
+                Ok(lowered)
+            } else {
+                Err(AppError::invalid_input(format!(
+                    "'{}' must be one of {}",
+                    key,
+                    allowed.join(", ")
+                )))
+            }
+        }
+        ConfigDomain::Integer { min, max } => {
+            let parsed: i64 = value.trim().parse().map_err(|_| {
+                AppError::invalid_input(format!("'{}' must be a whole number", key))
+            })?;
+            if parsed < *min || parsed > *max {
+                return Err(AppError::invalid_input(format!(
+                    "'{}' must be between {} and {}",
+                    key, min, max
+                )));
+            }
+            Ok(parsed.to_string())
+        }
     }
+}
+
+#[tauri::command]
+async fn set_config(
+    key: String,
+    value: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let value = validate_config_write(&key, &value)?;
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.set_config(&key, &value).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.set_config(&key, &value).map_err(AppError::from)
 }
 
 // --- Smart Albums Commands ---
@@ -1825,10 +2276,12 @@ async fn set_config(key: String, value: String, state: State<'_, AppState>) -> R
 #[tauri::command]
 async fn get_smart_album_counts(
     state: State<'_, AppState>,
-) -> Result<database::SmartAlbumCounts, String> {
+) -> Result<database::SmartAlbumCounts, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_smart_album_counts().map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.get_smart_album_counts().map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1836,10 +2289,12 @@ async fn get_videos(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let items = db.get_videos(limit, offset).map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let items = db.get_videos(limit, offset).map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -1849,10 +2304,12 @@ async fn get_recent(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let items = db.get_recent(limit, offset).map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let items = db.get_recent(limit, offset).map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -1862,26 +2319,32 @@ async fn get_top_rated(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    let items = db.get_top_rated(limit, offset).map_err(|e| e.to_string())?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let items = db.get_top_rated(limit, offset).map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
 
 #[tauri::command]
-async fn archive_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+async fn archive_media(media_id: i64, state: State<'_, AppState>) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.archive_media(media_id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.archive_media(media_id).map_err(AppError::from)
 }
 
 #[tauri::command]
-async fn unarchive_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+async fn unarchive_media(media_id: i64, state: State<'_, AppState>) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.unarchive_media(media_id).map_err(|e| e.to_string())
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    db.unarchive_media(media_id).map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -1889,12 +2352,14 @@ async fn get_archived_media(
     limit: i32,
     offset: i32,
     state: State<'_, AppState>,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
     let items = db
         .get_archived_media(limit, offset)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
@@ -1904,12 +2369,14 @@ async fn permanent_delete_media(
     media_id: i64,
     delete_from_telegram: bool,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     // Delete from local + DB, get telegram_media_id
-    let telegram_media_id = db.permanent_delete(media_id).map_err(|e| e.to_string())?;
+    let telegram_media_id = db.permanent_delete(media_id).map_err(AppError::from)?;
 
     // Optionally delete from Telegram
     if delete_from_telegram {
@@ -1928,23 +2395,21 @@ async fn permanent_delete_media(
 async fn empty_trash(
     delete_from_telegram: bool,
     state: State<'_, AppState>,
-) -> Result<usize, String> {
-    println!(
-        ">>> empty_trash CALLED! delete_from_telegram={}",
-        delete_from_telegram
-    );
+) -> Result<usize, AppError> {
+    log::info!("empty_trash: delete_from_telegram={}", delete_from_telegram);
 
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     // Delete all trashed items from local + DB
-    let (deleted_count, telegram_ids) = db.empty_trash().map_err(|e| e.to_string())?;
+    let (deleted_count, telegram_ids) = db.empty_trash().map_err(AppError::from)?;
 
-    println!(
-        "empty_trash: Deleted {} items locally. Telegram IDs to delete: {:?}, delete_from_telegram={}",
+    log::info!(
+        "empty_trash: deleted {} items locally, {} with a Telegram copy",
         deleted_count,
-        telegram_ids,
-        delete_from_telegram
+        telegram_ids.len()
     );
 
     // Optionally delete from Telegram
@@ -1956,28 +2421,24 @@ async fn empty_trash(
             .filter_map(|id| {
                 let parsed = id.parse::<i32>().ok();
                 if parsed.is_none() {
-                    println!("empty_trash: Failed to parse telegram_id '{}' as i32", id);
+                    log::warn!("empty_trash: unparseable telegram_id, skipping it");
                 }
                 parsed
             })
             .collect();
 
-        println!(
-            "empty_trash: Parsed {} message IDs for Telegram deletion: {:?}",
-            msg_ids.len(),
-            msg_ids
+        log::debug!(
+            "empty_trash: {} message IDs to delete from Telegram",
+            msg_ids.len()
         );
 
         if !msg_ids.is_empty() {
             match state.telegram.delete_messages(&msg_ids).await {
                 Ok(deleted) => {
-                    println!(
-                        "empty_trash: Successfully deleted {} messages from Telegram",
-                        deleted
-                    );
+                    log::info!("empty_trash: deleted {} messages from Telegram", deleted);
                 }
                 Err(e) => {
-                    println!("empty_trash: Failed to delete from Telegram: {}", e);
+                    log::warn!("empty_trash: failed to delete from Telegram: {}", e);
                 }
             }
         }
@@ -1992,7 +2453,7 @@ async fn backup_database(
     upload_to_telegram: bool,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     use std::path::Path;
 
     // Get the database path
@@ -2000,7 +2461,7 @@ async fn backup_database(
     let db_path = app_data.join("library.db");
 
     if !db_path.exists() {
-        return Err("Database file not found".to_string());
+        return Err(AppError::not_found("Database file not found"));
     }
 
     // Determine backup destination. A caller-supplied destination must be an
@@ -2010,10 +2471,10 @@ async fn backup_database(
     let backup_path = if let Some(dest) = destination {
         let dest_path = paths::normalize_lexically(Path::new(&dest));
         if !dest_path.is_dir() {
-            return Err(format!(
+            return Err(AppError::invalid_input(format!(
                 "Backup destination is not an existing directory: {}",
                 dest_path.display()
-            ));
+            )));
         }
         let filename = format!(
             "library_backup_{}.db",
@@ -2031,11 +2492,20 @@ async fn backup_database(
 
     // Create backup directory if needed
     if let Some(parent) = backup_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(AppError::from)?;
     }
 
-    // Copy the database file
-    std::fs::copy(&db_path, &backup_path).map_err(|e| e.to_string())?;
+    // Snapshot through SQLite rather than copying the file. See `Database::backup_to`:
+    // with WAL enabled, a raw copy of library.db can omit committed data that is still
+    // sitting in the write-ahead log.
+    {
+        let db_guard = state.db.lock().await;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
+        db.backup_to(&backup_path)
+            .map_err(|e| format!("Failed to write the database snapshot: {}", e))?;
+    }
 
     let mut final_backup_path = backup_path.clone();
 
@@ -2044,7 +2514,9 @@ async fn backup_database(
     // plaintext, so this fails closed rather than defaulting to "unset".
     let bundle = {
         let db_guard = state.db.lock().await;
-        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
         load_security_bundle(db)?
     };
     let encrypted_mode = bundle
@@ -2053,7 +2525,7 @@ async fn backup_database(
         .unwrap_or(false);
 
     if encrypted_mode {
-        let bundle = bundle.ok_or("Security bundle missing")?;
+        let bundle = bundle.ok_or_else(|| AppError::not_found("Security bundle missing"))?;
         let key = get_active_master_key(&state).await.ok_or_else(|| {
             "Encryption vault is locked. Unlock to create encrypted backup.".to_string()
         })?;
@@ -2068,7 +2540,7 @@ async fn backup_database(
             &key,
             app.package_info().version.to_string().as_str(),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
         let _ = std::fs::remove_file(&backup_path);
         final_backup_path = archive_path;
     }
@@ -2104,9 +2576,9 @@ struct BackupArchiveInfo {
 }
 
 #[tauri::command]
-async fn inspect_backup_archive(archive_path: String) -> Result<BackupArchiveInfo, String> {
+async fn inspect_backup_archive(archive_path: String) -> Result<BackupArchiveInfo, AppError> {
     let path = std::path::PathBuf::from(&archive_path);
-    let header = backup::read_header(&path).map_err(|e| e.to_string())?;
+    let header = backup::read_header(&path).map_err(AppError::from)?;
     Ok(BackupArchiveInfo {
         format_version: header.format_version,
         created_at: header.created_at,
@@ -2128,12 +2600,14 @@ async fn restore_backup_archive(
     archive_path: String,
     passphrase: Option<String>,
     recovery_key: Option<String>,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     let archive = std::path::PathBuf::from(&archive_path);
-    let passphrase = passphrase.filter(|p| !p.is_empty());
-    let recovery_key = recovery_key.filter(|k| !k.is_empty());
+    let passphrase = passphrase.filter(|p| !p.is_empty()).map(Zeroizing::new);
+    let recovery_key = recovery_key.filter(|k| !k.is_empty()).map(Zeroizing::new);
     if passphrase.is_none() && recovery_key.is_none() {
-        return Err("A passphrase or a recovery key is required".to_string());
+        return Err(AppError::invalid_input(
+            "A passphrase or a recovery key is required",
+        ));
     }
 
     let out_path = archive.with_extension("restored.db");
@@ -2142,16 +2616,20 @@ async fn restore_backup_archive(
     // uses spawn_blocking too.
     tauri::async_runtime::spawn_blocking(move || {
         let secret = match (passphrase.as_deref(), recovery_key.as_deref()) {
-            (Some(p), _) => backup::BackupSecret::Passphrase(p),
-            (None, Some(k)) => backup::BackupSecret::RecoveryKey(k),
-            (None, None) => return Err("A passphrase or a recovery key is required".to_string()),
+            (Some(p), _) => backup::BackupSecret::Passphrase(p.as_str()),
+            (None, Some(k)) => backup::BackupSecret::RecoveryKey(k.as_str()),
+            (None, None) => {
+                return Err(AppError::invalid_input(
+                    "A passphrase or a recovery key is required",
+                ))
+            }
         };
         backup::restore_encrypted_backup(&archive, &out_path, secret)
             .map(|_| out_path.to_string_lossy().to_string())
-            .map_err(|e| e.to_string())
+            .map_err(AppError::from)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(AppError::from)?
 }
 
 #[tauri::command]
@@ -2159,24 +2637,28 @@ async fn remove_local_copy(
     media_id: i64,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     // Get the media item to find the file path
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     let media = db
         .get_media_by_id(media_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Media not found".to_string())?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("Media not found"))?;
 
     // Check if it has a telegram_media_id (required for cloud-only mode)
     if media.telegram_media_id.is_none() {
-        return Err("Cannot remove local copy: media not uploaded to Telegram yet".to_string());
+        return Err(AppError::invalid_input(
+            "Cannot remove local copy: media not uploaded to Telegram yet",
+        ));
     }
 
     // Check if already cloud-only
     if media.is_cloud_only {
-        return Err("Media is already cloud-only".to_string());
+        return Err(AppError::invalid_input("Media is already cloud-only"));
     }
 
     // Delete the local file (but keep the thumbnail). `file_path` is a plain
@@ -2185,18 +2667,17 @@ async fn remove_local_copy(
     let roots = paths::managed_roots(&app_data);
     let file_path = std::path::Path::new(&media.file_path);
     if !paths::is_within_any(&roots, file_path) {
-        return Err(format!(
+        return Err(AppError::invalid_input(format!(
             "Refusing to delete a file outside the managed library: {}",
             media.file_path
-        ));
+        )));
     }
     if file_path.exists() {
         std::fs::remove_file(file_path).map_err(|e| format!("Failed to delete file: {}", e))?;
     }
 
     // Mark as cloud-only in database
-    db.set_cloud_only(media_id, true)
-        .map_err(|e| e.to_string())?;
+    db.set_cloud_only(media_id, true).map_err(AppError::from)?;
 
     log::info!("Removed local copy for media {}, now cloud-only", media_id);
     Ok(())
@@ -2207,26 +2688,28 @@ async fn download_local_copy(
     media_id: i64,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     // Get the media item
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     let media = db
         .get_media_by_id(media_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Media not found".to_string())?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("Media not found"))?;
 
     // Check if it's cloud-only
     if !media.is_cloud_only {
-        return Err("Media already has local copy".to_string());
+        return Err(AppError::invalid_input("Media already has local copy"));
     }
 
     // Get the telegram_media_id
     let telegram_id = media
         .telegram_media_id
         .clone()
-        .ok_or_else(|| "No Telegram ID found".to_string())?;
+        .ok_or_else(|| AppError::not_found("No Telegram ID found"))?;
 
     // Parse the telegram_media_id to get the message ID
     let msg_id: i32 = telegram_id
@@ -2239,7 +2722,7 @@ async fn download_local_copy(
     // Get the backup directory
     let app_data = resolve_app_data_dir(&app)?;
     let backup_dir = app_data.join("backup");
-    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&backup_dir).map_err(AppError::from)?;
 
     // Determine filename from original path
     let filename = std::path::Path::new(&media.file_path)
@@ -2251,8 +2734,8 @@ async fn download_local_copy(
 
     // Download to a temp file first to avoid watcher hashing/upload-queue races
     // while the file is still being written.
-    let restore_staging_dir = std::env::temp_dir().join("wanderer-local-restore-staging");
-    std::fs::create_dir_all(&restore_staging_dir).map_err(|e| e.to_string())?;
+    let restore_staging_dir = paths::local_restore_staging_dir();
+    std::fs::create_dir_all(&restore_staging_dir).map_err(AppError::from)?;
     let staged_path = restore_staging_dir.join(format!(
         "restore_{}_{}.tmp",
         media_id,
@@ -2269,21 +2752,26 @@ async fn download_local_copy(
     if download_path.exists() {
         let _ = std::fs::remove_file(&download_path);
     }
-    match std::fs::rename(&staged_path, &download_path) {
+    match tokio::fs::rename(&staged_path, &download_path).await {
         Ok(_) => {}
+        // Across filesystems rename fails and the media has to be copied, which for a
+        // restored video is gigabytes of work.
         Err(_) => {
-            std::fs::copy(&staged_path, &download_path).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&staged_path);
+            tokio::fs::copy(&staged_path, &download_path)
+                .await
+                .map_err(AppError::from)?;
+            let _ = tokio::fs::remove_file(&staged_path).await;
         }
     }
 
     // Re-acquire db lock to update
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     // Mark as not cloud-only
-    db.set_cloud_only(media_id, false)
-        .map_err(|e| e.to_string())?;
+    db.set_cloud_only(media_id, false).map_err(AppError::from)?;
 
     log::info!(
         "Downloaded local copy for media {} to {}",
@@ -2298,15 +2786,17 @@ async fn download_for_view(
     media_id: i64,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     // Get the media item
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     let media = db
         .get_media_by_id(media_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Media not found".to_string())?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("Media not found"))?;
 
     // Check if it's cloud-only
     if !media.is_cloud_only {
@@ -2321,7 +2811,7 @@ async fn download_for_view(
     let telegram_id = media
         .telegram_media_id
         .clone()
-        .ok_or_else(|| "No Telegram ID found".to_string())?;
+        .ok_or_else(|| AppError::not_found("No Telegram ID found"))?;
 
     // Parse the telegram_media_id to get the message ID
     let msg_id: i32 = telegram_id
@@ -2334,10 +2824,12 @@ async fn download_for_view(
     // Get the view_cache directory
     let app_data = resolve_app_data_dir(&app)?;
     let cache_dir = app_data.join("view_cache");
-    std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&cache_dir).map_err(AppError::from)?;
     let encrypted_mode = {
         let db_guard = state.db.lock().await;
-        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?;
         encryption_required(db)?
     };
 
@@ -2350,15 +2842,15 @@ async fn download_for_view(
     if encrypted_mode {
         let key = get_active_master_key(&state)
             .await
-            .ok_or_else(|| "Encryption vault is locked. Unlock to view cloud media.".to_string())?;
+            .ok_or_else(|| AppError::vault_locked("Unlock encryption to view cloud media"))?;
 
         // In encrypted mode, keep cache encrypted-at-rest and materialize plaintext
         // only in temp for active viewing.
         let cache_blob_path = cache_dir.join(format!("{}_{}.wbenc", media_id, filename));
 
         if !cache_blob_path.exists() {
-            let staging_dir = std::env::temp_dir().join("wanderer-view-cache-staging");
-            std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
+            let staging_dir = paths::view_cache_staging_dir();
+            std::fs::create_dir_all(&staging_dir).map_err(AppError::from)?;
             let raw_download_path = staging_dir.join(format!(
                 "view_{}_{}.bin",
                 media_id,
@@ -2373,22 +2865,33 @@ async fn download_for_view(
                 .map_err(|e| format!("Failed to download from Telegram: {}", e))?;
 
             let downloaded_is_encrypted =
-                security::is_encrypted_file(&raw_download_path).map_err(|e| e.to_string())?;
+                security::is_encrypted_file(&raw_download_path).map_err(AppError::from)?;
 
-            let write_result = if downloaded_is_encrypted {
-                match std::fs::rename(&raw_download_path, &cache_blob_path) {
+            let write_result: Result<(), AppError> = if downloaded_is_encrypted {
+                match tokio::fs::rename(&raw_download_path, &cache_blob_path).await {
                     Ok(_) => Ok(()),
+                    // Rename fails across devices, so the staging directory and the
+                    // cache may not share a filesystem. Copying a media file is worth
+                    // getting off the runtime.
                     Err(_) => {
-                        std::fs::copy(&raw_download_path, &cache_blob_path)
-                            .map_err(|e| e.to_string())?;
-                        let _ = std::fs::remove_file(&raw_download_path);
+                        tokio::fs::copy(&raw_download_path, &cache_blob_path)
+                            .await
+                            .map_err(AppError::from)?;
+                        let _ = tokio::fs::remove_file(&raw_download_path).await;
                         Ok(())
                     }
                 }
             } else {
-                security::encrypt_file(&raw_download_path, &cache_blob_path, &key)
-                    .map_err(|e| e.to_string())?;
-                let _ = std::fs::remove_file(&raw_download_path);
+                let encrypt_src = raw_download_path.clone();
+                let encrypt_dst = cache_blob_path.clone();
+                let encrypt_key = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    security::encrypt_file(&encrypt_src, &encrypt_dst, &encrypt_key)
+                })
+                .await
+                .map_err(|e| format!("Encrypt task failed: {}", e))?
+                .map_err(AppError::from)?;
+                let _ = tokio::fs::remove_file(&raw_download_path).await;
                 Ok(())
             };
 
@@ -2400,8 +2903,8 @@ async fn download_for_view(
 
         let _ = filetime::set_file_mtime(&cache_blob_path, filetime::FileTime::now());
 
-        let materialized_dir = std::env::temp_dir().join("wanderer-view-cache-materialized");
-        std::fs::create_dir_all(&materialized_dir).map_err(|e| e.to_string())?;
+        let materialized_dir = paths::view_cache_materialized_dir();
+        std::fs::create_dir_all(&materialized_dir).map_err(AppError::from)?;
         let cache_key = blake3::hash(cache_blob_path.to_string_lossy().as_bytes())
             .to_hex()
             .to_string();
@@ -2424,8 +2927,23 @@ async fn download_for_view(
         };
 
         if needs_refresh {
-            security::decrypt_file_if_needed(&cache_blob_path, &materialized_path, Some(&key))
-                .map_err(|e| e.to_string())?;
+            // This app wrote `cache_blob_path` itself, in encrypted mode, so a
+            // missing header means the cache has been tampered with rather than
+            // that the blob is legitimately plaintext.
+            let decrypt_src = cache_blob_path.clone();
+            let decrypt_dst = materialized_path.clone();
+            let decrypt_key = key.clone();
+            tokio::task::spawn_blocking(move || {
+                security::decrypt_file_if_needed(
+                    &decrypt_src,
+                    &decrypt_dst,
+                    Some(&decrypt_key),
+                    security::Expect::Encrypted,
+                )
+            })
+            .await
+            .map_err(|e| format!("Decrypt task failed: {}", e))?
+            .map_err(AppError::from)?;
         }
         let _ = filetime::set_file_mtime(&materialized_path, filetime::FileTime::now());
         return Ok(materialized_path.to_string_lossy().to_string());
@@ -2452,19 +2970,24 @@ async fn download_for_view(
 /// Generate a Telegram share link for a media item
 /// Returns a tg:// deep link that opens the message in Telegram
 #[tauri::command]
-async fn generate_share_link(media_id: i64, state: State<'_, AppState>) -> Result<String, String> {
+async fn generate_share_link(
+    media_id: i64,
+    state: State<'_, AppState>,
+) -> Result<String, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     let media = db
         .get_media_by_id(media_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Media not found".to_string())?;
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("Media not found"))?;
 
     // Check if uploaded to Telegram
     let telegram_id = media
         .telegram_media_id
-        .ok_or("Media not uploaded to Telegram yet")?;
+        .ok_or_else(|| AppError::invalid_input("Media not uploaded to Telegram yet"))?;
 
     // Parse the telegram_media_id to extract message_id
     // Format is typically "msg_id" as a string
@@ -2496,14 +3019,16 @@ async fn generate_share_link(media_id: i64, state: State<'_, AppState>) -> Resul
 async fn export_sync_manifest(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<String, String> {
+) -> Result<String, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     // Get or create device ID
     let device_id = db
         .get_config("device_id")
-        .map_err(|e| e.to_string())?
+        .map_err(AppError::from)?
         .unwrap_or_else(|| {
             let id = sync_manifest::generate_device_id();
             let _ = db.set_config("device_id", &id);
@@ -2514,13 +3039,13 @@ async fn export_sync_manifest(
     let mut manifest = sync_manifest::SyncManifest::new(device_id);
 
     // Export all media metadata
-    let all_media = db.get_all_media_for_sync().map_err(|e| e.to_string())?;
+    let all_media = db.get_all_media_for_sync().map_err(AppError::from)?;
     for item in all_media {
         if let Some(hash) = &item.file_hash {
             // Get albums for this item
             let albums = db
                 .get_albums_for_media(item.id)
-                .map_err(|e| e.to_string())?
+                .map_err(AppError::from)?
                 .iter()
                 .map(|a| a.name.clone())
                 .collect();
@@ -2530,7 +3055,7 @@ async fn export_sync_manifest(
     }
 
     // Export all albums
-    let all_albums = db.get_albums().map_err(|e| e.to_string())?;
+    let all_albums = db.get_albums().map_err(AppError::from)?;
     for album in all_albums {
         let normalized = album.name.to_lowercase().replace(' ', "_");
         manifest.add_album(&normalized, &album.name);
@@ -2549,9 +3074,14 @@ async fn export_sync_manifest(
 /// Import and merge a sync manifest from a file path
 /// Updates local database with merged values using LWW
 #[tauri::command]
-async fn import_sync_manifest(path: String, state: State<'_, AppState>) -> Result<String, String> {
+async fn import_sync_manifest(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<String, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     // Load the remote manifest
     let remote_manifest = sync_manifest::SyncManifest::from_file(std::path::Path::new(&path))?;
@@ -2565,7 +3095,7 @@ async fn import_sync_manifest(path: String, state: State<'_, AppState>) -> Resul
             // Get current last_modified from local
             let local_modified = db
                 .get_config(&format!("media_modified_{}", media.id))
-                .map_err(|e| e.to_string())?
+                .map_err(AppError::from)?
                 .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
             // LWW: only update if remote is newer
@@ -2589,7 +3119,7 @@ async fn import_sync_manifest(path: String, state: State<'_, AppState>) -> Resul
     for album_meta in remote_manifest.albums.values() {
         if db
             .get_album_by_name(&album_meta.name)
-            .map_err(|e| e.to_string())?
+            .map_err(AppError::from)?
             .is_none()
         {
             let _ = db.create_album(&album_meta.name);
@@ -2602,13 +3132,15 @@ async fn import_sync_manifest(path: String, state: State<'_, AppState>) -> Resul
 
 /// Get the unique device ID for this installation
 #[tauri::command]
-async fn get_device_id(state: State<'_, AppState>) -> Result<String, String> {
+async fn get_device_id(state: State<'_, AppState>) -> Result<String, AppError> {
     let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
 
     let device_id = db
         .get_config("device_id")
-        .map_err(|e| e.to_string())?
+        .map_err(AppError::from)?
         .unwrap_or_else(|| {
             let id = sync_manifest::generate_device_id();
             let _ = db.set_config("device_id", &id);
@@ -2620,14 +3152,20 @@ async fn get_device_id(state: State<'_, AppState>) -> Result<String, String> {
 
 /// Check if CLIP models are available for semantic search
 #[tauri::command]
-async fn check_clip_models(app: tauri::AppHandle) -> Result<bool, String> {
+async fn check_clip_models(app: tauri::AppHandle) -> Result<bool, AppError> {
     let app_dir = resolve_app_data_dir(&app)?;
     let models_dir = app_dir.join("models");
     if !clip::models_available(&models_dir) {
         return Ok(false);
     }
 
-    match clip::ensure_models_loaded(&models_dir) {
+    // Loading ONNX sessions reads hundreds of megabytes and builds the graph, which
+    // is several seconds of pure blocking work.
+    let loaded = tokio::task::spawn_blocking(move || clip::ensure_models_loaded(&models_dir))
+        .await
+        .map_err(|e| format!("CLIP model load task failed: {}", e))?;
+
+    match loaded {
         Ok(_) => Ok(true),
         Err(e) => {
             log::warn!("CLIP models found but failed to initialize: {}", e);
@@ -2638,7 +3176,7 @@ async fn check_clip_models(app: tauri::AppHandle) -> Result<bool, String> {
 
 /// Download CLIP models
 #[tauri::command]
-async fn download_clip_models(app: tauri::AppHandle) -> Result<(), String> {
+async fn download_clip_models(app: tauri::AppHandle) -> Result<(), AppError> {
     let app_dir = resolve_app_data_dir(&app)?;
     let models_dir = app_dir.join("models");
 
@@ -2654,6 +3192,7 @@ async fn download_clip_models(app: tauri::AppHandle) -> Result<(), String> {
         );
     })
     .await
+    .map_err(AppError::from)
 }
 
 /// Semantic search using CLIP embeddings
@@ -2664,39 +3203,50 @@ async fn semantic_search(
     limit: i32,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<Vec<database::MediaItem>, String> {
+) -> Result<Vec<database::MediaItem>, AppError> {
     // Changed to return objects for UI convenience
     let app_dir = resolve_app_data_dir(&app)?;
     let models_dir = app_dir.join("models");
 
-    // Ensure models loaded
-    clip::ensure_models_loaded(&models_dir).map_err(|e| e.to_string())?;
-
-    // Encode Query
-    let query_embedding = clip::encode_text(&query).map_err(|e| e.to_string())?;
+    // Model load and text encoding are both ONNX work.
+    let query_embedding = tokio::task::spawn_blocking(move || {
+        clip::ensure_models_loaded(&models_dir)?;
+        clip::encode_text(&query)
+    })
+    .await
+    .map_err(|e| format!("CLIP query task failed: {}", e))?
+    .map_err(AppError::from)?;
 
     // Get all embeddings from DB
     // NOTE: For large datasets, this should be optimized or moved to an indexing structure (FAISS/Granne)
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = {
+        let db_guard = state.db.lock().await;
+        db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?
+            .clone()
+    };
 
-    let all_embeddings = db.get_all_clip_embeddings().map_err(|e| e.to_string())?;
+    let all_embeddings = db.get_all_clip_embeddings().map_err(AppError::from)?;
 
-    // Compute Similarities
-    let mut scores: Vec<(i64, f32)> = all_embeddings
-        .iter()
-        .map(|(id, emb)| (*id, clip::cosine_similarity(&query_embedding, emb)))
-        .collect();
+    // Scoring is a dot product against every embedding in the library, so it grows
+    // with the library and belongs off the runtime along with the sort.
+    let scores: Vec<(i64, f32)> = tokio::task::spawn_blocking(move || {
+        let mut scores: Vec<(i64, f32)> = all_embeddings
+            .iter()
+            .map(|(id, emb)| (*id, clip::cosine_similarity(&query_embedding, emb)))
+            .collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores
+    })
+    .await
+    .map_err(|e| format!("CLIP scoring task failed: {}", e))?;
 
-    // Sort by score (descending)
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Get Top-K IDs
-    let top_ids: Vec<i64> = scores
-        .iter()
-        .take(limit as usize)
-        .map(|(id, _)| *id)
-        .collect();
+    // Get Top-K IDs. `limit` arrives from the frontend as a signed integer, and
+    // `-1i32 as usize` is 18446744073709551615, so a negative limit asked for every
+    // media item in the library rather than none.
+    let top_k = limit.clamp(0, 1000) as usize;
+    let top_ids: Vec<i64> = scores.iter().take(top_k).map(|(id, _)| *id).collect();
 
     // Fetch Media Items
     if top_ids.is_empty() {
@@ -2705,7 +3255,7 @@ async fn semantic_search(
 
     // Preserve order? get_media_by_ids usually doesn't preserve order.
     // We should re-sort items by the order of top_ids.
-    let mut items = db.get_media_by_ids(&top_ids).map_err(|e| e.to_string())?;
+    let mut items = db.get_media_by_ids(&top_ids).map_err(AppError::from)?;
 
     // Sort items to match top_ids order
     items.sort_by_key(|item| {
@@ -2715,7 +3265,6 @@ async fn semantic_search(
             .unwrap_or(usize::MAX)
     });
 
-    drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
 
@@ -2724,44 +3273,67 @@ async fn index_pending_clip(
     limit: i32,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<usize, String> {
+) -> Result<usize, AppError> {
     let app_dir = resolve_app_data_dir(&app)?;
     let models_dir = app_dir.join("models");
 
     // Check availability only, to avoid blocking if not ready
     if !clip::models_available(&models_dir) {
-        return Err("CLIP models not available".to_string());
+        return Err(AppError::unavailable("CLIP models not available"));
     }
 
-    // Ensure loaded
-    clip::ensure_models_loaded(&models_dir).map_err(|e| e.to_string())?;
+    let db = {
+        let db_guard = state.db.lock().await;
+        db_guard
+            .as_ref()
+            .ok_or_else(AppError::database_not_initialized)?
+            .clone()
+    };
 
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let pending = db.get_pending_clip_items(limit).map_err(AppError::from)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
 
-    let pending = db
-        .get_pending_clip_items(limit)
-        .map_err(|e| e.to_string())?;
+    // Model load plus one inference per image, on a blocking thread and with no lock
+    // held. This used to run on the runtime while holding the database mutex, so
+    // indexing a batch froze the interface and every other command with it.
+    let encoded = tokio::task::spawn_blocking(move || {
+        clip::ensure_models_loaded(&models_dir)?;
+
+        let results: Vec<(i64, String, Option<Vec<f32>>)> = pending
+            .into_iter()
+            .map(|(id, path_str)| {
+                let path = std::path::Path::new(&path_str);
+                if !path.exists() {
+                    return (id, path_str, None);
+                }
+                match clip::encode_image(path) {
+                    Ok(embedding) => (id, path_str, Some(embedding)),
+                    Err(e) => {
+                        log::error!("Failed to encode media {}: {}", id, e);
+                        (id, path_str, None)
+                    }
+                }
+            })
+            .collect();
+        Ok::<_, String>(results)
+    })
+    .await
+    .map_err(|e| format!("CLIP indexing task failed: {}", e))?
+    .map_err(AppError::from)?;
+
     let mut count = 0;
-
-    for (id, path_str) in pending {
-        let path = std::path::Path::new(&path_str);
-        if !path.exists() {
-            let _ = db.mark_clip_failed(id);
-            continue;
-        }
-
-        // Encode
-        match clip::encode_image(path) {
-            Ok(embedding) => {
+    for (id, _path, embedding) in encoded {
+        match embedding {
+            Some(embedding) => {
                 if let Err(e) = db.store_clip_embedding(id, &embedding) {
-                    log::error!("Failed to store embedding for {}: {}", path_str, e);
+                    log::error!("Failed to store the embedding for media {}: {}", id, e);
                 } else {
                     count += 1;
                 }
             }
-            Err(e) => {
-                log::error!("Failed to encode image {}: {}", path_str, e);
+            None => {
                 let _ = db.mark_clip_failed(id);
             }
         }
@@ -2810,5 +3382,66 @@ mod tests {
         ] {
             assert!(!is_security_key(key), "{key} must remain readable");
         }
+    }
+
+    #[test]
+    fn the_settings_the_ui_writes_are_all_writable() {
+        // Everything Settings.tsx can save has to pass, or the allowlist has quietly
+        // broken a control the user can see.
+        for (key, value) in [
+            ("cache_size_mb", "5000"),
+            ("view_cache_max_size_mb", "2000"),
+            ("view_cache_retention_hours", "24"),
+            ("ai_face_enabled", "false"),
+            ("ai_tags_enabled", "true"),
+            ("timeline_grouping", "month"),
+        ] {
+            assert_eq!(validate_config_write(key, value).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn unknown_and_security_keys_are_refused() {
+        // The denylist this replaces let both of these through.
+        assert!(validate_config_write("something_invented", "1").is_err());
+        assert!(validate_config_write(SECURITY_BUNDLE_KEY, "{}").is_err());
+        assert!(validate_config_write("device_id", "attacker-chosen").is_err());
+    }
+
+    #[test]
+    fn values_outside_their_domain_are_refused() {
+        assert!(validate_config_write("ai_face_enabled", "yes").is_err());
+        assert!(validate_config_write("timeline_grouping", "century").is_err());
+        assert!(validate_config_write("cache_size_mb", "-1").is_err());
+        assert!(validate_config_write("cache_size_mb", "999999999").is_err());
+        assert!(validate_config_write("cache_size_mb", "5000; DROP TABLE media").is_err());
+        assert!(validate_config_write("view_cache_retention_hours", "0").is_err());
+    }
+
+    /// Readers compare with `eq_ignore_ascii_case`, so a stored `"TRUE"` would work by
+    /// luck. Normalizing keeps one spelling in the table.
+    #[test]
+    fn accepted_values_are_normalized() {
+        assert_eq!(
+            validate_config_write("ai_tags_enabled", "TRUE").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            validate_config_write("timeline_grouping", "Year").unwrap(),
+            "year"
+        );
+        assert_eq!(
+            validate_config_write("cache_size_mb", " 5000 ").unwrap(),
+            "5000"
+        );
+    }
+
+    /// A rejected settings write is the user's mistake, not an internal failure, and
+    /// the frontend decides how to present it from the code.
+    #[test]
+    fn a_rejected_setting_is_invalid_input() {
+        let err = validate_config_write("timeline_grouping", "century").unwrap_err();
+        assert_eq!(err.code(), errors::ErrorCode::InvalidInput);
+        assert!(err.message().contains("timeline_grouping"));
     }
 }

@@ -1,6 +1,64 @@
 import { invoke } from "@tauri-apps/api/core";
 import { MediaItem, Album, QueueItem, Face, QueueCounts, SearchFilters, Tag, Person } from "../types";
 
+/**
+ * Stable classification of a backend failure, mirroring `ErrorCode` in errors.rs.
+ *
+ * Branch on these rather than on the message: the message is written for a person and
+ * gets reworded, and for failures that came out of a library it is deliberately vague,
+ * because the real cause names database columns and absolute paths and stays in the log.
+ */
+export type ErrorCode =
+    | "databaseNotInitialized"
+    | "vaultLocked"
+    | "notFound"
+    | "invalidInput"
+    | "unavailable"
+    | "database"
+    | "io"
+    | "telegram"
+    | "internal";
+
+export interface AppError {
+    code: ErrorCode;
+    message: string;
+}
+
+/** Tauri rejects with whatever the command serialized, so this narrows an unknown. */
+export function asAppError(error: unknown): AppError | null {
+    if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        "message" in error &&
+        typeof (error as { code: unknown }).code === "string" &&
+        typeof (error as { message: unknown }).message === "string"
+    ) {
+        return error as AppError;
+    }
+    return null;
+}
+
+/** The message to show for a rejection, whatever shape it arrived in. */
+export function errorMessage(error: unknown): string {
+    return asAppError(error)?.message ?? String(error);
+}
+
+export function hasErrorCode(error: unknown, code: ErrorCode): boolean {
+    return asAppError(error)?.code === code;
+}
+
+export interface MigrationStatus {
+    running: boolean;
+    total: number;
+    processed: number;
+    succeeded: number;
+    failed: number;
+    lastError?: string | null;
+    /** Telegram message IDs whose unencrypted copy is still in the cloud. */
+    unpurgedPlaintext: number[];
+}
+
 export const api = {
     getSecurityStatus: async (): Promise<{
         onboardingComplete: boolean;
@@ -8,14 +66,7 @@ export const api = {
         encryptionConfigured: boolean;
         encryptionLocked: boolean;
         telegramCredentialsConfigured: boolean;
-        migration: {
-            running: boolean;
-            total: number;
-            processed: number;
-            succeeded: number;
-            failed: number;
-            lastError?: string | null;
-        };
+        migration: MigrationStatus;
     }> => {
         return await invoke("get_security_status");
     },
@@ -60,15 +111,16 @@ export const api = {
         return await invoke("start_encryption_migration");
     },
 
-    getEncryptionMigrationStatus: async (): Promise<{
-        running: boolean;
-        total: number;
-        processed: number;
-        succeeded: number;
-        failed: number;
-        lastError?: string | null;
-    }> => {
+    getEncryptionMigrationStatus: async (): Promise<MigrationStatus> => {
         return await invoke("get_encryption_migration_status");
+    },
+
+    /**
+     * Retry deleting plaintext copies the migration left in Telegram.
+     * Resolves with the number confirmed deleted by this attempt.
+     */
+    retryPlaintextPurge: async (): Promise<number> => {
+        return await invoke("retry_plaintext_purge");
     },
 
     getMe: async (): Promise<string> => {

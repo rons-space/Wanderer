@@ -123,23 +123,102 @@ pub fn confine(root: &Path, candidate: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Decrypted thumbnails, written so the webview can load them by path.
+pub fn thumb_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("wanderer-thumb-cache")
+}
+
+/// Decrypted media, materialized for the viewer.
+pub fn view_cache_materialized_dir() -> PathBuf {
+    std::env::temp_dir().join("wanderer-view-cache-materialized")
+}
+
+/// Blobs as they arrive from Telegram, before they are decrypted into place.
+pub fn download_staging_dir() -> PathBuf {
+    std::env::temp_dir().join("wanderer-download-staging")
+}
+
+/// Where a restored archive is unpacked before it is put in place.
+pub fn local_restore_staging_dir() -> PathBuf {
+    std::env::temp_dir().join("wanderer-local-restore-staging")
+}
+
+/// Ciphertext staged for upload. Encrypted, but still this app's litter.
+pub fn encrypted_uploads_dir() -> PathBuf {
+    std::env::temp_dir().join("wanderer-encrypted-uploads")
+}
+
+/// Raw downloads on the view path, before they are re-encrypted into the cache.
+pub fn view_cache_staging_dir() -> PathBuf {
+    std::env::temp_dir().join("wanderer-view-cache-staging")
+}
+
+/// Plaintext copies made while migrating a library to encrypted storage.
+pub fn migration_staging_dir() -> PathBuf {
+    std::env::temp_dir().join("wanderer-migration")
+}
+
+/// Every scratch directory this app writes outside its own data directory.
+///
+/// All but one of these hold decrypted bytes at some point, which is the whole
+/// problem: locking the vault cleared the key in memory and left the plaintext on
+/// disk, where it survived the lock, the window closing and the reboot after it.
+pub fn scratch_dirs() -> Vec<PathBuf> {
+    vec![
+        thumb_cache_dir(),
+        view_cache_materialized_dir(),
+        download_staging_dir(),
+        local_restore_staging_dir(),
+        encrypted_uploads_dir(),
+        view_cache_staging_dir(),
+        migration_staging_dir(),
+    ]
+}
+
+/// Delete every scratch directory, returning how many were removed.
+///
+/// Deliberately best effort. A file the viewer still has open cannot be unlinked on
+/// Windows, and failing the lock because of it would leave the user with no way to
+/// lock at all, so each failure is logged and the rest still go.
+///
+/// Whole directories rather than a tracked list of files: a tracked list is only as
+/// good as the code that remembers to add to it, and the thing being cleaned up is a
+/// history of code paths that forgot.
+///
+/// This includes the directories holding in-flight work, so purging while an upload
+/// or a download is staged through one of them will fail that transfer. That is the
+/// intended trade: a failed transfer is retried from a source file that is still
+/// there, whereas plaintext left behind by a lock is the thing being fixed.
+pub fn purge_scratch_dirs() -> usize {
+    let mut removed = 0;
+    for dir in scratch_dirs() {
+        if !dir.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => removed += 1,
+            Err(e) => log::warn!(
+                "Could not purge decrypted scratch directory {}: {}",
+                dir.display(),
+                e
+            ),
+        }
+    }
+    removed
+}
+
 /// The directories the app owns inside its data directory.
 ///
 /// Anything the app deletes on the user's behalf must live in one of these.
 pub fn managed_roots(app_data: &Path) -> Vec<PathBuf> {
-    vec![
+    let mut roots = vec![
         app_data.join("backup"),
         app_data.join("cache"),
         app_data.join("view_cache"),
         app_data.join("backups"),
-        std::env::temp_dir().join("wanderer-thumb-cache"),
-        std::env::temp_dir().join("wanderer-view-cache-materialized"),
-        std::env::temp_dir().join("wanderer-download-staging"),
-        std::env::temp_dir().join("wanderer-local-restore-staging"),
-        std::env::temp_dir().join("wanderer-encrypted-uploads"),
-        std::env::temp_dir().join("wanderer-view-cache-staging"),
-        std::env::temp_dir().join("wanderer-migration"),
-    ]
+    ];
+    roots.extend(scratch_dirs());
+    roots
 }
 
 /// Reduce untrusted text to a single safe path component.
@@ -232,6 +311,42 @@ mod tests {
         let err = confine(Path::new("/srv/library"), Path::new("/etc/passwd")).unwrap_err();
         assert!(err.contains("/etc/passwd"));
         assert!(confine(Path::new("/srv/library"), Path::new("/srv/library/x")).is_ok());
+    }
+
+    /// A scratch directory that is not a managed root cannot be deleted by
+    /// `delete_managed_file`, so the two lists drifting apart is a silent way to
+    /// reintroduce exactly the leak this purge exists to close.
+    #[test]
+    fn every_scratch_dir_is_a_managed_root() {
+        let roots = managed_roots(Path::new("/srv/wanderer-data"));
+        for dir in scratch_dirs() {
+            assert!(
+                roots.iter().any(|r| r == &dir),
+                "{} is written to but is not a managed root",
+                dir.display()
+            );
+        }
+    }
+
+    /// Touches the real scratch locations, because those paths are the thing under
+    /// test. They belong to this application and no other test uses them.
+    ///
+    /// One test rather than two, because these share global directories and would
+    /// race each other under the default parallel test runner.
+    #[test]
+    fn purging_removes_scratch_directories_and_tolerates_their_absence() {
+        let dir = thumb_cache_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let plaintext = dir.join("decrypted.jpg");
+        std::fs::write(&plaintext, b"decrypted bytes").unwrap();
+
+        assert!(purge_scratch_dirs() >= 1);
+        assert!(!plaintext.exists(), "decrypted file survived the purge");
+        assert!(!dir.exists(), "scratch directory survived the purge");
+
+        // Nothing left to remove is the normal case at startup, and must not be an
+        // error or a second failure.
+        assert_eq!(purge_scratch_dirs(), 0);
     }
 
     #[test]

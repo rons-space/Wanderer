@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api } from "../lib/api";
+import { api, errorMessage, MigrationStatus } from "../lib/api";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "./ui/card";
 import { Label } from "./ui/label";
 import { Input } from "./ui/input";
@@ -76,26 +76,13 @@ export function Settings() {
         encryptionConfigured: boolean;
         encryptionLocked: boolean;
         telegramCredentialsConfigured: boolean;
-        migration: {
-            running: boolean;
-            total: number;
-            processed: number;
-            succeeded: number;
-            failed: number;
-            lastError?: string | null;
-        };
+        migration: MigrationStatus;
     } | null>(null);
     const [securityPassphrase, setSecurityPassphrase] = useState("");
     const [securityPassphraseConfirm, setSecurityPassphraseConfirm] = useState("");
     const [generatedRecoveryKey, setGeneratedRecoveryKey] = useState<string | null>(null);
-    const [migrationStatus, setMigrationStatus] = useState<{
-        running: boolean;
-        total: number;
-        processed: number;
-        succeeded: number;
-        failed: number;
-        lastError?: string | null;
-    } | null>(null);
+    const [migrationStatus, setMigrationStatus] = useState<MigrationStatus | null>(null);
+    const [isRetryingPurge, setIsRetryingPurge] = useState(false);
 
     // CLIP State
     const [clipInstalled, setClipInstalled] = useState(false);
@@ -300,7 +287,7 @@ export function Settings() {
             setSecurityPassphraseConfirm("");
             await loadSecurityStatus();
         } catch (e) {
-            toast.error(`Failed to enable encryption: ${e}`);
+            toast.error(`Failed to enable encryption: ${errorMessage(e)}`);
         } finally {
             setIsSaving(false);
         }
@@ -537,6 +524,39 @@ export function Settings() {
                                             <p>Succeeded: {migrationStatus?.succeeded ?? 0}</p>
                                             <p>Failed: {migrationStatus?.failed ?? 0}</p>
                                         </div>
+                                        {(migrationStatus?.unpurgedPlaintext?.length ?? 0) > 0 && (
+                                            <Alert variant="destructive">
+                                                <AlertTitle>Unencrypted copies still in Telegram</AlertTitle>
+                                                <AlertDescription className="space-y-2 text-xs">
+                                                    <p>
+                                                        {migrationStatus?.unpurgedPlaintext.length} item(s) were
+                                                        re-uploaded encrypted, but their original unencrypted copy
+                                                        could not be confirmed deleted from Telegram.
+                                                    </p>
+                                                    <Button
+                                                        variant="outline"
+                                                        size="sm"
+                                                        disabled={isRetryingPurge}
+                                                        onClick={async () => {
+                                                            setIsRetryingPurge(true);
+                                                            try {
+                                                                const purged = await api.retryPlaintextPurge();
+                                                                toast.success(
+                                                                    `Deleted ${purged} unencrypted copies`
+                                                                );
+                                                            } catch (e) {
+                                                                toast.error(`Purge retry failed: ${errorMessage(e)}`);
+                                                            } finally {
+                                                                setIsRetryingPurge(false);
+                                                                await loadMigrationStatus();
+                                                            }
+                                                        }}
+                                                    >
+                                                        {isRetryingPurge ? "Deleting..." : "Retry deletion"}
+                                                    </Button>
+                                                </AlertDescription>
+                                            </Alert>
+                                        )}
                                         {migrationStatus?.lastError && (
                                             <Alert>
                                                 <AlertTitle>Last Migration Error</AlertTitle>
@@ -556,7 +576,7 @@ export function Settings() {
                                                         toast.success("Migration started");
                                                         await loadMigrationStatus();
                                                     } catch (e) {
-                                                        toast.error(`Failed to start migration: ${e}`);
+                                                        toast.error(`Failed to start migration: ${errorMessage(e)}`);
                                                     }
                                                 }}
                                             >
@@ -940,7 +960,7 @@ export function Settings() {
                                                     toast.success(`Backup saved to: ${path}`);
                                                 }
                                             } catch (e) {
-                                                toast.error(`Backup failed: ${e}`);
+                                                toast.error(`Backup failed: ${errorMessage(e)}`);
                                             }
                                         }}
                                     >
@@ -954,7 +974,7 @@ export function Settings() {
                                                 const path = await api.backupDatabase(undefined, true);
                                                 toast.success(`Backup uploaded to Telegram. Local copy: ${path}`);
                                             } catch (e) {
-                                                toast.error(`Backup failed: ${e}`);
+                                                toast.error(`Backup failed: ${errorMessage(e)}`);
                                             }
                                         }}
                                     >
@@ -1060,7 +1080,7 @@ export function Settings() {
                                                         setClipInstalled(true);
                                                         toast.success("CLIP models installed successfully!");
                                                     } catch (e) {
-                                                        toast.error(`Download failed: ${e}`);
+                                                        toast.error(`Download failed: ${errorMessage(e)}`);
                                                     } finally {
                                                         setIsDownloadingModels(false);
                                                         setDownloadProgress(null);
@@ -1114,7 +1134,7 @@ export function Settings() {
                                                     }
                                                 } catch (e) {
                                                     toast.dismiss();
-                                                    toast.error(`Indexing failed: ${e}`);
+                                                    toast.error(`Indexing failed: ${errorMessage(e)}`);
                                                 }
                                             }}
                                         >
@@ -1152,7 +1172,7 @@ export function Settings() {
                                                 const path = await api.exportSyncManifest();
                                                 toast.success(`Sync manifest exported to: ${path}`);
                                             } catch (e) {
-                                                toast.error(`Export failed: ${e}`);
+                                                toast.error(`Export failed: ${errorMessage(e)}`);
                                             }
                                         }}
                                     >
@@ -1172,7 +1192,7 @@ export function Settings() {
                                                     toast.success(result);
                                                 }
                                             } catch (e) {
-                                                toast.error(`Import failed: ${e}`);
+                                                toast.error(`Import failed: ${errorMessage(e)}`);
                                             }
                                         }}
                                     >

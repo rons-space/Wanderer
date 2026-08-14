@@ -5,6 +5,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use time::OffsetDateTime;
 
+/// Largest page any paginated read will return.
+///
+/// The limit and offset on these methods come from the frontend, where a negative
+/// limit means "no limit" to SQLite and a negative offset is an error. Clamping here
+/// rather than at each call site means a caller that forgets cannot ask the database
+/// to materialize an entire library into memory.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// Most values bound into one statement built from a variable-length list.
+///
+/// SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 32766 on current builds and 999 on
+/// older ones. Selecting or updating every item in a large library would exceed that
+/// and fail the whole call, so those queries are chunked well under the smaller limit.
+const MAX_SQL_VARIABLES: usize = 500;
+
+/// Escape a value for use in a `LIKE` pattern.
+///
+/// The escape character has to be declared by the query with `ESCAPE '\\'`; without
+/// that clause SQLite treats the backslashes as literal text and the pattern silently
+/// stops matching. Unescaped, a `%` typed by the user turns their filter into a
+/// wildcard, which is a correctness bug rather than an injection one now that the
+/// value is bound.
+fn escape_like_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaItem {
     pub id: i64,
@@ -147,16 +176,25 @@ pub struct Database {
 }
 
 impl Database {
-    /// Get a connection, recovering from poisoned mutex if needed.
+    /// Get a connection, stepping over a poisoned mutex.
+    ///
+    /// The comment here used to say "recovering", but the code turned poisoning into an
+    /// error, and since a `Mutex` stays poisoned forever, one panic anywhere under this
+    /// lock disabled every database method for the rest of the process. The application
+    /// then looked broken in a way no restart-free action could fix.
+    ///
+    /// Poisoning only means a previous holder panicked while holding the guard. SQLite
+    /// is unharmed: any transaction that was open is rolled back when its statement is
+    /// dropped during the unwind. So take the connection back and carry on, which is
+    /// what `into_inner` is for.
     pub fn get_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|e| {
-            // Recover from poisoned mutex - the previous holder panicked
-            log::warn!("Recovering from poisoned database mutex");
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(format!("Mutex poisoned: {}", e)),
-            )
-        })
+        Ok(self.conn.lock().unwrap_or_else(|poisoned| {
+            log::warn!(
+                "Database mutex was poisoned by a panic in an earlier call; continuing \
+                 with the connection"
+            );
+            poisoned.into_inner()
+        }))
     }
 
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -167,8 +205,24 @@ impl Database {
             .unwrap_or_else(|| PathBuf::from("."));
         let conn = Connection::open(path)?;
 
-        // Enable foreign keys
-        conn.execute("PRAGMA foreign_keys = ON;", [])?;
+        // Set before the migration chain runs, so the migrations themselves get the
+        // same durability and locking behaviour as everything after them.
+        //
+        // WAL: readers stop blocking the writer, and a crash mid-write leaves the
+        // last committed state rather than a torn page. `synchronous = NORMAL` is the
+        // pairing WAL is designed for: fsync at checkpoints instead of every commit,
+        // which trades a crash-during-checkpoint window for an order of magnitude on
+        // write throughput, and this application commits per imported file.
+        //
+        // busy_timeout: the AI worker, the upload worker, the watcher and the sync
+        // worker all reach this connection. Without a timeout, any contention is an
+        // immediate SQLITE_BUSY error surfaced to the user rather than a short wait.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
+             PRAGMA foreign_keys = ON;",
+        )?;
 
         // Initialize/Migrate
         Self::migrate(&conn)?;
@@ -177,6 +231,23 @@ impl Database {
             conn: Mutex::new(conn),
             managed_roots: crate::paths::managed_roots(&app_data),
         })
+    }
+
+    /// Write a consistent snapshot of the database to `dest`.
+    ///
+    /// `VACUUM INTO` rather than a file copy. Copying `library.db` was always a race
+    /// against whatever transaction happened to be open, and with WAL enabled it is
+    /// worse than that: the most recent commits live in `library.db-wal` until a
+    /// checkpoint, so a copy of the main file alone can be missing data the user was
+    /// just told is backed up. This takes a read lock, writes a defragmented snapshot,
+    /// and produces a file that is a valid database on its own.
+    pub fn backup_to(&self, dest: &Path) -> Result<()> {
+        let conn = self.get_conn()?;
+        // VACUUM INTO refuses to overwrite an existing file, which is the behaviour we
+        // want: callers name their own timestamped file, so a collision means something
+        // is wrong and silently clobbering a previous backup would be the worst answer.
+        conn.execute("VACUUM INTO ?1", [dest.to_string_lossy().as_ref()])?;
+        Ok(())
     }
 
     /// Unlink a path from a media row, refusing anything outside the managed
@@ -585,7 +656,7 @@ impl Database {
             // Legacy DBs used `tags(media_id, tag, confidence, created_at)`.
             // Current schema uses `tags(name)` + `media_tags(media_id, tag_id, confidence)`.
             let tag_columns: Vec<String> = {
-                let mut stmt = conn.prepare("PRAGMA table_info('tags')")?;
+                let mut stmt = conn.prepare_cached("PRAGMA table_info('tags')")?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
                 rows.filter_map(|r| r.ok()).collect()
             };
@@ -702,6 +773,94 @@ impl Database {
             version = 19;
         }
 
+        if version < 20 {
+            // Migration 20: make the search index maintain itself, index the columns
+            // every list query filters on, and stop the upload queue holding duplicates.
+            //
+            // The FTS table was a standalone fts5 written by exactly one manual INSERT
+            // on the import path. Anything ingested by sync was never indexed, and
+            // nothing deleted was ever removed, so search returned stale rows and
+            // missed new ones. External-content FTS5 keyed to `media.id` with triggers
+            // makes that structurally impossible: the index cannot drift from the table
+            // because SQLite maintains it.
+            //
+            // The `tags` and `people` columns are dropped rather than carried over. No
+            // code ever wrote to them, so they only ever matched empty strings.
+            conn.execute_batch(
+                "BEGIN;
+                 DROP TABLE IF EXISTS media_fts;
+                 CREATE VIRTUAL TABLE media_fts USING fts5(
+                     file_path,
+                     content = 'media',
+                     content_rowid = 'id',
+                     tokenize = 'porter'
+                 );
+                 INSERT INTO media_fts (rowid, file_path) SELECT id, file_path FROM media;
+
+                 CREATE TRIGGER media_fts_insert AFTER INSERT ON media BEGIN
+                     INSERT INTO media_fts (rowid, file_path) VALUES (new.id, new.file_path);
+                 END;
+                 CREATE TRIGGER media_fts_delete AFTER DELETE ON media BEGIN
+                     INSERT INTO media_fts (media_fts, rowid, file_path)
+                     VALUES ('delete', old.id, old.file_path);
+                 END;
+                 CREATE TRIGGER media_fts_update AFTER UPDATE OF file_path ON media BEGIN
+                     INSERT INTO media_fts (media_fts, rowid, file_path)
+                     VALUES ('delete', old.id, old.file_path);
+                     INSERT INTO media_fts (rowid, file_path) VALUES (new.id, new.file_path);
+                 END;
+
+                 -- Every one of these backs a WHERE or ORDER BY that the timeline,
+                 -- trash, archive and AI workers run on every pass.
+                 -- Not UNIQUE, deliberately. Nothing has ever stopped two rows sharing
+                 -- a path, so a uniqueness constraint here would abort this migration
+                 -- on exactly the libraries that have the problem, and an aborted
+                 -- migration means an application that will not start. Deduplicating
+                 -- media rows means deciding what happens to the album memberships,
+                 -- faces and tags hanging off the losing row, which is its own change.
+                 CREATE INDEX IF NOT EXISTS idx_media_file_path ON media(file_path);
+                 CREATE INDEX IF NOT EXISTS idx_media_is_deleted ON media(is_deleted);
+                 CREATE INDEX IF NOT EXISTS idx_media_is_archived ON media(is_archived);
+                 CREATE INDEX IF NOT EXISTS idx_media_created_at ON media(created_at);
+                 CREATE INDEX IF NOT EXISTS idx_media_date_taken ON media(date_taken);
+                 CREATE INDEX IF NOT EXISTS idx_media_telegram_media_id ON media(telegram_media_id);
+                 CREATE INDEX IF NOT EXISTS idx_media_scan_status ON media(scan_status);
+                 CREATE INDEX IF NOT EXISTS idx_media_face_status ON media(face_status);
+                 CREATE INDEX IF NOT EXISTS idx_media_clip_status ON media(clip_status);
+                 CREATE INDEX IF NOT EXISTS idx_media_tags_status ON media(tags_status);
+                 CREATE INDEX IF NOT EXISTS idx_album_media_media ON album_media(media_id);
+                 CREATE INDEX IF NOT EXISTS idx_faces_media ON faces(media_id);
+
+                 -- The queue was deduplicated by a SELECT COUNT before each INSERT,
+                 -- which two workers can both pass before either writes. Existing
+                 -- duplicates are collapsed to the oldest row before the constraint
+                 -- goes on, or the index would fail to build.
+                 DELETE FROM upload_queue WHERE id NOT IN (
+                     SELECT MIN(id) FROM upload_queue GROUP BY file_path
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_queue_file_path
+                     ON upload_queue(file_path);
+
+                 PRAGMA user_version = 20;
+                 COMMIT;",
+            )?;
+            version = 20;
+        }
+
+        // Rows left in `uploading` by a process that died mid-transfer are invisible to
+        // `get_next_pending_item` forever, so the file silently never uploads. Nothing
+        // can legitimately be uploading at startup, before any worker has run.
+        let requeued = conn.execute(
+            "UPDATE upload_queue SET status = 'pending' WHERE status = 'uploading'",
+            [],
+        )?;
+        if requeued > 0 {
+            log::warn!(
+                "Requeued {} upload(s) stranded in the uploading state by an earlier run",
+                requeued
+            );
+        }
+
         Ok(())
     }
 
@@ -745,41 +904,16 @@ impl Database {
 
         // Update face record
 
-        if let Some(pid) = person_id {
-            // DEBUG: Check existence
-            let exists: bool = conn
-                .query_row("SELECT 1 FROM persons WHERE id = ?1", [pid], |_| Ok(true))
-                .unwrap_or(false);
-            println!(
-                "DEBUG: Person {} exists in 'persons' table? {}",
-                pid, exists
-            );
-
-            // DEBUG: Check FK definition
-            let mut stmt = conn.prepare("PRAGMA foreign_key_list('faces')")?;
-            let fks = stmt.query_map([], |row| {
-                Ok(format!(
-                    "table={}, from={}, to={}",
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?
-                ))
-            })?;
-            for fk in fks {
-                println!("DEBUG FK: faces -> {}", fk.unwrap());
-            }
-        }
-
-        match conn.execute(
+        // Two `PRAGMA` reads and a `SELECT` per face, printed to stdout, used to sit
+        // here to debug a foreign-key failure that no longer happens. They ran on every
+        // embedding write, and `stmt.query_map(...)?` on a schema pragma is also a
+        // plausible source of the panic that used to poison the connection mutex for
+        // the rest of the process.
+        conn.execute(
             "UPDATE faces SET embedding = ?1, person_id = ?2 WHERE rowid = ?3",
             rusqlite::params![bytes, person_id, face_id],
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                println!("CRITICAL DB ERROR updating faces: {}", e);
-                return Err(e);
-            }
-        }
+        )
+        .inspect_err(|e| log::error!("Failed to update face {}: {}", face_id, e))?;
 
         // Update Person Cover if needed
         if let Some(pid) = person_id {
@@ -814,7 +948,7 @@ impl Database {
         let mut best_match: Option<i64> = None;
         let mut max_score = -1.0;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT p.id, f.embedding 
              FROM persons p 
              JOIN faces f ON p.cover_face_id = f.rowid 
@@ -850,16 +984,16 @@ impl Database {
         }
 
         if max_score > THRESHOLD {
-            println!(
-                "Face matched to Person {} (score: {:.3})",
+            log::debug!(
+                "Face matched to person {} (score: {:.3})",
                 best_match.unwrap(),
                 max_score
             );
             return Ok(best_match);
         }
 
-        println!(
-            "No match found (max_score: {:.3}). Creating new person.",
+        log::debug!(
+            "No face match (max score {:.3}), creating a new person",
             max_score
         );
 
@@ -888,7 +1022,7 @@ impl Database {
     #[allow(dead_code)]
     pub fn get_persons(&self) -> Result<Vec<Person>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT p.id, p.name, 
                     (SELECT COUNT(DISTINCT f2.media_id) 
                      FROM faces f2 
@@ -943,7 +1077,7 @@ impl Database {
 
     pub fn get_pending_clip_items(&self, limit: i32) -> Result<Vec<(i64, String)>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path 
              FROM media 
              WHERE (clip_status = 'pending' OR clip_status IS NULL) 
@@ -961,8 +1095,9 @@ impl Database {
 
     pub fn get_all_clip_embeddings(&self) -> Result<Vec<(i64, Vec<f32>)>> {
         let conn = self.get_conn()?;
-        let mut stmt =
-            conn.prepare("SELECT id, clip_embedding FROM media WHERE clip_embedding IS NOT NULL")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, clip_embedding FROM media WHERE clip_embedding IS NOT NULL",
+        )?;
 
         let rows = stmt
             .query_map([], |row| {
@@ -995,7 +1130,7 @@ impl Database {
 
     pub fn get_next_item_to_scan(&self) -> Result<Option<MediaItem>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -1052,8 +1187,8 @@ impl Database {
 
     pub fn get_faces(&self, media_id: i64) -> Result<Vec<crate::ai::Face>> {
         let conn = self.get_conn()?;
-        let mut stmt =
-            conn.prepare("SELECT x, y, width, height, score FROM faces WHERE media_id = ?1")?;
+        let mut stmt = conn
+            .prepare_cached("SELECT x, y, width, height, score FROM faces WHERE media_id = ?1")?;
 
         let face_iter = stmt.query_map([media_id], |row| {
             Ok(crate::ai::Face {
@@ -1134,8 +1269,9 @@ impl Database {
         )?;
         let media_id = conn.last_insert_rowid();
 
-        // Also insert into FTS5 table for full-text search
-        let _ = conn.execute("INSERT INTO media_fts (file_path) VALUES (?1)", [file_path]);
+        // The FTS row is written by the `media_fts_insert` trigger. Doing it here as
+        // well would index the same media twice, and was also the reason media added by
+        // any other path was never indexed at all.
 
         Ok(media_id)
     }
@@ -1209,7 +1345,7 @@ impl Database {
 
     pub fn get_uploaded_unencrypted_media(&self, limit: i32) -> Result<Vec<UnencryptedUpload>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, telegram_media_id, thumbnail_path
              FROM media
              WHERE (is_deleted = 0 OR is_deleted IS NULL)
@@ -1238,7 +1374,7 @@ impl Database {
 
     pub fn get_unencrypted_thumbnail_paths(&self, limit: i32) -> Result<Vec<(i64, String)>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, thumbnail_path
              FROM media
              WHERE thumbnail_path IS NOT NULL
@@ -1272,7 +1408,7 @@ impl Database {
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -1328,6 +1464,16 @@ impl Database {
         if media_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // One statement per chunk: a selection of every item in a large library would
+        // otherwise build a query with more placeholders than SQLite accepts and fail
+        // outright, which is a worse answer than doing it in several round trips.
+        if media_ids.len() > MAX_SQL_VARIABLES {
+            let mut all = Vec::with_capacity(media_ids.len());
+            for chunk in media_ids.chunks(MAX_SQL_VARIABLES) {
+                all.extend(self.get_media_by_ids(chunk)?);
+            }
+            return Ok(all);
+        }
         let conn = self.get_conn()?;
         let placeholders = media_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
@@ -1338,6 +1484,8 @@ impl Database {
              FROM media WHERE id IN ({}) AND is_deleted = 0",
             placeholders
         );
+        // Not `prepare_cached`: this SQL is built per call, and rusqlite's cache is a
+        // small LRU, so variable statements would evict the fixed ones that repeat.
         let mut stmt = conn.prepare(&sql)?;
         let params: Vec<Box<dyn rusqlite::ToSql>> = media_ids
             .iter()
@@ -1421,7 +1569,7 @@ impl Database {
         let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -1438,7 +1586,7 @@ impl Database {
         let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -1455,7 +1603,7 @@ impl Database {
         let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -1515,7 +1663,7 @@ impl Database {
         // Escape LIKE wildcards to prevent pattern injection
         let escaped = crate::media_utils::escape_like_pattern(query);
         let pattern = format!("%{}%", escaped);
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -1574,38 +1722,46 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
-        let limit = limit.clamp(0, 1000);
+        let limit = limit.clamp(0, MAX_PAGE_SIZE);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
 
-        // Build dynamic WHERE clause based on filters
+        // Build dynamic WHERE clause based on filters.
+        //
+        // The shape of the clause varies, the values in it never do: every filter
+        // contributes an anonymous `?` and pushes its value here, in the same order.
+        // `camera_make` used to be interpolated with doubled quotes, which is the one
+        // filter carrying a user-controlled string and so the one place where an
+        // escaping mistake would have been an injection into the query text.
         let mut conditions = vec![
             "(is_deleted = 0 OR is_deleted IS NULL)".to_string(),
             "(is_archived = 0 OR is_archived IS NULL)".to_string(),
         ];
+        let mut filter_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if filters.favorites_only {
             conditions.push("is_favorite = 1".to_string());
         }
 
         if let Some(min_rating) = filters.min_rating {
-            conditions.push(format!("rating >= {}", min_rating.clamp(0, 5)));
+            conditions.push("rating >= ?".to_string());
+            filter_values.push(Box::new(min_rating.clamp(0, 5)));
         }
 
         if let Some(date_from) = filters.date_from {
-            conditions.push(format!("created_at >= {}", date_from));
+            conditions.push("created_at >= ?".to_string());
+            filter_values.push(Box::new(date_from));
         }
 
         if let Some(date_to) = filters.date_to {
-            conditions.push(format!("created_at <= {}", date_to));
+            conditions.push("created_at <= ?".to_string());
+            filter_values.push(Box::new(date_to));
         }
 
         if let Some(camera) = &filters.camera_make {
             if !camera.is_empty() {
-                conditions.push(format!(
-                    "camera_make LIKE '%{}%'",
-                    camera.replace('\'', "''")
-                ));
+                conditions.push("camera_make LIKE ? ESCAPE '\\'".to_string());
+                filter_values.push(Box::new(format!("%{}%", escape_like_value(camera))));
             }
         }
 
@@ -1627,12 +1783,94 @@ impl Database {
                  FROM media
                  WHERE {}
                  ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC
-                 LIMIT ?1 OFFSET ?2",
+                 LIMIT ? OFFSET ?",
                 where_clause
             );
 
+            // Positional binding: the filter values in clause order, then the page.
+            let mut values = filter_values;
+            values.push(Box::new(limit));
+            values.push(Box::new(offset));
+
+            // Not `prepare_cached`: this SQL is built per call, and rusqlite's cache is a
+            // small LRU, so variable statements would evict the fixed ones that repeat.
             let mut stmt = conn.prepare(&sql)?;
-            let media_iter = stmt.query_map(params![limit, offset], |row| {
+            let media_iter = stmt.query_map(
+                rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())),
+                |row| {
+                    Ok(MediaItem {
+                        id: row.get(0)?,
+                        file_path: row.get(1)?,
+                        file_hash: row.get(2)?,
+                        telegram_media_id: row.get(3)?,
+                        mime_type: row.get(4)?,
+                        width: row.get(5)?,
+                        height: row.get(6)?,
+                        duration: row.get(7)?,
+                        size_bytes: row.get(8)?,
+                        created_at: row.get(9)?,
+                        uploaded_at: row.get(10)?,
+                        thumbnail_path: row.get(11)?,
+                        date_taken: row.get(12)?,
+                        latitude: row.get(13)?,
+                        longitude: row.get(14)?,
+                        camera_make: row.get(15)?,
+                        camera_model: row.get(16)?,
+                        is_favorite: row.get::<_, i32>(17)? != 0,
+                        rating: row.get(18)?,
+                        is_deleted: row.get::<_, i32>(19)? != 0,
+                        deleted_at: row.get(20)?,
+                        is_archived: row
+                            .get::<_, Option<i32>>(21)?
+                            .map(|v| v != 0)
+                            .unwrap_or(false),
+                        archived_at: row.get(22)?,
+                        is_cloud_only: row
+                            .get::<_, Option<i32>>(23)?
+                            .map(|v| v != 0)
+                            .unwrap_or(false),
+                    })
+                },
+            )?;
+
+            let mut media = Vec::new();
+            for item in media_iter {
+                media.push(item?);
+            }
+            return Ok(media);
+        }
+
+        // FTS5 search with JOIN to media table
+        // Escape FTS5 special characters and add prefix matching
+        let fts_query = query
+            .split_whitespace()
+            .map(|word| format!("\"{}\"*", word.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let sql = format!(
+            "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
+                    m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
+             FROM media m
+             JOIN media_fts fts ON m.id = fts.rowid
+             WHERE fts.media_fts MATCH ? AND {}
+             ORDER BY rank, COALESCE(m.date_taken, datetime(m.created_at, 'unixepoch')) DESC
+             LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        // The MATCH placeholder comes first in the text, so it binds first.
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+        values.extend(filter_values);
+        values.push(Box::new(limit));
+        values.push(Box::new(offset));
+
+        // Not `prepare_cached`: this SQL is built per call, and rusqlite's cache is a
+        // small LRU, so variable statements would evict the fixed ones that repeat.
+        let mut stmt = conn.prepare(&sql)?;
+        let media_iter = stmt.query_map(
+            rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())),
+            |row| {
                 Ok(MediaItem {
                     id: row.get(0)?,
                     file_path: row.get(1)?,
@@ -1665,69 +1903,8 @@ impl Database {
                         .map(|v| v != 0)
                         .unwrap_or(false),
                 })
-            })?;
-
-            let mut media = Vec::new();
-            for item in media_iter {
-                media.push(item?);
-            }
-            return Ok(media);
-        }
-
-        // FTS5 search with JOIN to media table
-        // Escape FTS5 special characters and add prefix matching
-        let fts_query = query
-            .split_whitespace()
-            .map(|word| format!("\"{}\"*", word.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let sql = format!(
-            "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
-                    m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
-             FROM media m
-             JOIN media_fts fts ON m.file_path = fts.file_path
-             WHERE fts.media_fts MATCH ?1 AND {}
-             ORDER BY rank, COALESCE(m.date_taken, datetime(m.created_at, 'unixepoch')) DESC
-             LIMIT ?2 OFFSET ?3",
-            where_clause
-        );
-
-        let mut stmt = conn.prepare(&sql)?;
-        let media_iter = stmt.query_map(params![fts_query, limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+            },
+        )?;
 
         let mut media = Vec::new();
         for item in media_iter {
@@ -1761,21 +1938,25 @@ impl Database {
     pub fn add_to_queue(&self, file_path: &str) -> Result<()> {
         let conn = self.get_conn()?;
 
-        // Check if already in queue (pending or uploading)
-        let count: i32 = conn.query_row(
-            "SELECT COUNT(*) FROM upload_queue WHERE file_path = ?1 AND status IN ('pending', 'uploading')",
-            [file_path],
-            |row| row.get(0),
-        )?;
-
-        if count > 0 {
-            // Already queued, skip
-            return Ok(());
-        }
-
+        // The dedupe used to be a SELECT COUNT followed by an INSERT, which the watcher
+        // and an import can both pass before either writes, queueing the same file
+        // twice and uploading it twice. The unique index from migration 20 decides it
+        // instead.
+        //
+        // The WHERE on the conflict clause preserves the old semantics exactly: a row
+        // that is already pending or uploading is left alone, and anything else, a
+        // completed or failed upload of a path being queued again, is reset to pending.
+        // Without it this would silently become "a file can only ever be uploaded
+        // once", which is not what the count check did.
         let added_at = OffsetDateTime::now_utc().unix_timestamp();
         conn.execute(
-            "INSERT INTO upload_queue (file_path, status, added_at) VALUES (?1, 'pending', ?2)",
+            "INSERT INTO upload_queue (file_path, status, added_at) VALUES (?1, 'pending', ?2)
+             ON CONFLICT(file_path) DO UPDATE SET
+                 status = 'pending',
+                 retries = 0,
+                 error_msg = NULL,
+                 added_at = excluded.added_at
+             WHERE upload_queue.status NOT IN ('pending', 'uploading')",
             (file_path, added_at),
         )?;
         Ok(())
@@ -1783,7 +1964,7 @@ impl Database {
 
     pub fn get_next_pending_item(&self) -> Result<Option<QueueItem>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, status, retries, error_msg, added_at 
              FROM upload_queue 
              WHERE status = 'pending' 
@@ -1806,7 +1987,7 @@ impl Database {
 
     pub fn get_queue_status(&self) -> Result<Vec<QueueItem>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, status, retries, error_msg, added_at
              FROM upload_queue
              ORDER BY added_at DESC
@@ -1899,6 +2080,13 @@ impl Database {
         if media_ids.is_empty() {
             return Ok(0);
         }
+        if media_ids.len() > MAX_SQL_VARIABLES {
+            let mut total = 0;
+            for chunk in media_ids.chunks(MAX_SQL_VARIABLES) {
+                total += self.bulk_set_favorite(chunk, is_favorite)?;
+            }
+            return Ok(total);
+        }
         let conn = self.get_conn()?;
         let placeholders = media_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
@@ -1921,6 +2109,13 @@ impl Database {
     pub fn bulk_soft_delete(&self, media_ids: &[i64]) -> Result<usize> {
         if media_ids.is_empty() {
             return Ok(0);
+        }
+        if media_ids.len() > MAX_SQL_VARIABLES {
+            let mut total = 0;
+            for chunk in media_ids.chunks(MAX_SQL_VARIABLES) {
+                total += self.bulk_soft_delete(chunk)?;
+            }
+            return Ok(total);
         }
         let conn = self.get_conn()?;
         let deleted_at = OffsetDateTime::now_utc().unix_timestamp();
@@ -1988,7 +2183,7 @@ impl Database {
     pub fn get_albums(&self) -> Result<Vec<Album>> {
         let conn = self.get_conn()?;
         // Use a subquery to get the first non-archived, non-deleted media item for cover
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT a.id, a.name, a.created_at,
                     (SELECT m.thumbnail_path FROM album_media am2
                      JOIN media m ON am2.media_id = m.id
@@ -2049,7 +2244,7 @@ impl Database {
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
                     m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
              FROM media m
@@ -2106,13 +2301,13 @@ impl Database {
     /// Toggle favorite status for a media item. Returns new favorite status.
     pub fn toggle_favorite(&self, media_id: i64) -> Result<bool> {
         let conn = self.get_conn()?;
-        conn.execute(
-            "UPDATE media SET is_favorite = NOT COALESCE(is_favorite, 0) WHERE id = ?1",
-            [media_id],
-        )?;
-
+        // One statement, because the update and the read back used to be two: a second
+        // toggle landing between them returned the other caller's value, so the star in
+        // the UI could end up showing the opposite of what was stored.
         let is_favorite: i32 = conn.query_row(
-            "SELECT COALESCE(is_favorite, 0) FROM media WHERE id = ?1",
+            "UPDATE media SET is_favorite = NOT COALESCE(is_favorite, 0)
+             WHERE id = ?1
+             RETURNING is_favorite",
             [media_id],
             |row| row.get(0),
         )?;
@@ -2137,7 +2332,7 @@ impl Database {
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -2215,7 +2410,7 @@ impl Database {
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -2308,6 +2503,18 @@ impl Database {
             Err(e) => return Err(e.into()),
         };
 
+        // Order matters, and it used to be the other way round. The files were unlinked
+        // first, so a failure deleting the row left the library pointing at bytes that
+        // no longer exist, which reads as corruption rather than as a failed delete.
+        // Committing first means the worst case is an orphaned file on disk: wasted
+        // space, and nothing the user notices.
+        conn.execute("DELETE FROM media WHERE id = ?1", [media_id])?;
+        log::info!("Permanently deleted media id {} from database", media_id);
+
+        // Released before touching the filesystem: unlinking can block on a slow or
+        // networked volume, and every other database caller is waiting on this lock.
+        drop(conn);
+
         // Both paths are confined to the managed directories before any unlink.
         if self.delete_managed_file(&file_path) {
             log::info!("Deleted local file: {}", file_path);
@@ -2317,10 +2524,6 @@ impl Database {
                 log::info!("Deleted thumbnail: {}", thumb_path);
             }
         }
-
-        // Delete DB row
-        conn.execute("DELETE FROM media WHERE id = ?1", [media_id])?;
-        log::info!("Permanently deleted media id {} from database", media_id);
 
         Ok(telegram_media_id)
     }
@@ -2332,7 +2535,7 @@ impl Database {
 
         // Get all trashed items
         let items: Vec<(i64, String, Option<String>, Option<String>)> = {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT id, file_path, thumbnail_path, telegram_media_id FROM media WHERE is_deleted = 1",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -2343,15 +2546,19 @@ impl Database {
 
         let mut telegram_ids = Vec::new();
         let mut deleted_count = 0;
+        // Collected inside the transaction, unlinked after it commits. Doing it inline
+        // meant a rollback left rows pointing at files that had already been deleted,
+        // turning a failed "empty trash" into silent data loss for everything the loop
+        // had already reached.
+        let mut paths_to_unlink: Vec<String> = Vec::new();
 
         // Use a transaction for all deletions
         let tx = conn.transaction()?;
 
         for (id, file_path, thumbnail_path, telegram_media_id) in items {
-            // Confined to the managed directories, like every other unlink.
-            self.delete_managed_file(&file_path);
-            if let Some(ref thumb_path) = thumbnail_path {
-                self.delete_managed_file(thumb_path);
+            paths_to_unlink.push(file_path);
+            if let Some(thumb_path) = thumbnail_path {
+                paths_to_unlink.push(thumb_path);
             }
 
             // First, clear cover_face_id in persons table for any faces belonging to this media
@@ -2383,6 +2590,14 @@ impl Database {
 
         tx.commit()?;
 
+        // Only now, with the rows durably gone, are the files removed. Released first
+        // so the unlinks do not hold every other database caller behind them.
+        drop(conn);
+        for path in &paths_to_unlink {
+            // Confined to the managed directories, like every other unlink.
+            self.delete_managed_file(path);
+        }
+
         log::info!("Emptied trash: {} items permanently deleted", deleted_count);
         Ok((deleted_count, telegram_ids))
     }
@@ -2405,7 +2620,7 @@ impl Database {
     /// Returns (id, file_path) pairs for images only (not videos)
     pub fn get_media_without_phash(&self) -> Result<Vec<(i64, String)>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path FROM media 
              WHERE phash IS NULL 
              AND is_deleted = 0 
@@ -2425,7 +2640,7 @@ impl Database {
     /// Useful for full rescans to recover from stale/invalid hashes.
     pub fn get_all_media_for_phash_scan(&self) -> Result<Vec<(i64, String)>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path FROM media
              WHERE is_deleted = 0
              AND (mime_type LIKE 'image/%' OR mime_type IS NULL)
@@ -2479,7 +2694,7 @@ impl Database {
     /// If local file is missing but Telegram ID exists, mark as cloud-only.
     pub fn reconcile_cloud_only_flags(&self) -> Result<usize> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path
              FROM media
              WHERE (is_deleted = 0 OR is_deleted IS NULL)
@@ -2510,7 +2725,7 @@ impl Database {
     /// Get a single media item by ID.
     pub fn get_media_by_id(&self, media_id: i64) -> Result<Option<MediaItem>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media WHERE id = ?1"
@@ -2557,7 +2772,7 @@ impl Database {
     pub fn is_cloud_only_by_telegram_id(&self, telegram_id: &str) -> Result<bool> {
         let conn = self.get_conn()?;
         let mut stmt =
-            conn.prepare("SELECT is_cloud_only FROM media WHERE telegram_media_id = ?1")?;
+            conn.prepare_cached("SELECT is_cloud_only FROM media WHERE telegram_media_id = ?1")?;
 
         let mut rows = stmt.query([telegram_id])?;
         if let Some(row) = rows.next()? {
@@ -2574,7 +2789,7 @@ impl Database {
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -2631,7 +2846,7 @@ impl Database {
         let conn = self.get_conn()?;
         const PHASH_DISTANCE_THRESHOLD: u32 = 10;
 
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, 
                     duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, 
@@ -2750,7 +2965,7 @@ impl Database {
     /// Get all people with face counts
     pub fn get_people(&self) -> Result<Vec<Person>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT p.id, p.name, 
                     (SELECT COUNT(*) FROM faces f WHERE f.person_id = p.id) as face_count,
                     (SELECT m.thumbnail_path FROM faces f2 
@@ -2822,8 +3037,13 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
+        // Clamped like every other paginated read: a negative limit reaches SQLite as
+        // "no limit" and a negative offset is an error, and both arrive straight from
+        // the frontend.
+        let limit = limit.clamp(0, MAX_PAGE_SIZE);
+        let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, 
                     m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, 
                     m.thumbnail_path, m.date_taken, m.latitude, m.longitude, m.camera_make, 
@@ -2916,7 +3136,7 @@ impl Database {
     /// Get all config values as key-value pairs
     pub fn get_all_config(&self) -> Result<std::collections::HashMap<String, String>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare("SELECT key, value FROM config")?;
+        let mut stmt = conn.prepare_cached("SELECT key, value FROM config")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -2936,7 +3156,7 @@ impl Database {
     /// Get all media items with their sync-relevant fields (for export)
     pub fn get_all_media_for_sync(&self) -> Result<Vec<MediaItem>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
                     date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
              FROM media 
@@ -2987,7 +3207,7 @@ impl Database {
     /// Get albums that a specific media item belongs to
     pub fn get_albums_for_media(&self, media_id: i64) -> Result<Vec<Album>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT a.id, a.name, a.created_at, \
                     (SELECT m.thumbnail_path FROM album_media am2 \
                      JOIN media m ON am2.media_id = m.id \
@@ -3113,7 +3333,7 @@ impl Database {
 
     pub fn get_all_tags(&self) -> Result<Vec<Tag>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT t.id, t.name, COUNT(mt.media_id) as count 
              FROM tags t
              LEFT JOIN media_tags mt ON t.id = mt.tag_id
@@ -3138,8 +3358,10 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
+        let limit = limit.clamp(0, MAX_PAGE_SIZE);
+        let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
                     m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
              FROM media m
@@ -3274,7 +3496,7 @@ impl Database {
 
         // Find media_ids that have faces with NULL embedding (incomplete processing)
         let mut stmt =
-            conn.prepare("SELECT DISTINCT media_id FROM faces WHERE embedding IS NULL")?;
+            conn.prepare_cached("SELECT DISTINCT media_id FROM faces WHERE embedding IS NULL")?;
 
         let media_ids: Vec<i64> = stmt
             .query_map([], |row| row.get(0))?
@@ -3318,7 +3540,7 @@ impl Database {
 
     pub fn get_tags_for_media(&self, media_id: i64) -> Result<Vec<String>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT t.name 
              FROM tags t
              JOIN media_tags mt ON t.id = mt.tag_id
@@ -3338,7 +3560,7 @@ mod tests {
     /// The schema version the chain is expected to reach. Update this together with a
     /// new migration, which is the point: forgetting makes the test fail loudly here
     /// rather than quietly at a user's next startup.
-    const CURRENT_SCHEMA_VERSION: i32 = 19;
+    const CURRENT_SCHEMA_VERSION: i32 = 20;
 
     fn migrated() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory database");
@@ -3508,5 +3730,526 @@ mod tests {
             rows
         };
         assert_eq!(names, vec!["Ana".to_string()]);
+    }
+
+    fn insert_media(conn: &Connection, path: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO media (file_path, created_at) VALUES (?1, 0)",
+            [path],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Insert a row with a camera, for the filter tests.
+    fn insert_media_with_camera(db: &Database, path: &str, camera: &str) -> i64 {
+        let conn = db.get_conn().unwrap();
+        conn.execute(
+            "INSERT INTO media (file_path, created_at, camera_make) VALUES (?1, 0, ?2)",
+            rusqlite::params![path, camera],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn camera_filter(camera: &str) -> SearchFilters {
+        SearchFilters {
+            favorites_only: false,
+            min_rating: None,
+            date_from: None,
+            date_to: None,
+            camera_make: Some(camera.to_string()),
+            has_location: None,
+        }
+    }
+
+    #[test]
+    fn like_escaping_covers_the_three_special_characters() {
+        assert_eq!(escape_like_value("Canon"), "Canon");
+        assert_eq!(escape_like_value("100%"), "100\\%");
+        assert_eq!(escape_like_value("a_b"), "a\\_b");
+        // The backslash first, or escaping the others would double-escape it.
+        assert_eq!(escape_like_value("a\\b"), "a\\\\b");
+    }
+
+    /// The filter value is user input reaching a `WHERE` clause. It used to be
+    /// interpolated with doubled quotes; anything the escaping missed was query text.
+    #[test]
+    fn a_camera_filter_is_bound_rather_than_interpolated() {
+        let temp = TempDb::new();
+        insert_media_with_camera(&temp.db, "/library/a.jpg", "Canon");
+        insert_media_with_camera(&temp.db, "/library/b.jpg", "Nikon");
+
+        let hostile = "Canon' OR 1=1 --";
+        let found = temp
+            .db
+            .search_fts("", &camera_filter(hostile), 100, 0)
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "a quote in the filter must be a value, not syntax: {:?}",
+            found.iter().map(|m| &m.file_path).collect::<Vec<_>>()
+        );
+
+        let found = temp
+            .db
+            .search_fts("", &camera_filter("Canon"), 100, 0)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_path, "/library/a.jpg");
+    }
+
+    /// `%` in a `LIKE` pattern is a wildcard, so an unescaped one silently widens the
+    /// user's filter instead of matching what they typed.
+    #[test]
+    fn a_wildcard_in_a_camera_filter_matches_literally() {
+        let temp = TempDb::new();
+        insert_media_with_camera(&temp.db, "/library/literal.jpg", "C%N");
+        insert_media_with_camera(&temp.db, "/library/canon.jpg", "CANON");
+
+        let found = temp
+            .db
+            .search_fts("", &camera_filter("C%N"), 100, 0)
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|m| m.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/library/literal.jpg"]
+        );
+    }
+
+    /// Both come straight from the frontend. A negative limit means "no limit" to
+    /// SQLite, and a negative offset is an error rather than a page.
+    #[test]
+    fn paginated_reads_clamp_their_limit_and_offset() {
+        let temp = TempDb::new();
+        insert_media_with_camera(&temp.db, "/library/a.jpg", "Canon");
+
+        assert!(temp.db.get_media_by_person(1, -1, -5).is_ok());
+        assert!(temp.db.get_media_by_tag("holiday", -1, -5).is_ok());
+        assert!(temp
+            .db
+            .search_fts("", &camera_filter("Canon"), -1, -5)
+            .is_ok());
+    }
+
+    /// More ids than SQLite will accept as bound variables in one statement.
+    #[test]
+    fn reads_and_bulk_writes_chunk_long_id_lists() {
+        let temp = TempDb::new();
+        let ids: Vec<i64> = (0..(MAX_SQL_VARIABLES * 2 + 1))
+            .map(|i| insert_media_with_camera(&temp.db, &format!("/library/{}.jpg", i), "Canon"))
+            .collect();
+
+        let found = temp.db.get_media_by_ids(&ids).unwrap();
+        assert_eq!(found.len(), ids.len());
+
+        assert_eq!(temp.db.bulk_set_favorite(&ids, true).unwrap(), ids.len());
+        assert_eq!(temp.db.bulk_soft_delete(&ids).unwrap(), ids.len());
+    }
+
+    fn fts_matches(conn: &Connection, query: &str) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT rowid FROM media_fts WHERE media_fts MATCH ?1 ORDER BY rowid")
+            .unwrap();
+        stmt.query_map([query], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// The whole point of migration 20: the index is no longer something the import
+    /// path remembers to write. An insert through any code path indexes the row, an
+    /// update re-indexes it, and a delete removes it.
+    #[test]
+    fn the_search_index_is_maintained_by_triggers() {
+        let conn = migrated();
+
+        // Inserted with plain SQL, deliberately: no call to `add_media`, because the
+        // regression being guarded is precisely rows that arrive by some other path.
+        let vacation = insert_media(&conn, "/library/vacation.jpg");
+        insert_media(&conn, "/library/invoices.pdf");
+
+        assert_eq!(fts_matches(&conn, "vacation"), vec![vacation]);
+
+        conn.execute(
+            "UPDATE media SET file_path = '/library/holiday.jpg' WHERE id = ?1",
+            [vacation],
+        )
+        .unwrap();
+        assert!(
+            fts_matches(&conn, "vacation").is_empty(),
+            "the old term still matches after a rename"
+        );
+        assert_eq!(fts_matches(&conn, "holiday"), vec![vacation]);
+
+        conn.execute("DELETE FROM media WHERE id = ?1", [vacation])
+            .unwrap();
+        assert!(
+            fts_matches(&conn, "holiday").is_empty(),
+            "a deleted row is still in the search index"
+        );
+        assert_eq!(fts_matches(&conn, "invoices").len(), 1);
+    }
+
+    /// External-content FTS5 stores no copy of the text, so a mismatch between the
+    /// index and `media` is corruption rather than staleness. `integrity-check`
+    /// is the only thing that detects it.
+    #[test]
+    fn the_search_index_passes_its_own_integrity_check() {
+        let conn = migrated();
+        insert_media(&conn, "/library/vacation.jpg");
+        conn.execute(
+            "INSERT INTO media_fts (media_fts) VALUES ('integrity-check')",
+            [],
+        )
+        .expect("fts5 integrity-check failed: the index disagrees with the media table");
+    }
+
+    #[test]
+    fn the_upload_queue_rejects_duplicate_paths() {
+        let conn = migrated();
+        conn.execute(
+            "INSERT INTO upload_queue (file_path, added_at) VALUES ('/library/a.jpg', 0)",
+            [],
+        )
+        .unwrap();
+        let second = conn.execute(
+            "INSERT INTO upload_queue (file_path, added_at) VALUES ('/library/a.jpg', 0)",
+            [],
+        );
+        assert!(
+            second.is_err(),
+            "the unique index did not stop a duplicate queue entry"
+        );
+    }
+
+    /// Migration 20 has to collapse duplicates before it can add the constraint, or
+    /// the index fails to build and every existing library that queued the same file
+    /// twice under the old count-then-insert dedupe refuses to start.
+    ///
+    /// Run against a library put back into the pre-constraint state, rather than a
+    /// hand-built schema, so the statements under test are the migration's own.
+    #[test]
+    fn collapsing_duplicate_queue_rows_keeps_the_oldest() {
+        let conn = migrated();
+        conn.execute_batch(
+            "DROP INDEX idx_upload_queue_file_path;
+             INSERT INTO upload_queue (file_path, status, added_at)
+                 VALUES ('/library/a.jpg', 'failed', 100),
+                        ('/library/a.jpg', 'pending', 200),
+                        ('/library/b.jpg', 'pending', 300);",
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "DELETE FROM upload_queue WHERE id NOT IN (
+                 SELECT MIN(id) FROM upload_queue GROUP BY file_path
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_upload_queue_file_path
+                 ON upload_queue(file_path);",
+        )
+        .expect("the constraint should build once duplicates are collapsed");
+
+        let rows: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT file_path, status, added_at FROM upload_queue ORDER BY file_path")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("/library/a.jpg".to_string(), "failed".to_string(), 100),
+                ("/library/b.jpg".to_string(), "pending".to_string(), 300),
+            ]
+        );
+    }
+
+    /// A row abandoned in `uploading` by a process that died is invisible to
+    /// `get_next_pending_item`, so the file never uploads and never reports an error.
+    #[test]
+    fn startup_requeues_uploads_stranded_by_a_previous_run() {
+        let conn = migrated();
+        conn.execute_batch(
+            "INSERT INTO upload_queue (file_path, status, added_at)
+                 VALUES ('/library/a.jpg', 'uploading', 0),
+                        ('/library/b.jpg', 'completed', 0),
+                        ('/library/c.jpg', 'failed', 0);",
+        )
+        .unwrap();
+
+        Database::migrate(&conn).unwrap();
+
+        let status_of = |path: &str| -> String {
+            conn.query_row(
+                "SELECT status FROM upload_queue WHERE file_path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status_of("/library/a.jpg"), "pending");
+        assert_eq!(status_of("/library/b.jpg"), "completed");
+        assert_eq!(status_of("/library/c.jpg"), "failed");
+    }
+
+    /// Render the schema of a migrated database as deterministic SQL.
+    ///
+    /// Ordered by kind and then name rather than by `sqlite_master` order, because the
+    /// latter is the order the migrations happened to run in and would reshuffle the
+    /// whole file every time a column is added. Shadow tables that fts5 maintains for
+    /// itself are excluded: they are an implementation detail of the SQLite build, not
+    /// of this schema, and pinning them would turn a library upgrade into a failing
+    /// test.
+    fn schema_snapshot(conn: &Connection) -> String {
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                 WHERE sql IS NOT NULL
+                   AND name NOT LIKE 'sqlite_%'
+                   AND NOT (type = 'table' AND name LIKE 'media_fts_%')
+                 ORDER BY
+                     CASE type
+                         WHEN 'table' THEN 0
+                         WHEN 'index' THEN 1
+                         WHEN 'trigger' THEN 2
+                         WHEN 'view' THEN 3
+                         ELSE 4
+                     END,
+                     name",
+            )
+            .unwrap();
+        let entries = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        let mut out = String::new();
+        out.push_str(
+            "-- Generated from the migration chain in src/database.rs. Do not edit by hand.\n\
+             -- Refresh with: WANDERER_BLESS_SCHEMA=1 cargo test schema\n",
+        );
+        out.push_str(&format!(
+            "-- PRAGMA user_version = {};\n",
+            user_version(conn)
+        ));
+        for (_, _, sql) in entries {
+            out.push('\n');
+            out.push_str(&dedent(sql.trim()));
+            out.push_str(";\n");
+        }
+        out
+    }
+
+    /// SQLite stores the original text of a statement, so every definition here comes
+    /// back indented to wherever it sat inside a Rust string literal. Strip that shared
+    /// prefix, or the snapshot reads as a ragged quotation of `database.rs` instead of
+    /// as a schema.
+    fn dedent(sql: &str) -> String {
+        let common = sql
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.len() - l.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        sql.lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 || line.trim().is_empty() {
+                    line.trim_end().to_string()
+                } else {
+                    line[common..].trim_end().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// #43: the schema existed only as ~500 lines of string literals spread across
+    /// twenty migration blocks, so nothing could be reviewed or diffed. This pins a
+    /// readable snapshot and fails when the chain and the snapshot disagree, which
+    /// also makes every schema change visible in the diff of the pull request that
+    /// makes it.
+    #[test]
+    fn the_committed_schema_matches_the_migration_chain() {
+        let conn = migrated();
+        let actual = schema_snapshot(&conn);
+        let committed = include_str!("../schema.sql");
+        if actual == committed {
+            return;
+        }
+        if std::env::var_os("WANDERER_BLESS_SCHEMA").is_some() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("schema.sql");
+            std::fs::write(&path, &actual).expect("write the refreshed schema snapshot");
+            return;
+        }
+        panic!(
+            "src-tauri/schema.sql is out of date with the migration chain.\n\
+             Refresh it with: WANDERER_BLESS_SCHEMA=1 cargo test schema\n\
+             and commit the result with the migration that changed it."
+        );
+    }
+
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A file-backed database, for the handful of tests that exercise `Database`
+    /// itself rather than the schema. Dropped with the directory.
+    struct TempDb {
+        dir: PathBuf,
+        db: Database,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let pid = std::process::id();
+            let dir = std::env::temp_dir().join(format!("wanderer-db-test-{pid}-{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = Database::new(dir.join("library.db")).expect("open the test database");
+            Self { dir, db }
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn queue_rows(db: &Database) -> Vec<(String, String, i64)> {
+        let conn = db.get_conn().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT file_path, status, retries FROM upload_queue ORDER BY file_path")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// The upsert replaced a count-then-insert, and it has to preserve what the count
+    /// did: queueing a path that is already waiting or in flight changes nothing.
+    #[test]
+    fn queueing_a_file_twice_leaves_the_first_entry_alone() {
+        let tmp = TempDb::new();
+        tmp.db.add_to_queue("/library/a.jpg").unwrap();
+        tmp.db.add_to_queue("/library/a.jpg").unwrap();
+        assert_eq!(
+            queue_rows(&tmp.db),
+            vec![("/library/a.jpg".to_string(), "pending".to_string(), 0)]
+        );
+
+        {
+            let conn = tmp.db.get_conn().unwrap();
+            conn.execute(
+                "UPDATE upload_queue SET status = 'uploading' WHERE file_path = '/library/a.jpg'",
+                [],
+            )
+            .unwrap();
+        }
+        tmp.db.add_to_queue("/library/a.jpg").unwrap();
+        assert_eq!(
+            queue_rows(&tmp.db),
+            vec![("/library/a.jpg".to_string(), "uploading".to_string(), 0)],
+            "an upload in flight was reset out from under the worker"
+        );
+    }
+
+    /// The other half: a path that previously failed or completed is a genuine
+    /// re-queue, and must go back to pending with its retry count cleared.
+    #[test]
+    fn queueing_a_failed_file_again_resets_it_to_pending() {
+        let tmp = TempDb::new();
+        tmp.db.add_to_queue("/library/a.jpg").unwrap();
+        {
+            let conn = tmp.db.get_conn().unwrap();
+            conn.execute(
+                "UPDATE upload_queue SET status = 'failed', retries = 3, error_msg = 'boom'
+                 WHERE file_path = '/library/a.jpg'",
+                [],
+            )
+            .unwrap();
+        }
+
+        tmp.db.add_to_queue("/library/a.jpg").unwrap();
+
+        assert_eq!(
+            queue_rows(&tmp.db),
+            vec![("/library/a.jpg".to_string(), "pending".to_string(), 0)]
+        );
+        let error_msg: Option<String> = {
+            let conn = tmp.db.get_conn().unwrap();
+            conn.query_row(
+                "SELECT error_msg FROM upload_queue WHERE file_path = '/library/a.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(error_msg, None, "the stale failure message survived");
+    }
+
+    /// The backup has to be a database, not a byte copy taken mid-write. With WAL on,
+    /// the rows below are in the log and not yet in library.db, so a file copy of the
+    /// main file would produce an empty library: exactly the failure being fixed.
+    #[test]
+    fn a_backup_is_a_complete_snapshot_of_the_live_database() {
+        let tmp = TempDb::new();
+        {
+            let conn = tmp.db.get_conn().unwrap();
+            insert_media(&conn, "/library/vacation.jpg");
+            insert_media(&conn, "/library/invoices.pdf");
+        }
+
+        let dest = tmp.dir.join("backup.db");
+        tmp.db.backup_to(&dest).expect("write the snapshot");
+
+        let restored = Connection::open(&dest).unwrap();
+        let paths: Vec<String> = {
+            let mut stmt = restored
+                .prepare("SELECT file_path FROM media ORDER BY file_path")
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            paths,
+            vec![
+                "/library/invoices.pdf".to_string(),
+                "/library/vacation.jpg".to_string()
+            ]
+        );
+        assert_eq!(user_version(&restored), CURRENT_SCHEMA_VERSION);
+        assert_eq!(fts_matches(&restored, "vacation").len(), 1);
+    }
+
+    /// Overwriting a backup silently would be worse than failing, so `VACUUM INTO`
+    /// refusing an existing target is load-bearing rather than incidental.
+    #[test]
+    fn a_backup_refuses_to_overwrite_an_existing_file() {
+        let tmp = TempDb::new();
+        let dest = tmp.dir.join("backup.db");
+        std::fs::write(&dest, b"not a database").unwrap();
+
+        assert!(tmp.db.backup_to(&dest).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"not a database");
     }
 }

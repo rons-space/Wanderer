@@ -2,11 +2,14 @@ use grammers_client::client::{LoginToken, UpdatesConfiguration};
 use grammers_client::message::InputMessage;
 use grammers_client::update::Update;
 use grammers_client::{Client, SenderPool};
-use grammers_session::storages::SqliteSession;
 use log::info;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use crate::secret_store::SecretStore;
+use crate::security::MasterKey;
+use crate::session_store::EncryptedSession;
 
 /// Error type for upload operations supporting rate limit detection
 #[derive(Debug)]
@@ -94,7 +97,36 @@ impl TelegramService {
         self.credentials.lock().await.is_some()
     }
 
-    pub async fn connect(&self, app_data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn is_connected(&self) -> bool {
+        self.client.lock().await.is_some()
+    }
+
+    /// A handle to the connected client, cloned out of the mutex.
+    ///
+    /// `Client` is an `Arc` inside, so this costs a refcount. Working through the
+    /// guard instead meant every method held the mutex for its whole body, and an
+    /// upload of a 4GB video serialised every other Telegram operation behind it:
+    /// no progress query, no download, and a logout that could not proceed until the
+    /// transfer finished.
+    async fn client(&self) -> Result<Client, String> {
+        self.client
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "Client not connected".to_string())
+    }
+
+    /// Connect, unsealing the stored session first.
+    ///
+    /// `master_key` is what the vault currently holds. On Windows it is unused, since
+    /// DPAPI needs nothing unlocked; elsewhere it is the only thing that can open the
+    /// session, so a locked or unencrypted library fails here with an explanation
+    /// rather than falling back to storing the account key in the clear.
+    pub async fn connect(
+        &self,
+        app_data_dir: PathBuf,
+        master_key: Option<MasterKey>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (api_id, _api_hash) = self
             .credentials
             .lock()
@@ -102,14 +134,14 @@ impl TelegramService {
             .clone()
             .ok_or("Telegram API credentials not configured")?;
 
-        let session_path = app_data_dir.join("session.db");
-        info!(
-            "Connecting to Telegram using session at: {:?}",
-            session_path
-        );
-
         // 1. Initialize Session
-        let session = SqliteSession::open(session_path)?;
+        let store = SecretStore::for_session(master_key).map_err(|e| format!("{:#}", e))?;
+        info!(
+            "Connecting to Telegram with a session sealed by {}",
+            store.describe()
+        );
+        let session =
+            EncryptedSession::open(&app_data_dir, store).map_err(|e| format!("{:#}", e))?;
 
         // 2. Initialize SenderPool
         let session_handle = Arc::new(session);
@@ -135,8 +167,12 @@ impl TelegramService {
 
         let updates_handle = tokio::spawn(async move {
             while let Ok(update) = update_stream.next().await {
-                if let Update::NewMessage(message) = update {
-                    info!("New message: {:?}", message.text());
+                // Deliberately not logging the message: this is the user's own Saved
+                // Messages chat, so the text is their private correspondence and the
+                // backup payloads they store here. Only the arrival is interesting,
+                // and only while debugging.
+                if let Update::NewMessage(_) = update {
+                    log::debug!("Received a new Telegram message");
                 }
             }
         });
@@ -153,17 +189,17 @@ impl TelegramService {
         &self,
         phone: &str,
         app_data_dir: PathBuf,
+        master_key: Option<MasterKey>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Reconnect if client is missing (e.g. after logout)
         let needs_connect = { self.client.lock().await.is_none() };
 
         if needs_connect {
             info!("Client not connected, re-initializing...");
-            self.connect(app_data_dir).await?;
+            self.connect(app_data_dir, master_key).await?;
         }
 
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
         let api_hash = self
             .credentials
             .lock()
@@ -179,10 +215,7 @@ impl TelegramService {
     }
 
     pub async fn sign_in(&self, code: &str) -> Result<String, String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or("Client not connected".to_string())?;
+        let client = self.client().await?;
 
         let mut token_guard = self.pending_token.lock().await;
         let token = token_guard
@@ -191,7 +224,9 @@ impl TelegramService {
 
         match client.sign_in(&token, code).await {
             Ok(user) => {
-                info!("Signed in as: {}", user.full_name());
+                // The account name is the user's real name; it belongs in the UI, not
+                // in a log file that gets attached to bug reports.
+                info!("Signed in to Telegram");
                 Ok(user.full_name())
             }
             // Error handling remains similar
@@ -206,10 +241,7 @@ impl TelegramService {
     }
 
     pub async fn get_me(&self) -> Result<String, String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or("Client not connected".to_string())?;
+        let client = self.client().await?;
 
         match client.get_me().await {
             Ok(me) => Ok(me.full_name()),
@@ -219,17 +251,13 @@ impl TelegramService {
 
     #[allow(dead_code)]
     pub async fn is_authorized(&self) -> bool {
-        let client_guard = self.client.lock().await;
-        if let Some(client) = client_guard.as_ref() {
-            client.is_authorized().await.unwrap_or(false)
-        } else {
-            false
+        match self.client().await {
+            Ok(client) => client.is_authorized().await.unwrap_or(false),
+            Err(_) => false,
         }
     }
     pub async fn upload_file(&self, path: &str) -> Result<(), String> {
-        let client_guard = self.client.lock().await;
-        // Check connection
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // Upload logic
         // We reuse the client instance
@@ -267,10 +295,7 @@ impl TelegramService {
         use tokio::fs::File;
         use tokio::io::BufReader;
 
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or_else(|| UploadError::Other("Client not connected".to_string()))?;
+        let client = self.client().await.map_err(UploadError::Other)?;
 
         // Get file metadata
         let file = File::open(path)
@@ -337,8 +362,7 @@ impl TelegramService {
         _offset_id: i32,
         limit: usize,
     ) -> Result<Vec<grammers_client::message::Message>, String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         let me = client.get_me().await.map_err(|e| e.to_string())?;
         let peer = me.to_ref().ok_or("Could not get peer error")?;
@@ -359,8 +383,7 @@ impl TelegramService {
         message: &grammers_client::message::Message,
         path: &str,
     ) -> Result<(), String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // Check if message has media
         if let Some(media) = message.media() {
@@ -383,14 +406,9 @@ impl TelegramService {
             return Ok(0);
         }
 
-        log::info!(
-            "Telegram: Attempting to delete {} messages with IDs: {:?}",
-            message_ids.len(),
-            message_ids
-        );
+        log::info!("Telegram: deleting {} messages", message_ids.len());
 
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // For Saved Messages (self-chat), we use messages::DeleteMessages with revoke=true
         // This works for private chats including Saved Messages
@@ -419,11 +437,110 @@ impl TelegramService {
         }
     }
 
+    /// Delete messages and confirm they are gone.
+    ///
+    /// `delete_messages` reports what Telegram said it did, which is not the same
+    /// question. This is used where the copy being deleted is *plaintext the user
+    /// asked to stop storing*, so the answer has to come from asking for the message
+    /// back and finding nothing. Rate limits are waited out rather than treated as
+    /// failure, because a FLOOD_WAIT here means the plaintext is simply still there.
+    ///
+    /// Returns the message IDs that survived, so the caller can record them; an empty
+    /// vector is the only outcome that means the plaintext is gone.
+    pub async fn purge_messages(&self, message_ids: &[i32]) -> Result<Vec<i32>, String> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Three tries and a five minute ceiling on any single wait. Telegram can name
+        // a wait of hours, which is not something to block a migration worker on; the
+        // ids go to the backlog instead and the user can retry from Settings.
+        const MAX_ATTEMPTS: usize = 3;
+        const MAX_FLOOD_WAIT_SECS: u64 = 300;
+
+        let mut last_error = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.delete_messages(message_ids).await {
+                Ok(_) => {
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    let wait = parse_flood_wait(&e);
+                    last_error = Some(e);
+                    match wait {
+                        Some(secs) if secs <= MAX_FLOOD_WAIT_SECS && attempt < MAX_ATTEMPTS => {
+                            log::warn!(
+                                "Telegram rate limited the plaintext purge, retrying in {}s",
+                                secs
+                            );
+                            // Outside the client lock: `delete_messages` released it
+                            // when it returned, and nothing else should stall on this.
+                            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+
+        // Verified even when the delete errored. A FLOOD_WAIT can arrive after the
+        // server already applied the deletion, and the surviving-ids answer is what
+        // the caller actually needs.
+        match self.surviving_messages(message_ids).await {
+            Ok(surviving) => {
+                if surviving.is_empty() {
+                    log::info!(
+                        "Purged {} plaintext messages from Telegram",
+                        message_ids.len()
+                    );
+                } else {
+                    log::error!(
+                        "{} of {} plaintext messages are still in Telegram after the purge",
+                        surviving.len(),
+                        message_ids.len()
+                    );
+                }
+                Ok(surviving)
+            }
+            // The deletion may well have worked, but nothing here can say so, and
+            // claiming the plaintext is gone when it might not be is the failure
+            // this is meant to prevent.
+            Err(verify_error) => Err(match last_error {
+                Some(delete_error) => {
+                    format!("{}; verification failed: {}", delete_error, verify_error)
+                }
+                None => format!("Could not verify the purge: {}", verify_error),
+            }),
+        }
+    }
+
+    /// Which of `message_ids` Telegram still has.
+    async fn surviving_messages(&self, message_ids: &[i32]) -> Result<Vec<i32>, String> {
+        let client_guard = self.client.lock().await;
+        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let me = client.get_me().await.map_err(|e| e.to_string())?;
+        let peer = me
+            .to_ref()
+            .ok_or("Could not resolve the Saved Messages peer")?;
+
+        // `get_messages_by_id` answers positionally, `None` where the message is gone.
+        let fetched = client
+            .get_messages_by_id(peer, message_ids)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(message_ids
+            .iter()
+            .zip(fetched)
+            .filter_map(|(id, message)| message.map(|_| *id))
+            .collect())
+    }
+
     /// Download a file by message ID
     /// Fetches the message from saved messages and downloads its media to the specified path
     pub async fn download_by_message_id(&self, message_id: i32, path: &str) -> Result<(), String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // Get the "me" user for Saved Messages
         let me = client.get_me().await.map_err(|e| e.to_string())?;
@@ -454,19 +571,19 @@ impl TelegramService {
     }
 
     pub async fn logout(&self, app_data_dir: PathBuf) -> Result<(), String> {
-        // 1. Graceful Sign Out
-        {
-            let mut client_guard = self.client.lock().await;
-            if let Some(client) = client_guard.as_ref() {
-                info!("Attempting graceful sign out...");
-                match client.sign_out().await {
-                    Ok(_) => info!("Signed out from Telegram successfully"),
-                    Err(e) => log::error!("Failed to sign out gracefully: {}", e),
-                }
+        // 1. Take the client out of the slot before signing out, rather than holding
+        // the lock across the network call. Emptying the slot is what stops new work
+        // from starting; holding the mutex only stopped anything else from finding out
+        // that logout was in progress.
+        let client = self.client.lock().await.take();
+
+        // 2. Graceful Sign Out
+        if let Some(client) = client {
+            info!("Attempting graceful sign out...");
+            match client.sign_out().await {
+                Ok(_) => info!("Signed out from Telegram successfully"),
+                Err(e) => log::error!("Failed to sign out gracefully: {}", e),
             }
-            // 2. Disconnect (Drop Client) - inside the same lock or re-acquire?
-            // Better to keep it locked or just set to None immediately.
-            *client_guard = None;
         }
         info!("Client disconnected");
 
@@ -478,29 +595,30 @@ impl TelegramService {
             handle.abort();
         }
 
-        // 4. Delete Session File
-        let session_path = app_data_dir.join("session.db");
-        if session_path.exists() {
-            for i in 0..5 {
-                match tokio::fs::remove_file(&session_path).await {
-                    Ok(_) => {
-                        info!("Deleted session file: {:?}", session_path);
-                        break;
-                    }
-                    Err(e) => {
-                        if i == 4 {
-                            return Err(format!(
-                                "Failed to delete session file after retries: {}",
-                                e
-                            ));
-                        }
-                        log::warn!(
-                            "Failed to delete session file (attempt {}): {}. Retrying...",
-                            i + 1,
-                            e
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    }
+        // 4. Delete the session, sealed or legacy plaintext.
+        //
+        // Retried, because the runner task above is aborted rather than joined and
+        // Windows refuses to unlink a file another handle still holds. Logout that
+        // leaves the account key on disk is the one outcome worth retrying for.
+        for attempt in 0..5 {
+            match EncryptedSession::remove(&app_data_dir) {
+                Ok(()) => {
+                    info!("Deleted the stored Telegram session");
+                    break;
+                }
+                Err(e) if attempt == 4 => {
+                    return Err(format!(
+                        "Failed to delete the Telegram session after retries: {:#}",
+                        e
+                    ));
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to delete the Telegram session (attempt {}): {:#}. Retrying...",
+                        attempt + 1,
+                        e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
             }
         }

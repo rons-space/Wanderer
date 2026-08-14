@@ -16,8 +16,12 @@
 //! copy "the backup" to a new machine or upload it to Telegram.
 //!
 //! ```text
-//! "WBAK01" | u8 version | u32 header_len (LE) | header JSON | WBENC1 stream
+//! "WBAK01" | u8 version | u32 header_len (LE) | header JSON | WBENC2 stream
 //! ```
+//!
+//! The envelope version does not move when the inner stream format does: the
+//! stream is self-describing through its own magic, so archives written before
+//! `WBENC2` still restore without the envelope needing to say which one it holds.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -77,7 +81,7 @@ pub fn write_encrypted_backup(
     source_db: &Path,
     out_path: &Path,
     bundle: &SecurityBundle,
-    key: &[u8; 32],
+    key: &crate::security::MasterKey,
     app_version: &str,
 ) -> Result<()> {
     let header = BackupHeader {
@@ -281,7 +285,9 @@ mod tests {
         // The source database is gone from here on, which is the entire point.
         std::fs::remove_file(&db_path).unwrap();
 
-        (archive, contents, passphrase, recovery_key)
+        // Copied out of `Zeroizing` deliberately: the fixture has to outlive the
+        // bundle, exactly as the user's written-down copy does.
+        (archive, contents, passphrase, recovery_key.to_string())
     }
 
     #[test]

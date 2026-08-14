@@ -32,7 +32,6 @@ notify = "6.1.1"
 blake3 = "1.5.5"
 # Used to verify pinned SHA-256 digests for downloaded ONNX models.
 sha2 = "0.10"
-thiserror = "2.0.11"
 log = "0.4.25"
 env_logger = "0.11.6"
 dirs = "5.0"
@@ -66,6 +65,8 @@ base64 = "0.22.1"
 rand = "0.8.5"
 windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
 hex = "0.4.3"
+# `derive` for `ZeroizeOnDrop` on the master key newtype.
+zeroize = { version = "1.8", features = ["derive"] }
 
 [features]
 default = []
