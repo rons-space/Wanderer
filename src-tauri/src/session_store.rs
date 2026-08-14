@@ -62,6 +62,10 @@ struct PersistedSession {
 
 const PERSISTED_VERSION: u8 = 1;
 
+/// Telegram's datacenter identifiers, mirroring grammers' crate-private
+/// KNOWN_DC_OPTIONS so the auth keys can be read out of the in-memory session.
+const KNOWN_DC_IDS: [i32; 5] = [1, 2, 3, 4, 5];
+
 /// A [`Session`] that keeps everything in memory and seals the authorization keys to
 /// disk whenever they change.
 pub struct EncryptedSession {
@@ -141,10 +145,15 @@ impl EncryptedSession {
     }
 
     fn snapshot(&self) -> PersistedSession {
-        let data = SessionData::from(&self.inner as &dyn Session);
-        let mut dc_options: Vec<PersistedDcOption> = data
-            .dc_options
-            .values()
+        // `SessionData::from` would do this, but it takes the session by value and
+        // grammers implements `Session` for `MemorySession` rather than for a
+        // reference to one, so the datacenters are read directly instead. The range
+        // mirrors grammers' own KNOWN_DC_OPTIONS, which is crate-private; `dc_option`
+        // answers `None` for anything outside it, so a wider range would be harmless
+        // but this has to grow if Telegram ever gains a sixth datacenter.
+        let mut dc_options: Vec<PersistedDcOption> = KNOWN_DC_IDS
+            .iter()
+            .filter_map(|&id| self.inner.dc_option(id))
             .map(|dc| PersistedDcOption {
                 id: dc.id,
                 ipv4: dc.ipv4.to_string(),
@@ -158,7 +167,7 @@ impl EncryptedSession {
 
         PersistedSession {
             version: PERSISTED_VERSION,
-            home_dc: data.home_dc,
+            home_dc: self.inner.home_dc_id(),
             dc_options,
         }
     }
@@ -209,8 +218,10 @@ fn session_data_from(persisted: PersistedSession) -> Result<SessionData> {
 
     // Starts from the default, so the statically-known datacenters are present even
     // if the blob only carries the one that was in use.
-    let mut data = SessionData::default();
-    data.home_dc = persisted.home_dc;
+    let mut data = SessionData {
+        home_dc: persisted.home_dc,
+        ..SessionData::default()
+    };
 
     for dc in persisted.dc_options {
         let auth_key = match dc.auth_key {
@@ -423,7 +434,12 @@ mod tests {
         }
 
         let other = SecretStore::MasterKey(MasterKey::new([7u8; 32]));
-        let err = EncryptedSession::open(&dir.0, other).expect_err("must not open");
+        // Matched rather than `expect_err`, which would need `Debug` on the session
+        // and so on grammers' `MemorySession`.
+        let err = match EncryptedSession::open(&dir.0, other) {
+            Ok(_) => panic!("a session sealed with another key must not open"),
+            Err(e) => e,
+        };
         assert!(
             err.to_string().contains("sign in to Telegram again"),
             "unexpected error: {:#}",
