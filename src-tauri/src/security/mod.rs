@@ -52,7 +52,7 @@ pub struct TelegramApiCredentials {
     pub api_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationStatus {
     pub running: bool,
@@ -61,19 +61,6 @@ pub struct MigrationStatus {
     pub succeeded: i64,
     pub failed: i64,
     pub last_error: Option<String>,
-}
-
-impl Default for MigrationStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            total: 0,
-            processed: 0,
-            succeeded: 0,
-            failed: 0,
-            last_error: None,
-        }
-    }
 }
 
 #[derive(Debug, Default)]

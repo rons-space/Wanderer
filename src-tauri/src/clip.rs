@@ -22,6 +22,9 @@ use tokenizers::Tokenizer;
 use tract_onnx::tract_hir::internal::*;
 
 /// CLIP embedding dimension (ViT-B/32)
+// Nothing validates embedding length against this today; kept as the documented shape of
+// what `clip_embedding` rows contain.
+#[allow(dead_code)]
 pub const EMBEDDING_DIM: usize = 512;
 
 /// Model filenames
@@ -337,13 +340,17 @@ pub fn encode_image(image_path: &Path) -> Result<Vec<f32>, String> {
 
     // Normalize and convert to NCHW
     // CLIP Mean and Std for normalization
+    // The published CLIP constants, kept as written upstream rather than truncated to the
+    // nearest `f32`, so they stay recognisable against the reference implementation.
+    #[allow(clippy::excessive_precision)]
     let mean = [0.48145466, 0.4578275, 0.40821073];
+    #[allow(clippy::excessive_precision)]
     let std = [0.26862954, 0.26130258, 0.27577711];
 
     let image_tensor: Tensor =
         tract_ndarray::Array4::from_shape_fn((1, 3, 224, 224), |(_, c, y, x)| {
             let pixel = resized.get_pixel(x as u32, y as u32);
-            let val = pixel[c as usize] as f32 / 255.0;
+            let val = pixel[c] as f32 / 255.0;
             (val - mean[c]) / std[c]
         })
         .into();

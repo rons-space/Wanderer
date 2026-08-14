@@ -940,7 +940,7 @@ pub fn run() {
             db: Mutex::new(None),
             watcher: Mutex::new(None),
             security_runtime,
-            face_detector: face_detector,
+            face_detector,
         })
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -1337,7 +1337,7 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
             }
 
             // Copy the file
-            if let Err(e) = std::fs::copy(&path, &dest_path) {
+            if let Err(e) = std::fs::copy(path, &dest_path) {
                 log::error!("Failed to copy file {:?} to {:?}: {}", path, dest_path, e);
             } else {
                 success_count += 1;
@@ -2585,7 +2585,7 @@ async fn import_sync_manifest(path: String, state: State<'_, AppState>) -> Resul
     }
 
     // Create any new albums from the manifest
-    for (_, album_meta) in &remote_manifest.albums {
+    for album_meta in remote_manifest.albums.values() {
         if db
             .get_album_by_name(&album_meta.name)
             .map_err(|e| e.to_string())?

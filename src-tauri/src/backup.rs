@@ -58,6 +58,9 @@ pub enum BackupSecret<'a> {
 }
 
 /// True when `path` starts with the backup envelope magic.
+// Only the tests call it: restore takes the path the user picked and fails on a bad
+// header rather than probing first. Kept so the check exists for the file picker.
+#[allow(dead_code)]
 pub fn is_backup_envelope(path: &Path) -> Result<bool> {
     let mut file = File::open(path)?;
     let mut magic = [0u8; 6];

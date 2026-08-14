@@ -2,7 +2,6 @@ use crate::database::Database;
 use crate::media_utils;
 use crate::security::{self, RuntimeState};
 use log::{error, info, warn};
-use mime_guess;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,22 +55,20 @@ impl FileWatcher {
         tokio::spawn(async move {
             info!("Starting initial scan of {:?}", path_clone);
             if let Ok(entries) = fs::read_dir(&path_clone) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_file() {
-                            info!("Initial scan checking: {:?}", path);
-                            if let Err(e) = process_file(
-                                &path,
-                                &cache_dir_clone,
-                                &db_clone,
-                                Some(&app_handle_scan),
-                                &runtime_for_scan,
-                            )
-                            .await
-                            {
-                                error!("Failed to process existing file {:?}: {}", path, e);
-                            }
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        info!("Initial scan checking: {:?}", path);
+                        if let Err(e) = process_file(
+                            &path,
+                            &cache_dir_clone,
+                            &db_clone,
+                            Some(&app_handle_scan),
+                            &runtime_for_scan,
+                        )
+                        .await
+                        {
+                            error!("Failed to process existing file {:?}: {}", path, e);
                         }
                     }
                 }
@@ -209,7 +206,7 @@ async fn process_file(
     // Fail closed: if the bundle cannot be read, assume encryption is required.
     // The branch below deletes the plaintext thumbnail when it cannot seal it,
     // so the worst case is a missing thumbnail rather than a plaintext one.
-    let thumbnail_needs_encryption = crate::encryption_required(&db).unwrap_or_else(|e| {
+    let thumbnail_needs_encryption = crate::encryption_required(db).unwrap_or_else(|e| {
         warn!(
             "Cannot determine encryption state, treating thumbnail as encrypted: {}",
             e
