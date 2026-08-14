@@ -47,7 +47,7 @@ jobs:
     # behind it leaves this queued forever, and a sync that never runs is
     # indistinguishable from the drift it is meant to catch. The job is a handful of
     # git commands, so it wants the smallest useful runner rather than a large one.
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: nscloud-ubuntu-24.04-amd64-8x16
 
     steps:
       - name: Check out full history
