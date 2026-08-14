@@ -62,10 +62,16 @@ aes-gcm = "0.10.3"
 argon2 = "0.5.3"
 base64 = "0.22.1"
 rand = "0.8.5"
-windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
 hex = "0.4.3"
 # `derive` for `ZeroizeOnDrop` on the master key newtype.
 zeroize = { version = "1.8", features = ["derive"] }
+
+# Windows only. The DPAPI wrappers in `security/mod.rs` that use it are already
+# behind `#[cfg(target_os = "windows")]`, so pulling the crate in unconditionally
+# only meant a Linux or macOS build had to resolve and compile a crate it could
+# never call.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
 
 [features]
 default = []
@@ -78,3 +84,16 @@ default = []
 #
 #   npm run tauri dev -- --features mcp-bridge
 mcp-bridge = ["dep:tauri-plugin-mcp-bridge"]
+
+# Shipped binaries only. Link-time optimization across the whole graph and a
+# single codegen unit are slow to build but meaningfully smaller and faster for
+# a binary that statically links ONNX Runtime, SQLite and the image stack;
+# stripping symbols removes debug information that has no use in a release and
+# takes tens of megabytes with it. `panic = "abort"` is deliberately not set:
+# Tauri command handlers rely on unwinding to turn a panic into a rejected
+# promise rather than killing the process.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
