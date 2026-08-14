@@ -147,7 +147,7 @@ pub async fn run_upload_worker(
                         }
                     };
 
-                    let temp_dir = std::env::temp_dir().join("wanderer-encrypted-uploads");
+                    let temp_dir = crate::paths::encrypted_uploads_dir();
                     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
                         let err_msg = format!("Failed to create temp encrypted upload dir: {}", e);
                         let _ = db.update_queue_status(item.id, "failed", Some(&err_msg));

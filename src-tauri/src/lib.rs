@@ -214,7 +214,7 @@ async fn materialize_thumbnail_path_for_response(
     }
 
     let key = state.security_runtime.lock().await.master_key.clone()?;
-    let cache_dir = std::env::temp_dir().join("wanderer-thumb-cache");
+    let cache_dir = paths::thumb_cache_dir();
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return None;
     }
@@ -268,7 +268,7 @@ async fn download_and_materialize_media(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let temp_dir = std::env::temp_dir().join("wanderer-download-staging");
+    let temp_dir = paths::download_staging_dir();
     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
     let temp_path = temp_dir.join(format!(
         "msg_{}_{}.bin",
@@ -429,6 +429,14 @@ async fn unlock_encryption(passphrase: String, state: State<'_, AppState>) -> Re
 #[tauri::command]
 async fn lock_encryption(state: State<'_, AppState>) -> Result<(), String> {
     state.security_runtime.lock().await.master_key = None;
+    // Clearing the key in memory was the whole of "lock" before this, which left every
+    // thumbnail and every media file the user had viewed sitting decrypted in %TEMP%.
+    // Locking has to mean the plaintext is gone, not just the key.
+    let purged = paths::purge_scratch_dirs();
+    log::info!(
+        "Locked encryption and purged {} scratch directories",
+        purged
+    );
     Ok(())
 }
 
@@ -665,7 +673,7 @@ async fn start_encryption_migration(
                         return Err("Local file is missing; cannot migrate cloud blob".to_string());
                     }
 
-                    let temp_dir = std::env::temp_dir().join("wanderer-migration");
+                    let temp_dir = paths::migration_staging_dir();
                     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
                     let temp_path = temp_dir.join(format!("media_{}_enc.wbenc", media_id));
                     security::encrypt_file(source, &temp_path, &key).map_err(|e| e.to_string())?;
@@ -966,31 +974,18 @@ pub fn run() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
 
+            // Before anything else, and before the vault can be unlocked again: a crash
+            // or a kill leaves decrypted scratch behind that no lock handler ever ran
+            // for, and startup is the only moment nothing is using it.
+            let purged = paths::purge_scratch_dirs();
+            if purged > 0 {
+                log::info!(
+                    "Purged {} scratch directories left by a previous run",
+                    purged
+                );
+            }
+
             tauri::async_runtime::spawn(async move {
-                // Initialize State with cache
-                // Note: We need to manage how state is initialized if we changed the struct
-                // actually `manage` call is usually done before setup or passed via .manage()
-                // But here we are accessing state that was managed?
-                // Wait, tauri::Builder::default().manage(AppState { ... }) is missing in the visible code!
-                // Ah, the view showed `.setup`.
-                // I need to see where `AppState` is created.
-                // Usually it's `.manage(AppState::default())` or similar.
-
-                // Let's look at the full file content of lib.rs again to check `manage`.
-                // If I can't find it, I will assume I need to add it or modify it.
-                // Assuming `manage` is called with initial state.
-
-                // Wait, the previous view of lib.rs showed:
-                // let state: tauri::State<AppState> = app_handle.state();
-                // This means state is ALREADY managed.
-                // I need to find where `.manage` is called to update the INITIALIZATION.
-
-                // If I change AppState struct, I MUST update the `.manage(...)` call.
-                // Let's find it.
-
-                // I will do a `view_file` regarding this in next step if I can't find it.
-                // But let's look at lines 100-150 relative to previous view.
-
                 let state: tauri::State<AppState> = app_handle.state();
 
                 let app_dir = match resolve_app_data_dir(&app_handle) {
@@ -1195,6 +1190,15 @@ pub fn run() {
                 }
             });
             Ok(())
+        })
+        // The last chance to clean up while the process is still alive. `Destroyed`
+        // rather than `CloseRequested`, because the latter can be cancelled and the
+        // viewer may still hold the very files being deleted.
+        .on_window_event(|_window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let purged = paths::purge_scratch_dirs();
+                log::info!("Window closed; purged {} scratch directories", purged);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_security_status,
@@ -2278,7 +2282,7 @@ async fn download_local_copy(
 
     // Download to a temp file first to avoid watcher hashing/upload-queue races
     // while the file is still being written.
-    let restore_staging_dir = std::env::temp_dir().join("wanderer-local-restore-staging");
+    let restore_staging_dir = paths::local_restore_staging_dir();
     std::fs::create_dir_all(&restore_staging_dir).map_err(|e| e.to_string())?;
     let staged_path = restore_staging_dir.join(format!(
         "restore_{}_{}.tmp",
@@ -2384,7 +2388,7 @@ async fn download_for_view(
         let cache_blob_path = cache_dir.join(format!("{}_{}.wbenc", media_id, filename));
 
         if !cache_blob_path.exists() {
-            let staging_dir = std::env::temp_dir().join("wanderer-view-cache-staging");
+            let staging_dir = paths::view_cache_staging_dir();
             std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
             let raw_download_path = staging_dir.join(format!(
                 "view_{}_{}.bin",
@@ -2427,7 +2431,7 @@ async fn download_for_view(
 
         let _ = filetime::set_file_mtime(&cache_blob_path, filetime::FileTime::now());
 
-        let materialized_dir = std::env::temp_dir().join("wanderer-view-cache-materialized");
+        let materialized_dir = paths::view_cache_materialized_dir();
         std::fs::create_dir_all(&materialized_dir).map_err(|e| e.to_string())?;
         let cache_key = blake3::hash(cache_blob_path.to_string_lossy().as_bytes())
             .to_hex()
