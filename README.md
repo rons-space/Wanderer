@@ -111,6 +111,7 @@ Important:
 Important:
 
 - If you lose both passphrase and recovery key, encrypted data is unrecoverable.
+- Either one is enough to open a `.wbak` database backup on a new machine.
 
 ### 3. Enter BYOK Telegram Credentials
 
@@ -174,7 +175,16 @@ To restore later:
 
 - Go to `Settings -> Storage`
 - Use database backup actions
-- In encrypted mode, backup file is exported as encrypted `.db.wbenc`
+- In encrypted mode, the backup is exported as a `.wbak` archive: the encrypted
+  database plus a plaintext header holding the same passphrase-wrapped and
+  recovery-key-wrapped master key that `library.db` stores. The archive can
+  therefore be opened on a machine that has lost `library.db`, using your
+  passphrase or your recovery key. The header exposes no secret: without one of
+  those two, it is Argon2id-wrapped key material and nothing else.
+
+> **Older `.db.wbenc` backups cannot be restored.** They were encrypted with the
+> master key while the only copy of that key stayed behind in `library.db`. If
+> you have one, keep your current `library.db` safe and take a fresh backup.
 
 ---
 

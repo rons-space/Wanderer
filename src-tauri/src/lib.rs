@@ -1,4 +1,5 @@
 mod ai;
+mod backup;
 mod cache;
 mod clip;
 mod database;
@@ -1194,6 +1195,8 @@ pub fn run() {
             // Backup
             get_backup_path,
             backup_database,
+            inspect_backup_archive,
+            restore_backup_archive,
             // Cloud-Only Mode
             remove_local_copy,
             download_local_copy,
@@ -1920,22 +1923,38 @@ async fn backup_database(
 
     let mut final_backup_path = backup_path.clone();
 
-    // Encrypt database backup artifact when encryption mode is enabled.
-    let security_mode = {
+    // The authoritative encryption state is the bundle, not the `security_mode`
+    // row, and a read failure must not silently downgrade the backup to
+    // plaintext, so this fails closed rather than defaulting to "unset".
+    let bundle = {
         let db_guard = state.db.lock().await;
         let db = db_guard.as_ref().ok_or("Database not initialized")?;
-        db.get_config(SECURITY_MODE_KEY)
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| "unset".to_string())
+        load_security_bundle(db)?
     };
-    if security_mode == "encrypted" {
-        let key = get_active_master_key(&state)
-            .await
-            .ok_or_else(|| "Encryption vault is locked. Unlock to create encrypted backup.".to_string())?;
-        let encrypted_path = backup_path.with_extension("db.wbenc");
-        security::encrypt_file(&backup_path, &encrypted_path, &key).map_err(|e| e.to_string())?;
+    let encrypted_mode = bundle
+        .as_ref()
+        .map(|b| b.mode == EncryptionMode::Encrypted)
+        .unwrap_or(false);
+
+    if encrypted_mode {
+        let bundle = bundle.ok_or("Security bundle missing")?;
+        let key = get_active_master_key(&state).await.ok_or_else(|| {
+            "Encryption vault is locked. Unlock to create encrypted backup.".to_string()
+        })?;
+        // The archive carries the wrapped master key in its plaintext header, so
+        // the passphrase and the recovery key can open it on a machine that has
+        // lost `library.db`. See `backup.rs`.
+        let archive_path = backup_path.with_extension("wbak");
+        backup::write_encrypted_backup(
+            &backup_path,
+            &archive_path,
+            &bundle,
+            &key,
+            app.package_info().version.to_string().as_str(),
+        )
+        .map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&backup_path);
-        final_backup_path = encrypted_path;
+        final_backup_path = archive_path;
     }
 
     let backup_path_str = final_backup_path.to_string_lossy().to_string();
@@ -1954,6 +1973,69 @@ async fn backup_database(
     }
 
     Ok(backup_path_str)
+}
+
+/// Metadata about a backup archive, readable without any secret.
+#[derive(serde::Serialize)]
+struct BackupArchiveInfo {
+    format_version: u8,
+    created_at: i64,
+    app_version: String,
+    source_file: String,
+    encrypted: bool,
+    has_passphrase_wrap: bool,
+    has_recovery_wrap: bool,
+}
+
+#[tauri::command]
+async fn inspect_backup_archive(archive_path: String) -> Result<BackupArchiveInfo, String> {
+    let path = std::path::PathBuf::from(&archive_path);
+    let header = backup::read_header(&path).map_err(|e| e.to_string())?;
+    Ok(BackupArchiveInfo {
+        format_version: header.format_version,
+        created_at: header.created_at,
+        app_version: header.app_version,
+        source_file: header.source_file,
+        encrypted: header.bundle.mode == EncryptionMode::Encrypted,
+        has_passphrase_wrap: header.bundle.passphrase_wrap.is_some(),
+        has_recovery_wrap: header.bundle.recovery.is_some(),
+    })
+}
+
+/// Decrypt a backup archive to a plaintext `library.db` next to it.
+///
+/// This deliberately does not overwrite the live database: the app holds it
+/// open, and a disaster restore is done with the app closed. It returns the path
+/// of the restored file for the caller to put in place.
+#[tauri::command]
+async fn restore_backup_archive(
+    archive_path: String,
+    passphrase: Option<String>,
+    recovery_key: Option<String>,
+) -> Result<String, String> {
+    let archive = std::path::PathBuf::from(&archive_path);
+    let passphrase = passphrase.filter(|p| !p.is_empty());
+    let recovery_key = recovery_key.filter(|k| !k.is_empty());
+    if passphrase.is_none() && recovery_key.is_none() {
+        return Err("A passphrase or a recovery key is required".to_string());
+    }
+
+    let out_path = archive.with_extension("restored.db");
+    // Argon2id at 64 MiB plus a full-file decrypt is far too much work for the
+    // async runtime; every other heavy path in this file that gets this right
+    // uses spawn_blocking too.
+    tauri::async_runtime::spawn_blocking(move || {
+        let secret = match (passphrase.as_deref(), recovery_key.as_deref()) {
+            (Some(p), _) => backup::BackupSecret::Passphrase(p),
+            (None, Some(k)) => backup::BackupSecret::RecoveryKey(k),
+            (None, None) => return Err("A passphrase or a recovery key is required".to_string()),
+        };
+        backup::restore_encrypted_backup(&archive, &out_path, secret)
+            .map(|_| out_path.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
