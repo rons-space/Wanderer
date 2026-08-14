@@ -393,7 +393,7 @@ mod tests {
         let expected = dir.write_executable(FFMPEG_EXE);
 
         assert_eq!(
-            find_executable(&[dir.0.clone()], FFMPEG_EXE),
+            find_executable(std::slice::from_ref(&dir.0), FFMPEG_EXE),
             Some(expected)
         );
     }
@@ -431,7 +431,10 @@ mod tests {
         let dir = TempDir::new("dir-shaped");
         std::fs::create_dir_all(dir.0.join(FFMPEG_EXE)).expect("create decoy directory");
 
-        assert_eq!(find_executable(&[dir.0.clone()], FFMPEG_EXE), None);
+        assert_eq!(
+            find_executable(std::slice::from_ref(&dir.0), FFMPEG_EXE),
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -440,6 +443,9 @@ mod tests {
         let dir = TempDir::new("not-executable");
         std::fs::write(dir.0.join(FFMPEG_EXE), b"not executable").expect("write file");
 
-        assert_eq!(find_executable(&[dir.0.clone()], FFMPEG_EXE), None);
+        assert_eq!(
+            find_executable(std::slice::from_ref(&dir.0), FFMPEG_EXE),
+            None
+        );
     }
 }
