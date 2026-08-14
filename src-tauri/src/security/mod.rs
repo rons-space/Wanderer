@@ -448,9 +448,19 @@ pub fn decrypt_stream<R: Read, W: Write>(
             Err(e) => return Err(e.into()),
         }
 
+        // A chunk is at most `chunk_size` of plaintext plus the 16 byte GCM tag,
+        // and the header's `chunk_size` was bounded above. Without the upper
+        // bound this length is attacker-controlled and unauthenticated: a
+        // declared 0xFFFFFFFF allocates ~4 GiB per chunk before a single tag is
+        // verified, so a corrupt or hostile file is an out-of-memory abort.
         let ct_len = u32::from_le_bytes(len_buf) as usize;
-        if ct_len < 16 {
-            return Err(anyhow!("Invalid encrypted chunk length"));
+        let max_ct_len = chunk_size as usize + 16;
+        if !(16..=max_ct_len).contains(&ct_len) {
+            return Err(anyhow!(
+                "Invalid encrypted chunk length: {} (expected 16..={})",
+                ct_len,
+                max_ct_len
+            ));
         }
 
         let mut ciphertext = vec![0u8; ct_len];
@@ -636,6 +646,44 @@ mod tests {
             key
         );
         assert!(bundle.unlock_with_recovery_key("WRONG-KEY").is_err());
+    }
+
+    /// Build a `WBENC1` header followed by a single chunk length, with no chunk
+    /// body: enough to exercise the length validation without a real key.
+    fn header_with_chunk_len(chunk_size: u32, ct_len: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(FILE_MAGIC);
+        buf.push(FILE_VERSION);
+        buf.extend_from_slice(&chunk_size.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 12]);
+        buf.extend_from_slice(&ct_len.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn oversized_chunk_length_is_rejected_before_allocating() {
+        let key = [7u8; 32];
+
+        // ~4 GiB declared. This must fail on the bound, not on the allocation.
+        let hostile = header_with_chunk_len(DEFAULT_CHUNK_SIZE, u32::MAX);
+        let err = decrypt_stream(&mut hostile.as_slice(), &mut Vec::new(), &key)
+            .expect_err("oversized chunk must be rejected");
+        assert!(err.to_string().contains("Invalid encrypted chunk length"));
+
+        // One byte past the legitimate maximum is still rejected.
+        let over = header_with_chunk_len(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE + 17);
+        assert!(decrypt_stream(&mut over.as_slice(), &mut Vec::new(), &key).is_err());
+
+        // Under the tag length was already rejected and still is.
+        let under = header_with_chunk_len(DEFAULT_CHUNK_SIZE, 15);
+        assert!(decrypt_stream(&mut under.as_slice(), &mut Vec::new(), &key).is_err());
+
+        // A length at the maximum passes validation and fails later, on the
+        // truncated body, which proves the bound itself is not too tight.
+        let at_max = header_with_chunk_len(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE + 16);
+        let err = decrypt_stream(&mut at_max.as_slice(), &mut Vec::new(), &key)
+            .expect_err("truncated body must fail");
+        assert!(!err.to_string().contains("Invalid encrypted chunk length"));
     }
 
     /// Guards the split of `encrypt_file` and `decrypt_file` into stream
