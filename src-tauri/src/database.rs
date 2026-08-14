@@ -5,6 +5,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use time::OffsetDateTime;
 
+/// The columns `map_media_row` reads, in the order it reads them.
+///
+/// Every query that feeds that mapper must select exactly this list: the mapper
+/// addresses columns by index, so a query that selects them in another order, or
+/// adds one in the middle, silently loads the wrong field into each item rather
+/// than failing. Naming the list once is what keeps the two in step.
+const MEDIA_COLUMNS: &str = "id, file_path, file_hash, telegram_media_id, mime_type, width, height, \
+     duration, size_bytes, created_at, uploaded_at, thumbnail_path, date_taken, latitude, longitude, \
+     camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, \
+     is_cloud_only";
+
+/// `MEDIA_COLUMNS` qualified with the `m` alias, for the queries that join.
+const MEDIA_COLUMNS_M: &str = "m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, \
+     m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path, \
+     m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, \
+     m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only";
+
 /// Largest page any paginated read will return.
 ///
 /// The limit and offset on these methods come from the frontend, where a negative
@@ -1017,37 +1034,6 @@ impl Database {
         Ok(Some(new_id))
     }
 
-    // Superseded by `get_people`; `search_media` is the only caller of the broken
-    // `escape_like_pattern`. Both go in T55 (issue #63), which owns their removal.
-    #[allow(dead_code)]
-    pub fn get_persons(&self) -> Result<Vec<Person>> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT p.id, p.name, 
-                    (SELECT COUNT(DISTINCT f2.media_id) 
-                     FROM faces f2 
-                     JOIN media m2 ON f2.media_id = m2.id 
-                     WHERE f2.person_id = p.id 
-                       AND (m2.is_deleted = 0 OR m2.is_deleted IS NULL)) as face_count,
-                    m.file_path -- cover path
-             FROM persons p
-             LEFT JOIN faces f ON p.cover_face_id = f.rowid
-             LEFT JOIN media m ON f.media_id = m.id
-             ORDER BY face_count DESC",
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok(Person {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                face_count: row.get(2)?,
-                cover_path: row.get(3)?,
-            })
-        })?;
-
-        rows.collect()
-    }
-
     // --- CLIP Operations ---
 
     pub fn store_clip_embedding(&self, media_id: i64, embedding: &[f32]) -> Result<()> {
@@ -1131,49 +1117,14 @@ impl Database {
     pub fn get_next_item_to_scan(&self) -> Result<Option<MediaItem>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+            &format!("SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE (scan_status = 'pending' OR scan_status IS NULL) AND (is_deleted = 0 OR is_deleted IS NULL)
              ORDER BY created_at DESC 
-             LIMIT 1"
+             LIMIT 1")
         )?;
 
-        stmt.query_row([], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })
-        .optional()
+        stmt.query_row([], Self::map_media_row).optional()
     }
 
     pub fn mark_media_scan_failed(&self, media_id: i64) -> Result<()> {
@@ -1409,48 +1360,14 @@ impl Database {
 
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+            &format!("SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE (is_deleted = 0 OR is_deleted IS NULL) AND (is_archived = 0 OR is_archived IS NULL)
              ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC 
-             LIMIT ?1 OFFSET ?2"
+             LIMIT ?1 OFFSET ?2")
         )?;
 
-        let media_iter = stmt.query_map([limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+        let media_iter = stmt.query_map([limit, offset], Self::map_media_row)?;
 
         let mut media = Vec::new();
         for item in media_iter {
@@ -1477,10 +1394,7 @@ impl Database {
         let conn = self.get_conn()?;
         let placeholders = media_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, 
-                    width, height, duration, size_bytes, created_at, uploaded_at, 
-                    thumbnail_path, date_taken, latitude, longitude, 
-                    camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+            "SELECT {MEDIA_COLUMNS}
              FROM media WHERE id IN ({}) AND is_deleted = 0",
             placeholders
         );
@@ -1493,40 +1407,7 @@ impl Database {
             .collect();
         let media_iter = stmt.query_map(
             rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-            |row| {
-                Ok(MediaItem {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    file_hash: row.get(2)?,
-                    telegram_media_id: row.get(3)?,
-                    mime_type: row.get(4)?,
-                    width: row.get(5)?,
-                    height: row.get(6)?,
-                    duration: row.get(7)?,
-                    size_bytes: row.get(8)?,
-                    created_at: row.get(9)?,
-                    uploaded_at: row.get(10)?,
-                    thumbnail_path: row.get(11)?,
-                    date_taken: row.get(12)?,
-                    latitude: row.get(13)?,
-                    longitude: row.get(14)?,
-                    camera_make: row.get(15)?,
-                    camera_model: row.get(16)?,
-                    is_favorite: row.get::<_, i32>(17)? != 0,
-                    rating: row.get(18)?,
-                    is_deleted: row.get::<_, i32>(19)? != 0,
-                    deleted_at: row.get(20)?,
-                    is_archived: row
-                        .get::<_, Option<i32>>(21)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                    archived_at: row.get(22)?,
-                    is_cloud_only: row
-                        .get::<_, Option<i32>>(23)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                })
-            },
+            Self::map_media_row,
         )?;
         media_iter.collect()
     }
@@ -1569,14 +1450,13 @@ impl Database {
         let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE mime_type LIKE 'video/%' AND (is_deleted = 0 OR is_deleted IS NULL)
              ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC 
              LIMIT ?1 OFFSET ?2"
-        )?;
+        ))?;
         let media_iter = stmt.query_map([limit, offset], Self::map_media_row)?;
         media_iter.collect()
     }
@@ -1587,12 +1467,11 @@ impl Database {
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+            &format!("SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE created_at >= strftime('%s', 'now', '-30 days') AND (is_deleted = 0 OR is_deleted IS NULL)
              ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC 
-             LIMIT ?1 OFFSET ?2"
+             LIMIT ?1 OFFSET ?2")
         )?;
         let media_iter = stmt.query_map([limit, offset], Self::map_media_row)?;
         media_iter.collect()
@@ -1603,14 +1482,13 @@ impl Database {
         let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE rating >= 4 AND (is_deleted = 0 OR is_deleted IS NULL)
              ORDER BY rating DESC, COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC 
              LIMIT ?1 OFFSET ?2"
-        )?;
+        ))?;
         let media_iter = stmt.query_map([limit, offset], Self::map_media_row)?;
         media_iter.collect()
     }
@@ -1649,69 +1527,6 @@ impl Database {
                 .map(|v| v != 0)
                 .unwrap_or(false),
         })
-    }
-
-    // Unreachable: FTS5 search replaced it. Removed in T55 (issue #63) together with
-    // `escape_like_pattern`, whose only caller it is.
-    #[allow(dead_code)]
-    pub fn search_media(&self, query: &str, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        // Validate and clamp pagination parameters
-        let limit = limit.clamp(0, 1000);
-        let offset = offset.max(0);
-
-        let conn = self.get_conn()?;
-        // Escape LIKE wildcards to prevent pattern injection
-        let escaped = crate::media_utils::escape_like_pattern(query);
-        let pattern = format!("%{}%", escaped);
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
-             FROM media 
-             WHERE (file_path LIKE ?1 OR mime_type LIKE ?1) AND (is_deleted = 0 OR is_deleted IS NULL)
-             ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC 
-             LIMIT ?2 OFFSET ?3"
-        )?;
-
-        let media_iter = stmt.query_map(params![pattern, limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
-
-        let mut media = Vec::new();
-        for item in media_iter {
-            media.push(item?);
-        }
-        Ok(media)
     }
 
     /// Full-text search using FTS5 with optional filters
@@ -1778,8 +1593,7 @@ impl Database {
         // If query is empty, just return filtered results without FTS
         if query.trim().is_empty() {
             let sql = format!(
-                "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                        date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+                "SELECT {MEDIA_COLUMNS}
                  FROM media
                  WHERE {}
                  ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC
@@ -1797,40 +1611,7 @@ impl Database {
             let mut stmt = conn.prepare(&sql)?;
             let media_iter = stmt.query_map(
                 rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())),
-                |row| {
-                    Ok(MediaItem {
-                        id: row.get(0)?,
-                        file_path: row.get(1)?,
-                        file_hash: row.get(2)?,
-                        telegram_media_id: row.get(3)?,
-                        mime_type: row.get(4)?,
-                        width: row.get(5)?,
-                        height: row.get(6)?,
-                        duration: row.get(7)?,
-                        size_bytes: row.get(8)?,
-                        created_at: row.get(9)?,
-                        uploaded_at: row.get(10)?,
-                        thumbnail_path: row.get(11)?,
-                        date_taken: row.get(12)?,
-                        latitude: row.get(13)?,
-                        longitude: row.get(14)?,
-                        camera_make: row.get(15)?,
-                        camera_model: row.get(16)?,
-                        is_favorite: row.get::<_, i32>(17)? != 0,
-                        rating: row.get(18)?,
-                        is_deleted: row.get::<_, i32>(19)? != 0,
-                        deleted_at: row.get(20)?,
-                        is_archived: row
-                            .get::<_, Option<i32>>(21)?
-                            .map(|v| v != 0)
-                            .unwrap_or(false),
-                        archived_at: row.get(22)?,
-                        is_cloud_only: row
-                            .get::<_, Option<i32>>(23)?
-                            .map(|v| v != 0)
-                            .unwrap_or(false),
-                    })
-                },
+                Self::map_media_row,
             )?;
 
             let mut media = Vec::new();
@@ -1849,8 +1630,7 @@ impl Database {
             .join(" ");
 
         let sql = format!(
-            "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
-                    m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
+            "SELECT {MEDIA_COLUMNS_M}
              FROM media m
              JOIN media_fts fts ON m.id = fts.rowid
              WHERE fts.media_fts MATCH ? AND {}
@@ -1870,40 +1650,7 @@ impl Database {
         let mut stmt = conn.prepare(&sql)?;
         let media_iter = stmt.query_map(
             rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())),
-            |row| {
-                Ok(MediaItem {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    file_hash: row.get(2)?,
-                    telegram_media_id: row.get(3)?,
-                    mime_type: row.get(4)?,
-                    width: row.get(5)?,
-                    height: row.get(6)?,
-                    duration: row.get(7)?,
-                    size_bytes: row.get(8)?,
-                    created_at: row.get(9)?,
-                    uploaded_at: row.get(10)?,
-                    thumbnail_path: row.get(11)?,
-                    date_taken: row.get(12)?,
-                    latitude: row.get(13)?,
-                    longitude: row.get(14)?,
-                    camera_make: row.get(15)?,
-                    camera_model: row.get(16)?,
-                    is_favorite: row.get::<_, i32>(17)? != 0,
-                    rating: row.get(18)?,
-                    is_deleted: row.get::<_, i32>(19)? != 0,
-                    deleted_at: row.get(20)?,
-                    is_archived: row
-                        .get::<_, Option<i32>>(21)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                    archived_at: row.get(22)?,
-                    is_cloud_only: row
-                        .get::<_, Option<i32>>(23)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                })
-            },
+            Self::map_media_row,
         )?;
 
         let mut media = Vec::new();
@@ -2245,49 +1992,15 @@ impl Database {
 
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
-                    m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
+            &format!("SELECT {MEDIA_COLUMNS_M}
              FROM media m
              INNER JOIN album_media am ON m.id = am.media_id
              WHERE am.album_id = ?1 AND (m.is_deleted = 0 OR m.is_deleted IS NULL) AND (m.is_archived = 0 OR m.is_archived IS NULL)
              ORDER BY am.added_at DESC
-             LIMIT ?2 OFFSET ?3"
+             LIMIT ?2 OFFSET ?3")
         )?;
 
-        let media_iter = stmt.query_map(params![album_id, limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+        let media_iter = stmt.query_map(params![album_id, limit, offset], Self::map_media_row)?;
 
         let mut media = Vec::new();
         for item in media_iter {
@@ -2333,48 +2046,14 @@ impl Database {
 
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+            &format!("SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE is_favorite = 1 AND (is_deleted = 0 OR is_deleted IS NULL) AND (is_archived = 0 OR is_archived IS NULL)
              ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC 
-             LIMIT ?1 OFFSET ?2"
+             LIMIT ?1 OFFSET ?2")
         )?;
 
-        let media_iter = stmt.query_map([limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+        let media_iter = stmt.query_map([limit, offset], Self::map_media_row)?;
 
         let mut media = Vec::new();
         for item in media_iter {
@@ -2410,49 +2089,15 @@ impl Database {
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE is_deleted = 1
              ORDER BY deleted_at DESC 
              LIMIT ?1 OFFSET ?2"
-        )?;
+        ))?;
 
-        let media_iter = stmt.query_map([limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+        let media_iter = stmt.query_map([limit, offset], Self::map_media_row)?;
 
         let mut media = Vec::new();
         for item in media_iter {
@@ -2725,47 +2370,12 @@ impl Database {
     /// Get a single media item by ID.
     pub fn get_media_by_id(&self, media_id: i64) -> Result<Option<MediaItem>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS}
              FROM media WHERE id = ?1"
-        )?;
+        ))?;
 
-        stmt.query_row([media_id], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })
-        .optional()
+        stmt.query_row([media_id], Self::map_media_row).optional()
     }
 
     /// Check if media with the given Telegram ID is marked as cloud-only.
@@ -2789,49 +2399,15 @@ impl Database {
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE is_archived = 1 AND (is_deleted = 0 OR is_deleted IS NULL)
              ORDER BY archived_at DESC 
              LIMIT ?1 OFFSET ?2"
-        )?;
+        ))?;
 
-        let media_iter = stmt.query_map([limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+        let media_iter = stmt.query_map([limit, offset], Self::map_media_row)?;
 
         let mut media = Vec::new();
         for item in media_iter {
@@ -2846,54 +2422,15 @@ impl Database {
         let conn = self.get_conn()?;
         const PHASH_DISTANCE_THRESHOLD: u32 = 10;
 
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, 
-                    duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, 
-                    is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only, phash
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS}, phash
              FROM media
              WHERE phash IS NOT NULL AND is_deleted = 0
-             ORDER BY created_at ASC",
-        )?;
+             ORDER BY created_at ASC"
+        ))?;
 
         let candidates: Vec<(MediaItem, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    MediaItem {
-                        id: row.get(0)?,
-                        file_path: row.get(1)?,
-                        file_hash: row.get(2)?,
-                        telegram_media_id: row.get(3)?,
-                        mime_type: row.get(4)?,
-                        width: row.get(5)?,
-                        height: row.get(6)?,
-                        duration: row.get(7)?,
-                        size_bytes: row.get(8)?,
-                        created_at: row.get(9)?,
-                        uploaded_at: row.get(10)?,
-                        thumbnail_path: row.get(11)?,
-                        date_taken: row.get(12)?,
-                        latitude: row.get(13)?,
-                        longitude: row.get(14)?,
-                        camera_make: row.get(15)?,
-                        camera_model: row.get(16)?,
-                        is_favorite: row.get::<_, i32>(17)? != 0,
-                        rating: row.get(18)?,
-                        is_deleted: row.get::<_, i32>(19)? != 0,
-                        deleted_at: row.get(20)?,
-                        is_archived: row
-                            .get::<_, Option<i32>>(21)?
-                            .map(|v| v != 0)
-                            .unwrap_or(false),
-                        archived_at: row.get(22)?,
-                        is_cloud_only: row
-                            .get::<_, Option<i32>>(23)?
-                            .map(|v| v != 0)
-                            .unwrap_or(false),
-                    },
-                    row.get(24)?,
-                ))
-            })?
+            .query_map([], |row| Ok((Self::map_media_row(row)?, row.get(24)?)))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -3044,51 +2581,15 @@ impl Database {
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT DISTINCT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, 
-                    m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, 
-                    m.thumbnail_path, m.date_taken, m.latitude, m.longitude, m.camera_make, 
-                    m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
+            &format!("SELECT DISTINCT {MEDIA_COLUMNS_M}
              FROM media m
              JOIN faces f ON f.media_id = m.id
              WHERE f.person_id = ?1 AND (m.is_deleted = 0 OR m.is_deleted IS NULL) AND (m.is_archived = 0 OR m.is_archived IS NULL)
              ORDER BY m.created_at DESC
-             LIMIT ?2 OFFSET ?3",
+             LIMIT ?2 OFFSET ?3"),
         )?;
 
-        let items = stmt.query_map((person_id, limit, offset), |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+        let items = stmt.query_map((person_id, limit, offset), Self::map_media_row)?;
 
         let mut result = Vec::new();
         for item in items {
@@ -3156,48 +2657,14 @@ impl Database {
     /// Get all media items with their sync-relevant fields (for export)
     pub fn get_all_media_for_sync(&self) -> Result<Vec<MediaItem>> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS}
              FROM media 
              WHERE (is_deleted = 0 OR is_deleted IS NULL)"
-        )?;
+        ))?;
 
         let items: Vec<MediaItem> = stmt
-            .query_map([], |row| {
-                Ok(MediaItem {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    file_hash: row.get(2)?,
-                    telegram_media_id: row.get(3)?,
-                    mime_type: row.get(4)?,
-                    width: row.get(5)?,
-                    height: row.get(6)?,
-                    duration: row.get(7)?,
-                    size_bytes: row.get(8)?,
-                    created_at: row.get(9)?,
-                    uploaded_at: row.get(10)?,
-                    thumbnail_path: row.get(11)?,
-                    date_taken: row.get(12)?,
-                    latitude: row.get(13)?,
-                    longitude: row.get(14)?,
-                    camera_make: row.get(15)?,
-                    camera_model: row.get(16)?,
-                    is_favorite: row.get::<_, i32>(17)? != 0,
-                    rating: row.get(18)?,
-                    is_deleted: row.get::<_, i32>(19)? != 0,
-                    deleted_at: row.get(20)?,
-                    is_archived: row
-                        .get::<_, Option<i32>>(21)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                    archived_at: row.get(22)?,
-                    is_cloud_only: row
-                        .get::<_, Option<i32>>(23)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                })
-            })?
+            .query_map([], Self::map_media_row)?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -3249,44 +2716,12 @@ impl Database {
     pub fn get_media_by_hash(&self, hash: &str) -> Result<Option<MediaItem>> {
         let conn = self.get_conn()?;
         let result = conn.query_row(
-            "SELECT id, file_path, file_hash, telegram_media_id, mime_type, width, height, duration, size_bytes, created_at, uploaded_at, thumbnail_path,
-                    date_taken, latitude, longitude, camera_make, camera_model, is_favorite, rating, is_deleted, deleted_at, is_archived, archived_at, is_cloud_only
-             FROM media WHERE file_hash = ?1",
+            &format!(
+                "SELECT {MEDIA_COLUMNS}
+             FROM media WHERE file_hash = ?1"
+            ),
             [hash],
-            |row| {
-                Ok(MediaItem {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    file_hash: row.get(2)?,
-                    telegram_media_id: row.get(3)?,
-                    mime_type: row.get(4)?,
-                    width: row.get(5)?,
-                    height: row.get(6)?,
-                    duration: row.get(7)?,
-                    size_bytes: row.get(8)?,
-                    created_at: row.get(9)?,
-                    uploaded_at: row.get(10)?,
-                    thumbnail_path: row.get(11)?,
-                    date_taken: row.get(12)?,
-                    latitude: row.get(13)?,
-                    longitude: row.get(14)?,
-                    camera_make: row.get(15)?,
-                    camera_model: row.get(16)?,
-                    is_favorite: row.get::<_, i32>(17)? != 0,
-                    rating: row.get(18)?,
-                    is_deleted: row.get::<_, i32>(19)? != 0,
-                    deleted_at: row.get(20)?,
-                    is_archived: row
-                        .get::<_, Option<i32>>(21)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                    archived_at: row.get(22)?,
-                    is_cloud_only: row
-                        .get::<_, Option<i32>>(23)?
-                        .map(|v| v != 0)
-                        .unwrap_or(false),
-                })
-            },
+            Self::map_media_row,
         );
 
         match result {
@@ -3361,51 +2796,17 @@ impl Database {
         let limit = limit.clamp(0, MAX_PAGE_SIZE);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
-                    m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {MEDIA_COLUMNS_M}
              FROM media m
              JOIN media_tags mt ON m.id = mt.media_id
              JOIN tags t ON mt.tag_id = t.id
              WHERE t.name = ?1 AND (m.is_deleted = 0 OR m.is_deleted IS NULL)
              ORDER BY m.created_at DESC
              LIMIT ?2 OFFSET ?3"
-         )?;
+        ))?;
 
-        let media_iter = stmt.query_map(params![tag_name, limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+        let media_iter = stmt.query_map(params![tag_name, limit, offset], Self::map_media_row)?;
 
         media_iter.collect()
     }
@@ -3527,16 +2928,6 @@ impl Database {
         tx.commit()?;
         Ok(media_ids.len())
     }
-
-    pub fn reset_all_scans(&self) -> Result<usize> {
-        let conn = self.get_conn()?;
-        // Reset ALL scan status
-        let count = conn.execute("UPDATE media SET scan_status = 'pending'", [])?;
-        log::info!("Forced reset of {} media items to pending state", count);
-        Ok(count)
-    }
-
-    // Original broken function signature was here:
 
     pub fn get_tags_for_media(&self, media_id: i64) -> Result<Vec<String>> {
         let conn = self.get_conn()?;
@@ -3739,6 +3130,125 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    /// Every read that returns a `MediaItem` goes through `map_media_row`, which
+    /// addresses columns by index. A query that selects the shared list in another
+    /// order still compiles and still runs: it just loads the wrong value into each
+    /// field. Fill one row with a distinct value per column and assert that every
+    /// entry point returns the same item, so a mismatched `SELECT` fails here.
+    #[test]
+    fn every_media_read_maps_the_same_row() {
+        let temp = TempDb::new();
+        let id = {
+            let conn = temp.db.get_conn().unwrap();
+            conn.execute(
+                "INSERT INTO media (
+                     file_path, file_hash, telegram_media_id, mime_type, width, height, duration,
+                     size_bytes, created_at, uploaded_at, thumbnail_path, date_taken, latitude,
+                     longitude, camera_make, camera_model, is_favorite, rating, is_deleted,
+                     deleted_at, is_archived, archived_at, is_cloud_only
+                 ) VALUES (
+                     '/library/one.jpg', 'hash-1', '4242', 'image/jpeg', 640, 480, 12,
+                     4096, 1000, 2000, '/library/thumbs/one.jpg', '2024-01-02 03:04:05', 51.5,
+                     -0.12, 'Canon', 'EOS R', 1, 5, 0,
+                     NULL, 0, NULL, 0
+                 )",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+
+        let expected = temp.db.get_media_by_id(id).unwrap().expect("row by id");
+        assert_eq!(expected.file_path, "/library/one.jpg");
+        assert_eq!(expected.file_hash.as_deref(), Some("hash-1"));
+        assert_eq!(expected.telegram_media_id.as_deref(), Some("4242"));
+        assert_eq!(expected.mime_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(expected.width, Some(640));
+        assert_eq!(expected.height, Some(480));
+        assert_eq!(expected.duration, Some(12));
+        assert_eq!(expected.size_bytes, Some(4096));
+        assert_eq!(expected.created_at, 1000);
+        assert_eq!(expected.uploaded_at, Some(2000));
+        assert_eq!(
+            expected.thumbnail_path.as_deref(),
+            Some("/library/thumbs/one.jpg")
+        );
+        assert_eq!(expected.date_taken.as_deref(), Some("2024-01-02 03:04:05"));
+        assert_eq!(expected.latitude, Some(51.5));
+        assert_eq!(expected.longitude, Some(-0.12));
+        assert_eq!(expected.camera_make.as_deref(), Some("Canon"));
+        assert_eq!(expected.camera_model.as_deref(), Some("EOS R"));
+        assert!(expected.is_favorite);
+        assert_eq!(expected.rating, 5);
+        assert!(!expected.is_deleted);
+        assert!(!expected.is_archived);
+        assert!(!expected.is_cloud_only);
+
+        let same = |label: &str, item: &MediaItem| {
+            assert_eq!(item.id, expected.id, "{label}: id");
+            assert_eq!(item.file_path, expected.file_path, "{label}: file_path");
+            assert_eq!(item.file_hash, expected.file_hash, "{label}: file_hash");
+            assert_eq!(
+                item.telegram_media_id, expected.telegram_media_id,
+                "{label}: telegram_media_id"
+            );
+            assert_eq!(item.mime_type, expected.mime_type, "{label}: mime_type");
+            assert_eq!(item.width, expected.width, "{label}: width");
+            assert_eq!(item.height, expected.height, "{label}: height");
+            assert_eq!(item.duration, expected.duration, "{label}: duration");
+            assert_eq!(item.size_bytes, expected.size_bytes, "{label}: size_bytes");
+            assert_eq!(item.created_at, expected.created_at, "{label}: created_at");
+            assert_eq!(
+                item.uploaded_at, expected.uploaded_at,
+                "{label}: uploaded_at"
+            );
+            assert_eq!(
+                item.thumbnail_path, expected.thumbnail_path,
+                "{label}: thumbnail_path"
+            );
+            assert_eq!(item.date_taken, expected.date_taken, "{label}: date_taken");
+            assert_eq!(item.latitude, expected.latitude, "{label}: latitude");
+            assert_eq!(item.longitude, expected.longitude, "{label}: longitude");
+            assert_eq!(
+                item.camera_make, expected.camera_make,
+                "{label}: camera_make"
+            );
+            assert_eq!(
+                item.camera_model, expected.camera_model,
+                "{label}: camera_model"
+            );
+            assert_eq!(
+                item.is_favorite, expected.is_favorite,
+                "{label}: is_favorite"
+            );
+            assert_eq!(item.rating, expected.rating, "{label}: rating");
+            assert_eq!(item.is_cloud_only, expected.is_cloud_only, "{label}: cloud");
+        };
+
+        same("get_media", &temp.db.get_media(10, 0).unwrap()[0]);
+        same(
+            "get_media_by_ids",
+            &temp.db.get_media_by_ids(&[id]).unwrap()[0],
+        );
+        same("get_top_rated", &temp.db.get_top_rated(10, 0).unwrap()[0]);
+        same("get_favorites", &temp.db.get_favorites(10, 0).unwrap()[0]);
+        same(
+            "get_all_media_for_sync",
+            &temp.db.get_all_media_for_sync().unwrap()[0],
+        );
+        same(
+            "search_fts",
+            &temp
+                .db
+                .search_fts("", &camera_filter("Canon"), 10, 0)
+                .unwrap()[0],
+        );
+        same(
+            "get_next_item_to_scan",
+            &temp.db.get_next_item_to_scan().unwrap().expect("pending"),
+        );
     }
 
     /// Insert a row with a camera, for the filter tests.
