@@ -476,8 +476,7 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init());
+        .plugin(tauri_plugin_dialog::init());
 
     // The MCP bridge is a development tool and must never reach a distributed
     // build. Its WebSocket server has no authentication and exposes `execute_js`,
