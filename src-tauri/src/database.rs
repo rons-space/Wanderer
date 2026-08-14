@@ -5,6 +5,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use time::OffsetDateTime;
 
+/// Largest page any paginated read will return.
+///
+/// The limit and offset on these methods come from the frontend, where a negative
+/// limit means "no limit" to SQLite and a negative offset is an error. Clamping here
+/// rather than at each call site means a caller that forgets cannot ask the database
+/// to materialize an entire library into memory.
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// Most values bound into one statement built from a variable-length list.
+///
+/// SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` is 32766 on current builds and 999 on
+/// older ones. Selecting or updating every item in a large library would exceed that
+/// and fail the whole call, so those queries are chunked well under the smaller limit.
+const MAX_SQL_VARIABLES: usize = 500;
+
+/// Escape a value for use in a `LIKE` pattern.
+///
+/// The escape character has to be declared by the query with `ESCAPE '\\'`; without
+/// that clause SQLite treats the backslashes as literal text and the pattern silently
+/// stops matching. Unescaped, a `%` typed by the user turns their filter into a
+/// wildcard, which is a correctness bug rather than an injection one now that the
+/// value is bound.
+fn escape_like_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaItem {
     pub id: i64,
@@ -1435,6 +1464,16 @@ impl Database {
         if media_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // One statement per chunk: a selection of every item in a large library would
+        // otherwise build a query with more placeholders than SQLite accepts and fail
+        // outright, which is a worse answer than doing it in several round trips.
+        if media_ids.len() > MAX_SQL_VARIABLES {
+            let mut all = Vec::with_capacity(media_ids.len());
+            for chunk in media_ids.chunks(MAX_SQL_VARIABLES) {
+                all.extend(self.get_media_by_ids(chunk)?);
+            }
+            return Ok(all);
+        }
         let conn = self.get_conn()?;
         let placeholders = media_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
@@ -1683,38 +1722,46 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
-        let limit = limit.clamp(0, 1000);
+        let limit = limit.clamp(0, MAX_PAGE_SIZE);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
 
-        // Build dynamic WHERE clause based on filters
+        // Build dynamic WHERE clause based on filters.
+        //
+        // The shape of the clause varies, the values in it never do: every filter
+        // contributes an anonymous `?` and pushes its value here, in the same order.
+        // `camera_make` used to be interpolated with doubled quotes, which is the one
+        // filter carrying a user-controlled string and so the one place where an
+        // escaping mistake would have been an injection into the query text.
         let mut conditions = vec![
             "(is_deleted = 0 OR is_deleted IS NULL)".to_string(),
             "(is_archived = 0 OR is_archived IS NULL)".to_string(),
         ];
+        let mut filter_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if filters.favorites_only {
             conditions.push("is_favorite = 1".to_string());
         }
 
         if let Some(min_rating) = filters.min_rating {
-            conditions.push(format!("rating >= {}", min_rating.clamp(0, 5)));
+            conditions.push("rating >= ?".to_string());
+            filter_values.push(Box::new(min_rating.clamp(0, 5)));
         }
 
         if let Some(date_from) = filters.date_from {
-            conditions.push(format!("created_at >= {}", date_from));
+            conditions.push("created_at >= ?".to_string());
+            filter_values.push(Box::new(date_from));
         }
 
         if let Some(date_to) = filters.date_to {
-            conditions.push(format!("created_at <= {}", date_to));
+            conditions.push("created_at <= ?".to_string());
+            filter_values.push(Box::new(date_to));
         }
 
         if let Some(camera) = &filters.camera_make {
             if !camera.is_empty() {
-                conditions.push(format!(
-                    "camera_make LIKE '%{}%'",
-                    camera.replace('\'', "''")
-                ));
+                conditions.push("camera_make LIKE ? ESCAPE '\\'".to_string());
+                filter_values.push(Box::new(format!("%{}%", escape_like_value(camera))));
             }
         }
 
@@ -1736,14 +1783,94 @@ impl Database {
                  FROM media
                  WHERE {}
                  ORDER BY COALESCE(date_taken, datetime(created_at, 'unixepoch')) DESC
-                 LIMIT ?1 OFFSET ?2",
+                 LIMIT ? OFFSET ?",
                 where_clause
             );
+
+            // Positional binding: the filter values in clause order, then the page.
+            let mut values = filter_values;
+            values.push(Box::new(limit));
+            values.push(Box::new(offset));
 
             // Not `prepare_cached`: this SQL is built per call, and rusqlite's cache is a
             // small LRU, so variable statements would evict the fixed ones that repeat.
             let mut stmt = conn.prepare(&sql)?;
-            let media_iter = stmt.query_map(params![limit, offset], |row| {
+            let media_iter = stmt.query_map(
+                rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())),
+                |row| {
+                    Ok(MediaItem {
+                        id: row.get(0)?,
+                        file_path: row.get(1)?,
+                        file_hash: row.get(2)?,
+                        telegram_media_id: row.get(3)?,
+                        mime_type: row.get(4)?,
+                        width: row.get(5)?,
+                        height: row.get(6)?,
+                        duration: row.get(7)?,
+                        size_bytes: row.get(8)?,
+                        created_at: row.get(9)?,
+                        uploaded_at: row.get(10)?,
+                        thumbnail_path: row.get(11)?,
+                        date_taken: row.get(12)?,
+                        latitude: row.get(13)?,
+                        longitude: row.get(14)?,
+                        camera_make: row.get(15)?,
+                        camera_model: row.get(16)?,
+                        is_favorite: row.get::<_, i32>(17)? != 0,
+                        rating: row.get(18)?,
+                        is_deleted: row.get::<_, i32>(19)? != 0,
+                        deleted_at: row.get(20)?,
+                        is_archived: row
+                            .get::<_, Option<i32>>(21)?
+                            .map(|v| v != 0)
+                            .unwrap_or(false),
+                        archived_at: row.get(22)?,
+                        is_cloud_only: row
+                            .get::<_, Option<i32>>(23)?
+                            .map(|v| v != 0)
+                            .unwrap_or(false),
+                    })
+                },
+            )?;
+
+            let mut media = Vec::new();
+            for item in media_iter {
+                media.push(item?);
+            }
+            return Ok(media);
+        }
+
+        // FTS5 search with JOIN to media table
+        // Escape FTS5 special characters and add prefix matching
+        let fts_query = query
+            .split_whitespace()
+            .map(|word| format!("\"{}\"*", word.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let sql = format!(
+            "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
+                    m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
+             FROM media m
+             JOIN media_fts fts ON m.id = fts.rowid
+             WHERE fts.media_fts MATCH ? AND {}
+             ORDER BY rank, COALESCE(m.date_taken, datetime(m.created_at, 'unixepoch')) DESC
+             LIMIT ? OFFSET ?",
+            where_clause
+        );
+
+        // The MATCH placeholder comes first in the text, so it binds first.
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query)];
+        values.extend(filter_values);
+        values.push(Box::new(limit));
+        values.push(Box::new(offset));
+
+        // Not `prepare_cached`: this SQL is built per call, and rusqlite's cache is a
+        // small LRU, so variable statements would evict the fixed ones that repeat.
+        let mut stmt = conn.prepare(&sql)?;
+        let media_iter = stmt.query_map(
+            rusqlite::params_from_iter(values.iter().map(|v| v.as_ref())),
+            |row| {
                 Ok(MediaItem {
                     id: row.get(0)?,
                     file_path: row.get(1)?,
@@ -1776,71 +1903,8 @@ impl Database {
                         .map(|v| v != 0)
                         .unwrap_or(false),
                 })
-            })?;
-
-            let mut media = Vec::new();
-            for item in media_iter {
-                media.push(item?);
-            }
-            return Ok(media);
-        }
-
-        // FTS5 search with JOIN to media table
-        // Escape FTS5 special characters and add prefix matching
-        let fts_query = query
-            .split_whitespace()
-            .map(|word| format!("\"{}\"*", word.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let sql = format!(
-            "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
-                    m.date_taken, m.latitude, m.longitude, m.camera_make, m.camera_model, m.is_favorite, m.rating, m.is_deleted, m.deleted_at, m.is_archived, m.archived_at, m.is_cloud_only
-             FROM media m
-             JOIN media_fts fts ON m.id = fts.rowid
-             WHERE fts.media_fts MATCH ?1 AND {}
-             ORDER BY rank, COALESCE(m.date_taken, datetime(m.created_at, 'unixepoch')) DESC
-             LIMIT ?2 OFFSET ?3",
-            where_clause
-        );
-
-        // Not `prepare_cached`: this SQL is built per call, and rusqlite's cache is a
-        // small LRU, so variable statements would evict the fixed ones that repeat.
-        let mut stmt = conn.prepare(&sql)?;
-        let media_iter = stmt.query_map(params![fts_query, limit, offset], |row| {
-            Ok(MediaItem {
-                id: row.get(0)?,
-                file_path: row.get(1)?,
-                file_hash: row.get(2)?,
-                telegram_media_id: row.get(3)?,
-                mime_type: row.get(4)?,
-                width: row.get(5)?,
-                height: row.get(6)?,
-                duration: row.get(7)?,
-                size_bytes: row.get(8)?,
-                created_at: row.get(9)?,
-                uploaded_at: row.get(10)?,
-                thumbnail_path: row.get(11)?,
-                date_taken: row.get(12)?,
-                latitude: row.get(13)?,
-                longitude: row.get(14)?,
-                camera_make: row.get(15)?,
-                camera_model: row.get(16)?,
-                is_favorite: row.get::<_, i32>(17)? != 0,
-                rating: row.get(18)?,
-                is_deleted: row.get::<_, i32>(19)? != 0,
-                deleted_at: row.get(20)?,
-                is_archived: row
-                    .get::<_, Option<i32>>(21)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                archived_at: row.get(22)?,
-                is_cloud_only: row
-                    .get::<_, Option<i32>>(23)?
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-            })
-        })?;
+            },
+        )?;
 
         let mut media = Vec::new();
         for item in media_iter {
@@ -2016,6 +2080,13 @@ impl Database {
         if media_ids.is_empty() {
             return Ok(0);
         }
+        if media_ids.len() > MAX_SQL_VARIABLES {
+            let mut total = 0;
+            for chunk in media_ids.chunks(MAX_SQL_VARIABLES) {
+                total += self.bulk_set_favorite(chunk, is_favorite)?;
+            }
+            return Ok(total);
+        }
         let conn = self.get_conn()?;
         let placeholders = media_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
@@ -2038,6 +2109,13 @@ impl Database {
     pub fn bulk_soft_delete(&self, media_ids: &[i64]) -> Result<usize> {
         if media_ids.is_empty() {
             return Ok(0);
+        }
+        if media_ids.len() > MAX_SQL_VARIABLES {
+            let mut total = 0;
+            for chunk in media_ids.chunks(MAX_SQL_VARIABLES) {
+                total += self.bulk_soft_delete(chunk)?;
+            }
+            return Ok(total);
         }
         let conn = self.get_conn()?;
         let deleted_at = OffsetDateTime::now_utc().unix_timestamp();
@@ -2959,6 +3037,11 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
+        // Clamped like every other paginated read: a negative limit reaches SQLite as
+        // "no limit" and a negative offset is an error, and both arrive straight from
+        // the frontend.
+        let limit = limit.clamp(0, MAX_PAGE_SIZE);
+        let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT DISTINCT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, 
@@ -3275,6 +3358,8 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
+        let limit = limit.clamp(0, MAX_PAGE_SIZE);
+        let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT m.id, m.file_path, m.file_hash, m.telegram_media_id, m.mime_type, m.width, m.height, m.duration, m.size_bytes, m.created_at, m.uploaded_at, m.thumbnail_path,
@@ -3654,6 +3739,115 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    /// Insert a row with a camera, for the filter tests.
+    fn insert_media_with_camera(db: &Database, path: &str, camera: &str) -> i64 {
+        let conn = db.get_conn().unwrap();
+        conn.execute(
+            "INSERT INTO media (file_path, created_at, camera_make) VALUES (?1, 0, ?2)",
+            rusqlite::params![path, camera],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn camera_filter(camera: &str) -> SearchFilters {
+        SearchFilters {
+            favorites_only: false,
+            min_rating: None,
+            date_from: None,
+            date_to: None,
+            camera_make: Some(camera.to_string()),
+            has_location: None,
+        }
+    }
+
+    #[test]
+    fn like_escaping_covers_the_three_special_characters() {
+        assert_eq!(escape_like_value("Canon"), "Canon");
+        assert_eq!(escape_like_value("100%"), "100\\%");
+        assert_eq!(escape_like_value("a_b"), "a\\_b");
+        // The backslash first, or escaping the others would double-escape it.
+        assert_eq!(escape_like_value("a\\b"), "a\\\\b");
+    }
+
+    /// The filter value is user input reaching a `WHERE` clause. It used to be
+    /// interpolated with doubled quotes; anything the escaping missed was query text.
+    #[test]
+    fn a_camera_filter_is_bound_rather_than_interpolated() {
+        let temp = TempDb::new();
+        insert_media_with_camera(&temp.db, "/library/a.jpg", "Canon");
+        insert_media_with_camera(&temp.db, "/library/b.jpg", "Nikon");
+
+        let hostile = "Canon' OR 1=1 --";
+        let found = temp
+            .db
+            .search_fts("", &camera_filter(hostile), 100, 0)
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "a quote in the filter must be a value, not syntax: {:?}",
+            found.iter().map(|m| &m.file_path).collect::<Vec<_>>()
+        );
+
+        let found = temp
+            .db
+            .search_fts("", &camera_filter("Canon"), 100, 0)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_path, "/library/a.jpg");
+    }
+
+    /// `%` in a `LIKE` pattern is a wildcard, so an unescaped one silently widens the
+    /// user's filter instead of matching what they typed.
+    #[test]
+    fn a_wildcard_in_a_camera_filter_matches_literally() {
+        let temp = TempDb::new();
+        insert_media_with_camera(&temp.db, "/library/literal.jpg", "C%N");
+        insert_media_with_camera(&temp.db, "/library/canon.jpg", "CANON");
+
+        let found = temp
+            .db
+            .search_fts("", &camera_filter("C%N"), 100, 0)
+            .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|m| m.file_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/library/literal.jpg"]
+        );
+    }
+
+    /// Both come straight from the frontend. A negative limit means "no limit" to
+    /// SQLite, and a negative offset is an error rather than a page.
+    #[test]
+    fn paginated_reads_clamp_their_limit_and_offset() {
+        let temp = TempDb::new();
+        insert_media_with_camera(&temp.db, "/library/a.jpg", "Canon");
+
+        assert!(temp.db.get_media_by_person(1, -1, -5).is_ok());
+        assert!(temp.db.get_media_by_tag("holiday", -1, -5).is_ok());
+        assert!(temp
+            .db
+            .search_fts("", &camera_filter("Canon"), -1, -5)
+            .is_ok());
+    }
+
+    /// More ids than SQLite will accept as bound variables in one statement.
+    #[test]
+    fn reads_and_bulk_writes_chunk_long_id_lists() {
+        let temp = TempDb::new();
+        let ids: Vec<i64> = (0..(MAX_SQL_VARIABLES * 2 + 1))
+            .map(|i| insert_media_with_camera(&temp.db, &format!("/library/{}.jpg", i), "Canon"))
+            .collect();
+
+        let found = temp.db.get_media_by_ids(&ids).unwrap();
+        assert_eq!(found.len(), ids.len());
+
+        assert_eq!(temp.db.bulk_set_favorite(&ids, true).unwrap(), ids.len());
+        assert_eq!(temp.db.bulk_soft_delete(&ids).unwrap(), ids.len());
     }
 
     fn fts_matches(conn: &Connection, query: &str) -> Vec<i64> {
