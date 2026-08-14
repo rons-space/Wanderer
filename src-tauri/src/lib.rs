@@ -1,6 +1,5 @@
 mod ai;
 mod backup;
-mod cache;
 mod clip;
 mod database;
 mod errors;
@@ -29,7 +28,6 @@ struct AppState {
     telegram: Arc<TelegramService>,
     db: Mutex<Option<Arc<Database>>>,
     watcher: Mutex<Option<watcher::FileWatcher>>,
-    cache: cache::ThumbnailCache,
     security_runtime: Arc<Mutex<RuntimeState>>,
     /// Face detector is optional - AI features gracefully degrade if model fails to load
     face_detector: Option<Arc<Mutex<ai::FaceDetector>>>,
@@ -880,9 +878,6 @@ pub fn run() {
     let telegram_service = Arc::new(TelegramService::new());
     let security_runtime = Arc::new(Mutex::new(RuntimeState::default()));
 
-    // Initialize Cache (Capacity 2000 items)
-    let thumbnail_cache = cache::ThumbnailCache::new(2000);
-
     // Initialize AI Face Detector - gracefully degrade if unavailable
     let face_detector: Option<Arc<Mutex<ai::FaceDetector>>> = match ai::FaceDetector::new() {
         Ok(fd) => {
@@ -921,15 +916,11 @@ pub fn run() {
             telegram: telegram_service,
             db: Mutex::new(None),
             watcher: Mutex::new(None),
-            cache: thumbnail_cache.clone(),
             security_runtime,
             face_detector: face_detector,
         })
         .setup(move |app| {
             let app_handle = app.handle().clone();
-
-            // Pass cache to logic
-            let setup_cache = thumbnail_cache.clone();
 
             tauri::async_runtime::spawn(async move {
                 // Initialize State with cache
@@ -1048,7 +1039,6 @@ pub fn run() {
                         cache_dir,
                         db.clone(),
                         app_handle.clone(),
-                        setup_cache.clone(),
                         state.security_runtime.clone(),
                     ) {
                         Ok(w) => {
@@ -1096,7 +1086,6 @@ pub fn run() {
                         state.telegram.clone(),
                         app_dir.join("backup").to_string_lossy().to_string(),
                         app_handle.clone(),
-                        setup_cache.clone(),
                         state.security_runtime.clone(),
                     );
                     let sync_worker = Arc::new(sync_worker);

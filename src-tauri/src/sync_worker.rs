@@ -1,4 +1,3 @@
-use crate::cache::ThumbnailCache;
 use crate::database::Database;
 use crate::media_utils;
 use crate::security::{self, RuntimeState};
@@ -17,7 +16,6 @@ pub struct SyncWorker {
     telegram: Arc<TelegramService>,
     backup_path: String,
     app_handle: AppHandle,
-    cache: ThumbnailCache,
     security_runtime: Arc<Mutex<RuntimeState>>,
 }
 
@@ -27,7 +25,6 @@ impl SyncWorker {
         telegram: Arc<TelegramService>,
         backup_path: String,
         app_handle: AppHandle,
-        cache: ThumbnailCache,
         security_runtime: Arc<Mutex<RuntimeState>>,
     ) -> Self {
         Self {
@@ -35,7 +32,6 @@ impl SyncWorker {
             telegram,
             backup_path,
             app_handle,
-            cache,
             security_runtime,
         }
     }
@@ -284,11 +280,7 @@ impl SyncWorker {
 
         let mut thumbnail_path =
             match media_utils::generate_thumbnail(temp_path, &cache_dir, &hash, 300).await {
-                Ok(Some(thumb_path)) => {
-                    // Insert into LRU Cache
-                    self.cache.insert(hash.clone(), thumb_path.clone()).await;
-                    Some(thumb_path.to_string_lossy().to_string())
-                }
+                Ok(Some(thumb_path)) => Some(thumb_path.to_string_lossy().to_string()),
                 Ok(None) => None,
                 Err(e) => {
                     warn!("SyncWorker: Thumbnail failed: {}", e);
