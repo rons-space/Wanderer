@@ -21,9 +21,15 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 const MAGIC_V1: &[u8; 6] = b"WBENC1";
 const FILE_VERSION_V1: u8 = 1;
 
-/// The v2 stream. See `encrypt_stream` for the layout and what each field buys.
+/// The v2 stream. Header-authenticated and terminated, but every file was
+/// encrypted directly under the master key with a 12 byte nonce whose last four
+/// bytes the chunk counter overwrote. Still read, never written.
 const MAGIC_V2: &[u8; 6] = b"WBENC2";
 const FILE_VERSION_V2: u8 = 2;
+
+/// The v3 stream. Same framing as v2, but keyed per file. See `encrypt_stream`.
+const MAGIC_V3: &[u8; 6] = b"WBENC3";
+const FILE_VERSION_V3: u8 = 3;
 
 const DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024; // 1MB
 
@@ -37,6 +43,16 @@ const KEY_ID_LEN: usize = 8;
 
 /// magic 6 || version 1 || chunk_size 4 || base_nonce 12 || key_id 8.
 const V2_HEADER_LEN: usize = 6 + 1 + 4 + 12 + KEY_ID_LEN;
+
+/// Random per-file value that the file's own encryption key is derived from.
+///
+/// 16 bytes rather than the 8 that would be enough to index a file: this is the
+/// only thing separating one file's keystream from another's, so it is sized as
+/// key-derivation input, not as an identifier.
+const FILE_ID_LEN: usize = 16;
+
+/// magic 6 || version 1 || chunk_size 4 || file_id 16 || key_id 8.
+const V3_HEADER_LEN: usize = 6 + 1 + 4 + FILE_ID_LEN + KEY_ID_LEN;
 
 /// Domain separators in the associated data, so a data chunk can never be replayed
 /// as the terminator and the terminator can never be replayed as chunk zero.
@@ -163,9 +179,7 @@ impl SecurityBundle {
     }
 
     pub fn new_encrypted(passphrase: &str) -> Result<(Self, Zeroizing<String>, MasterKey)> {
-        if passphrase.trim().len() < 8 {
-            return Err(anyhow!("Passphrase must be at least 8 characters"));
-        }
+        validate_passphrase(passphrase)?;
 
         let mut key_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key_bytes);
@@ -174,8 +188,9 @@ impl SecurityBundle {
 
         let passphrase_wrap = wrap_master_key_with_secret(passphrase.as_bytes(), &master_key)?;
         let recovery_key = generate_recovery_key();
-        let recovery_wrap = wrap_master_key_with_secret(recovery_key.as_bytes(), &master_key)?;
-        let verifier_phc = hash_recovery_key(&recovery_key)?;
+        let normalized = normalize_recovery_key(&recovery_key);
+        let recovery_wrap = wrap_master_key_with_secret(normalized.as_bytes(), &master_key)?;
+        let verifier_phc = hash_recovery_key(&normalized)?;
 
         let mut key_id_bytes = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut key_id_bytes);
@@ -222,19 +237,66 @@ impl SecurityBundle {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing recovery data"))?;
 
-        if !verify_recovery_key(recovery_key, &recovery.verifier_phc)? {
+        let normalized = normalize_recovery_key(recovery_key);
+        if !verify_recovery_key(&normalized, &recovery.verifier_phc)? {
             return Err(anyhow!("Invalid recovery key"));
         }
 
-        unwrap_master_key_with_secret(recovery_key.as_bytes(), &recovery.wrap)
+        unwrap_master_key_with_secret(normalized.as_bytes(), &recovery.wrap)
     }
 
+    /// Reset the passphrase using the recovery key, and burn the recovery key.
+    ///
+    /// The recovery key is now spent. It has been typed into a machine, and it
+    /// came from wherever the user was keeping it, which after a forgotten
+    /// passphrase is often somewhere they no longer control. Leaving it valid
+    /// meant a reset changed the passphrase while the credential that bypasses
+    /// the passphrase stayed exactly as it was, so whoever had a copy of the
+    /// printout still held the vault.
+    ///
+    /// Both the wrap and the verifier are replaced, and the new key comes back
+    /// for the caller to show once. The old passphrase is not required, by
+    /// design: not having it is the reason to be here.
     pub fn recover_and_rewrap(
         &self,
         recovery_key: &str,
         new_passphrase: &str,
-    ) -> Result<(Self, MasterKey)> {
+    ) -> Result<(Self, Zeroizing<String>, MasterKey)> {
+        validate_passphrase(new_passphrase)?;
         let master_key = self.unlock_with_recovery_key(recovery_key)?;
+        let passphrase_wrap = wrap_master_key_with_secret(new_passphrase.as_bytes(), &master_key)?;
+
+        let new_recovery_key = generate_recovery_key();
+        let normalized = normalize_recovery_key(&new_recovery_key);
+        let recovery_wrap = wrap_master_key_with_secret(normalized.as_bytes(), &master_key)?;
+        let verifier_phc = hash_recovery_key(&normalized)?;
+
+        let mut next = self.clone();
+        next.passphrase_wrap = Some(passphrase_wrap);
+        next.recovery = Some(RecoveryData {
+            verifier_phc,
+            wrap: recovery_wrap,
+        });
+        Ok((next, new_recovery_key, master_key))
+    }
+
+    /// Change the passphrase for someone who still knows the current one.
+    ///
+    /// Only the passphrase wrap is rewritten: the master key is unchanged, so
+    /// nothing already encrypted has to be rewritten, and the recovery key is
+    /// left alone because it has not been exposed. Rotating it here would force
+    /// the user to file a new printout every time they changed a passphrase,
+    /// which is how printouts stop being filed.
+    pub fn change_passphrase(
+        &self,
+        current_passphrase: &str,
+        new_passphrase: &str,
+    ) -> Result<(Self, MasterKey)> {
+        validate_passphrase(new_passphrase)?;
+        // Unwrapping with the current passphrase is the authorization check:
+        // there is nothing else to verify against, and a wrong passphrase
+        // cannot produce the key.
+        let master_key = self.unlock_with_passphrase(current_passphrase)?;
         let passphrase_wrap = wrap_master_key_with_secret(new_passphrase.as_bytes(), &master_key)?;
 
         let mut next = self.clone();
@@ -248,12 +310,47 @@ impl SecurityBundle {
     ) -> Result<(Self, Zeroizing<String>, MasterKey)> {
         let master_key = self.unlock_with_passphrase(passphrase)?;
         let new_recovery_key = generate_recovery_key();
-        let wrap = wrap_master_key_with_secret(new_recovery_key.as_bytes(), &master_key)?;
-        let verifier_phc = hash_recovery_key(&new_recovery_key)?;
+        let normalized = normalize_recovery_key(&new_recovery_key);
+        let wrap = wrap_master_key_with_secret(normalized.as_bytes(), &master_key)?;
+        let verifier_phc = hash_recovery_key(&normalized)?;
         let mut next = self.clone();
         next.recovery = Some(RecoveryData { verifier_phc, wrap });
         Ok((next, new_recovery_key, master_key))
     }
+}
+
+/// The one place the passphrase rule lives.
+///
+/// It was written out at each call site, which is how the reset path came to
+/// have no check at all: `recover_and_rewrap` would happily wrap the master key
+/// under a one-character passphrase, undoing the requirement the user met when
+/// they first enabled encryption.
+///
+/// The length is measured on the trimmed string but the passphrase is used
+/// untrimmed, deliberately: leading and trailing spaces are part of a
+/// passphrase someone chose, and silently dropping them would lock out anyone
+/// who typed one. Trimming only decides whether there is enough substance to
+/// count, so "       x" is refused rather than accepted as eight characters.
+pub const MIN_PASSPHRASE_LEN: usize = 8;
+
+pub fn validate_passphrase(passphrase: &str) -> Result<()> {
+    if passphrase.trim().chars().count() < MIN_PASSPHRASE_LEN {
+        return Err(anyhow!(
+            "Passphrase must be at least {} characters",
+            MIN_PASSPHRASE_LEN
+        ));
+    }
+    Ok(())
+}
+
+/// The canonical form of a recovery key, used everywhere it is consumed.
+///
+/// The verifier hashed the trimmed key while the unwrap used the raw one, so a
+/// key pasted with a trailing newline (which is most of them, coming out of the
+/// downloaded text file) passed verification and then failed to unwrap, with an
+/// error blaming the key. Both sides go through here now.
+fn normalize_recovery_key(recovery_key: &str) -> String {
+    recovery_key.trim().to_uppercase()
 }
 
 fn unix_ts() -> i64 {
@@ -342,11 +439,13 @@ fn unwrap_master_key_with_secret(secret: &[u8], wrapped: &WrappedMasterKey) -> R
     Ok(key)
 }
 
+/// Takes an already-normalized key. Callers go through `normalize_recovery_key`
+/// so that the verifier and the wrap can never disagree about what was hashed.
 fn hash_recovery_key(recovery_key: &str) -> Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = argon2id_params()?;
     argon2
-        .hash_password(recovery_key.trim().as_bytes(), &salt)
+        .hash_password(recovery_key.as_bytes(), &salt)
         .map(|phc| phc.to_string())
         .map_err(|e| anyhow!("Failed to hash recovery key: {}", e))
 }
@@ -356,7 +455,7 @@ fn verify_recovery_key(recovery_key: &str, verifier_phc: &str) -> Result<bool> {
         PasswordHash::new(verifier_phc).map_err(|e| anyhow!("Invalid verifier hash: {}", e))?;
     let argon2 = argon2id_params()?;
     Ok(argon2
-        .verify_password(recovery_key.trim().as_bytes(), &parsed)
+        .verify_password(recovery_key.as_bytes(), &parsed)
         .is_ok())
 }
 
@@ -402,6 +501,47 @@ fn chunk_aad(header: &[u8], chunk_idx: u32, kind: u8) -> Vec<u8> {
     aad
 }
 
+/// The key a single v3 file is encrypted under.
+///
+/// v2 encrypted every file directly under the master key with a random 12 byte
+/// base nonce whose last four bytes the chunk counter then overwrote, leaving
+/// 64 bits of per-file entropy. AES-GCM fails catastrophically on nonce reuse
+/// (two chunks under one nonce leak their XOR and, worse, the GHASH
+/// authentication key), and 64 bits puts the birthday bound at around four
+/// billion files: far away, but not a number a photo library should be
+/// measured against at all.
+///
+/// Deriving per file moves the uniqueness requirement onto a 128 bit random
+/// value, and means the nonce only has to be unique *within* one file, where a
+/// counter makes it so by construction.
+///
+/// SHA-256 as the KDF rather than HKDF: this is a single fixed-length output
+/// from a uniformly random 256 bit key, which is exactly the case where the
+/// extract step buys nothing. The key goes before the file id and the whole
+/// digest is consumed, so length extension has nothing to extend.
+fn derive_file_key(master_key: &MasterKey, file_id: &[u8; FILE_ID_LEN]) -> Zeroizing<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"wanderer-wbenc3-file-key");
+    hasher.update(master_key.expose());
+    hasher.update(file_id);
+    let digest = hasher.finalize();
+
+    let mut out = Zeroizing::new([0u8; 32]);
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// The nonce for one chunk of a v3 file.
+///
+/// Just the counter, zero-padded. The file key is already unique to this file,
+/// so the nonce only has to be unique within it, and a `u32` counter over 1 MB
+/// chunks covers four petabytes.
+fn v3_chunk_nonce(chunk_idx: u32) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[8..12].copy_from_slice(&chunk_idx.to_le_bytes());
+    nonce
+}
+
 fn derive_chunk_nonce(base_nonce: &[u8; 12], chunk_idx: u32) -> [u8; 12] {
     let mut nonce = *base_nonce;
     nonce[8..12].copy_from_slice(&chunk_idx.to_le_bytes());
@@ -420,7 +560,7 @@ pub fn is_encrypted_file(path: &Path) -> Result<bool> {
     if read != 6 {
         return Ok(false);
     }
-    Ok(&magic == MAGIC_V2 || &magic == MAGIC_V1)
+    Ok(&magic == MAGIC_V3 || &magic == MAGIC_V2 || &magic == MAGIC_V1)
 }
 
 pub fn encrypt_file(input_path: &Path, output_path: &Path, key: &MasterKey) -> Result<()> {
@@ -446,18 +586,19 @@ pub fn encrypt_file(input_path: &Path, output_path: &Path, key: &MasterKey) -> R
     encrypt_stream(&mut reader, &mut writer, key)
 }
 
-/// Write a `WBENC2` stream for everything `reader` yields.
+/// Write a `WBENC3` stream for everything `reader` yields.
 ///
 /// Layout:
 ///
 /// ```text
-/// "WBENC2" | version | chunk_size | base_nonce | key_id | chunk* | terminator
-///        6 |       1 |          4 |         12 |      8 |        |
+/// "WBENC3" | version | chunk_size | file_id | key_id | chunk* | terminator
+///        6 |       1 |          4 |      16 |      8 |        |
 /// ```
 ///
 /// where each chunk and the terminator are `len: u32 || ciphertext`, and the whole
-/// 31 byte header is the associated data of every one of them. Three things v1 got
-/// wrong, in order of how much they mattered:
+/// 35 byte header is the associated data of every one of them.
+///
+/// What v1 got wrong, in order of how much it mattered:
 ///
 /// 1. **Nothing authenticated the header.** `chunk_size` and `base_nonce` sat in
 ///    plaintext that no tag covered. Binding them means an edited header now fails
@@ -469,6 +610,16 @@ pub fn encrypt_file(input_path: &Path, output_path: &Path, key: &MasterKey) -> R
 ///    count. Bytes appended after the terminator are rejected too.
 /// 3. **Nothing said which key.** The key id turns "every chunk fails its tag" into
 ///    "this file was written with a different key".
+///
+/// What v2 still got wrong, and why the format moved again: every file was
+/// encrypted directly under the master key, and the 12 byte random base nonce
+/// had its last four bytes overwritten by the chunk counter, so files were
+/// separated by 64 bits of entropy. v3 replaces the base nonce with a 128 bit
+/// `file_id` and encrypts under a key derived from it, which makes the nonce a
+/// within-file counter and takes the collision question off the table. The
+/// header is one byte longer per field but the framing is unchanged, and v1 and
+/// v2 streams still decrypt: they are in every library encrypted before this and
+/// in every blob already uploaded to Telegram.
 ///
 /// The count lives in the terminator rather than the header because the header is
 /// written before the input has been read, and this encrypts a `Read` of unknown
@@ -482,19 +633,20 @@ pub fn encrypt_stream<R: Read, W: Write>(
     writer: &mut W,
     key: &MasterKey,
 ) -> Result<()> {
-    let mut base_nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut base_nonce);
+    let mut file_id = [0u8; FILE_ID_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut file_id);
 
-    let mut header = Vec::with_capacity(V2_HEADER_LEN);
-    header.extend_from_slice(MAGIC_V2);
-    header.push(FILE_VERSION_V2);
+    let mut header = Vec::with_capacity(V3_HEADER_LEN);
+    header.extend_from_slice(MAGIC_V3);
+    header.push(FILE_VERSION_V3);
     header.extend_from_slice(&DEFAULT_CHUNK_SIZE.to_le_bytes());
-    header.extend_from_slice(&base_nonce);
+    header.extend_from_slice(&file_id);
     header.extend_from_slice(&key_id(key));
-    debug_assert_eq!(header.len(), V2_HEADER_LEN);
+    debug_assert_eq!(header.len(), V3_HEADER_LEN);
     writer.write_all(&header)?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.expose()));
+    let file_key = derive_file_key(key, &file_id);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(file_key.as_ref()));
     let mut chunk_buf = vec![0u8; DEFAULT_CHUNK_SIZE as usize];
     let mut chunk_idx: u32 = 0;
 
@@ -504,7 +656,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
             break;
         }
 
-        let nonce = derive_chunk_nonce(&base_nonce, chunk_idx);
+        let nonce = v3_chunk_nonce(chunk_idx);
         let aad = chunk_aad(&header, chunk_idx, CHUNK_KIND_DATA);
         let payload = Payload {
             msg: &chunk_buf[..n],
@@ -525,7 +677,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     // The terminator: no plaintext, so it is exactly a tag, and its index is one past
     // the last data chunk, so it never reuses a nonce. Its associated data carries the
     // number of data chunks that came before it.
-    let nonce = derive_chunk_nonce(&base_nonce, chunk_idx);
+    let nonce = v3_chunk_nonce(chunk_idx);
     let aad = chunk_aad(&header, chunk_idx, CHUNK_KIND_TERMINATOR);
     let terminator = cipher
         .encrypt(
@@ -575,7 +727,9 @@ pub fn decrypt_stream<R: Read, W: Write>(
 ) -> Result<()> {
     let mut magic = [0u8; 6];
     reader.read_exact(&mut magic)?;
-    if &magic == MAGIC_V2 {
+    if &magic == MAGIC_V3 {
+        decrypt_stream_v3(reader, writer, key)
+    } else if &magic == MAGIC_V2 {
         decrypt_stream_v2(reader, writer, key)
     } else if &magic == MAGIC_V1 {
         decrypt_stream_v1(reader, writer, key)
@@ -587,7 +741,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
 /// Read the header fields that follow the magic and are common to both versions.
 ///
 /// Returns the chunk size, bounded, and the base nonce.
-fn read_common_header<R: Read>(reader: &mut R, expected_version: u8) -> Result<(u32, [u8; 12])> {
+fn read_version_and_chunk_size<R: Read>(reader: &mut R, expected_version: u8) -> Result<u32> {
     let mut version = [0u8; 1];
     reader.read_exact(&mut version)?;
     if version[0] != expected_version {
@@ -603,10 +757,28 @@ fn read_common_header<R: Read>(reader: &mut R, expected_version: u8) -> Result<(
     if chunk_size == 0 || chunk_size > 8 * 1024 * 1024 {
         return Err(anyhow!("Invalid encrypted chunk size"));
     }
+    Ok(chunk_size)
+}
 
+fn read_common_header<R: Read>(reader: &mut R, expected_version: u8) -> Result<(u32, [u8; 12])> {
+    let chunk_size = read_version_and_chunk_size(reader, expected_version)?;
     let mut base_nonce = [0u8; 12];
     reader.read_exact(&mut base_nonce)?;
     Ok((chunk_size, base_nonce))
+}
+
+/// Read the key id and require it to be this key's.
+///
+/// Turns "every chunk fails its tag" into one clear error before any work.
+fn read_and_check_key_id<R: Read>(reader: &mut R, key: &MasterKey) -> Result<[u8; KEY_ID_LEN]> {
+    let mut file_key_id = [0u8; KEY_ID_LEN];
+    reader.read_exact(&mut file_key_id)?;
+    if file_key_id != key_id(key) {
+        return Err(anyhow!(
+            "This file was encrypted with a different key than the one currently unlocked"
+        ));
+    }
+    Ok(file_key_id)
 }
 
 /// Validate a declared chunk length against the header's chunk size.
@@ -629,40 +801,30 @@ fn checked_chunk_len(len_buf: [u8; 4], chunk_size: u32) -> Result<usize> {
     Ok(ct_len)
 }
 
-fn decrypt_stream_v2<R: Read, W: Write>(
+/// The chunk loop shared by v2 and v3.
+///
+/// The two formats differ only in their header layout, the key each chunk is
+/// encrypted under and how the nonce is produced. The framing, the terminator
+/// rules and the length checks are identical, and keeping one copy of them is
+/// the point: this is the code that decides whether a truncated or edited file
+/// is rejected, and two copies of it would eventually stop agreeing.
+fn decrypt_chunks<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    key: &MasterKey,
+    cipher: &Aes256Gcm,
+    header: &[u8],
+    chunk_size: u32,
+    nonce_for: impl Fn(u32) -> [u8; 12],
 ) -> Result<()> {
-    let (chunk_size, base_nonce) = read_common_header(reader, FILE_VERSION_V2)?;
-
-    let mut file_key_id = [0u8; KEY_ID_LEN];
-    reader.read_exact(&mut file_key_id)?;
-    let expected_key_id = key_id(key);
-    if file_key_id != expected_key_id {
-        return Err(anyhow!(
-            "This file was encrypted with a different key than the one currently unlocked"
-        ));
-    }
-
-    // Reconstructed rather than kept: every byte of it was just validated, so a
-    // rebuilt header that differs from the one on disk cannot verify a single chunk.
-    let mut header = Vec::with_capacity(V2_HEADER_LEN);
-    header.extend_from_slice(MAGIC_V2);
-    header.push(FILE_VERSION_V2);
-    header.extend_from_slice(&chunk_size.to_le_bytes());
-    header.extend_from_slice(&base_nonce);
-    header.extend_from_slice(&file_key_id);
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.expose()));
     let mut chunk_idx: u32 = 0;
     let mut len_buf = [0u8; 4];
 
     loop {
         match reader.read_exact(&mut len_buf) {
             Ok(()) => {}
-            // v1 ended here and called it success. In v2 the stream is only complete
-            // when the terminator says so, so running out of input is truncation.
+            // v1 ended here and called it success. From v2 on, the stream is only
+            // complete when the terminator says so, so running out of input is
+            // truncation.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 return Err(anyhow!(
                     "Encrypted stream ended after {} chunks without a terminator; \
@@ -677,14 +839,14 @@ fn decrypt_stream_v2<R: Read, W: Write>(
         let mut ciphertext = vec![0u8; ct_len];
         reader.read_exact(&mut ciphertext)?;
 
-        let nonce = derive_chunk_nonce(&base_nonce, chunk_idx);
+        let nonce = nonce_for(chunk_idx);
 
         // A tag with no plaintext is the terminator, and a data chunk is never
         // empty, so the lengths cannot collide. Guessing wrong is not exploitable
         // either way: the kind is in the associated data, so a data chunk cut down
         // to a bare tag fails to verify as a terminator.
         if ct_len == TAG_LEN {
-            let aad = chunk_aad(&header, chunk_idx, CHUNK_KIND_TERMINATOR);
+            let aad = chunk_aad(header, chunk_idx, CHUNK_KIND_TERMINATOR);
             cipher
                 .decrypt(
                     Nonce::from_slice(&nonce),
@@ -717,7 +879,7 @@ fn decrypt_stream_v2<R: Read, W: Write>(
             return Ok(());
         }
 
-        let aad = chunk_aad(&header, chunk_idx, CHUNK_KIND_DATA);
+        let aad = chunk_aad(header, chunk_idx, CHUNK_KIND_DATA);
         let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(&nonce),
@@ -737,6 +899,52 @@ fn decrypt_stream_v2<R: Read, W: Write>(
             .checked_add(1)
             .ok_or_else(|| anyhow!("Chunk counter overflow"))?;
     }
+}
+
+fn decrypt_stream_v3<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key: &MasterKey,
+) -> Result<()> {
+    let chunk_size = read_version_and_chunk_size(reader, FILE_VERSION_V3)?;
+
+    let mut file_id = [0u8; FILE_ID_LEN];
+    reader.read_exact(&mut file_id)?;
+    let file_key_id = read_and_check_key_id(reader, key)?;
+
+    // Reconstructed rather than kept: every byte of it was just validated, so a
+    // rebuilt header that differs from the one on disk cannot verify a single chunk.
+    let mut header = Vec::with_capacity(V3_HEADER_LEN);
+    header.extend_from_slice(MAGIC_V3);
+    header.push(FILE_VERSION_V3);
+    header.extend_from_slice(&chunk_size.to_le_bytes());
+    header.extend_from_slice(&file_id);
+    header.extend_from_slice(&file_key_id);
+
+    let file_key = derive_file_key(key, &file_id);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(file_key.as_ref()));
+    decrypt_chunks(reader, writer, &cipher, &header, chunk_size, v3_chunk_nonce)
+}
+
+fn decrypt_stream_v2<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key: &MasterKey,
+) -> Result<()> {
+    let (chunk_size, base_nonce) = read_common_header(reader, FILE_VERSION_V2)?;
+    let file_key_id = read_and_check_key_id(reader, key)?;
+
+    let mut header = Vec::with_capacity(V2_HEADER_LEN);
+    header.extend_from_slice(MAGIC_V2);
+    header.push(FILE_VERSION_V2);
+    header.extend_from_slice(&chunk_size.to_le_bytes());
+    header.extend_from_slice(&base_nonce);
+    header.extend_from_slice(&file_key_id);
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.expose()));
+    decrypt_chunks(reader, writer, &cipher, &header, chunk_size, |idx| {
+        derive_chunk_nonce(&base_nonce, idx)
+    })
 }
 
 /// The v1 reader, unchanged in behaviour and kept only to open old files.
@@ -1077,6 +1285,65 @@ mod tests {
         Ok(())
     }
 
+    /// A v2 writer, kept for the same reason as the v1 one above: every library
+    /// encrypted between v2 and v3 is full of these, and so is Telegram.
+    fn encrypt_stream_v2<R: Read, W: Write>(
+        reader: &mut R,
+        writer: &mut W,
+        key: &MasterKey,
+    ) -> Result<()> {
+        let mut base_nonce = [0u8; 12];
+        rand::rngs::OsRng.fill_bytes(&mut base_nonce);
+
+        let mut header = Vec::with_capacity(V2_HEADER_LEN);
+        header.extend_from_slice(MAGIC_V2);
+        header.push(FILE_VERSION_V2);
+        header.extend_from_slice(&DEFAULT_CHUNK_SIZE.to_le_bytes());
+        header.extend_from_slice(&base_nonce);
+        header.extend_from_slice(&key_id(key));
+        writer.write_all(&header)?;
+
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.expose()));
+        let mut chunk_buf = vec![0u8; DEFAULT_CHUNK_SIZE as usize];
+        let mut chunk_idx: u32 = 0;
+        loop {
+            let n = reader.read(&mut chunk_buf)?;
+            if n == 0 {
+                break;
+            }
+            let nonce = derive_chunk_nonce(&base_nonce, chunk_idx);
+            let aad = chunk_aad(&header, chunk_idx, CHUNK_KIND_DATA);
+            let ciphertext = cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: &chunk_buf[..n],
+                        aad: &aad,
+                    },
+                )
+                .map_err(|_| anyhow!("v2 chunk encryption failed"))?;
+            writer.write_all(&(ciphertext.len() as u32).to_le_bytes())?;
+            writer.write_all(&ciphertext)?;
+            chunk_idx += 1;
+        }
+
+        let nonce = derive_chunk_nonce(&base_nonce, chunk_idx);
+        let aad = chunk_aad(&header, chunk_idx, CHUNK_KIND_TERMINATOR);
+        let terminator = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &[],
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow!("v2 terminator failed"))?;
+        writer.write_all(&(terminator.len() as u32).to_le_bytes())?;
+        writer.write_all(&terminator)?;
+        writer.flush()?;
+        Ok(())
+    }
+
     /// Plaintext spanning several chunks, so tests can drop a whole chunk rather
     /// than only cut one in half.
     fn multi_chunk_plaintext() -> Vec<u8> {
@@ -1101,7 +1368,7 @@ mod tests {
     /// decrypt perfectly into a shorter file, so a truncated photo was indistinguishable
     /// from a complete one.
     #[test]
-    fn a_v2_stream_missing_its_last_chunk_is_rejected() {
+    fn a_stream_missing_its_last_chunk_is_rejected() {
         let key = random_test_key();
         let contents = multi_chunk_plaintext();
         let sealed = seal(&contents, &key);
@@ -1112,7 +1379,7 @@ mod tests {
         // short read here, which is the point: this is the clean drop of trailing
         // chunks that v1 accepted as a complete, shorter file.
         let whole_chunk = 4 + DEFAULT_CHUNK_SIZE as usize + TAG_LEN;
-        let cut = V2_HEADER_LEN + 2 * whole_chunk;
+        let cut = V3_HEADER_LEN + 2 * whole_chunk;
         assert!(cut < sealed.len(), "fixture is not multi-chunk");
         let err = open(&sealed[..cut], &key).expect_err("truncated stream must fail");
         assert!(
@@ -1128,7 +1395,7 @@ mod tests {
     /// The same file with the terminator removed. Under v1 this was simply "the file
     /// ended", which is exactly the ambiguity the terminator removes.
     #[test]
-    fn a_v2_stream_with_its_terminator_removed_is_rejected() {
+    fn a_stream_with_its_terminator_removed_is_rejected() {
         let key = random_test_key();
         let sealed = seal(b"a few bytes", &key);
 
@@ -1159,7 +1426,7 @@ mod tests {
     /// The v1 header was plaintext that no tag covered, so these fields could be
     /// edited in place. In v2 the whole header is associated data.
     #[test]
-    fn editing_the_v2_header_is_rejected() {
+    fn editing_the_v3_header_is_rejected() {
         let key = random_test_key();
         let contents = multi_chunk_plaintext();
         let sealed = seal(&contents, &key);
@@ -1172,17 +1439,18 @@ mod tests {
             "an edited chunk_size was accepted"
         );
 
-        // base_nonce, at offset 11.
+        // file_id, at offset 11. Editing it derives a different file key, so
+        // nothing verifies, which is the same rejection by a different route.
         let mut edited = sealed.clone();
         edited[11] ^= 0xFF;
         assert!(
             open(&edited, &key).is_err(),
-            "an edited base_nonce was accepted"
+            "an edited file_id was accepted"
         );
 
-        // key_id, at offset 23, is checked before a single chunk is read.
+        // key_id, at offset 27, is checked before a single chunk is read.
         let mut edited = sealed.clone();
-        edited[23] ^= 0xFF;
+        edited[27] ^= 0xFF;
         let err = open(&edited, &key).expect_err("an edited key_id was accepted");
         assert!(
             err.to_string().contains("different key"),
@@ -1234,6 +1502,184 @@ mod tests {
     }
 
     /// Every library encrypted before this change is full of v1, in the local cache
+    /// The reset path must not leave the credential it just consumed valid.
+    #[test]
+    fn resetting_the_passphrase_burns_the_recovery_key() {
+        let (bundle, recovery_key, master_key) =
+            SecurityBundle::new_encrypted("original passphrase").expect("new");
+
+        let (next, fresh_recovery_key, recovered) = bundle
+            .recover_and_rewrap(&recovery_key, "a replacement passphrase")
+            .expect("reset");
+        assert_eq!(recovered, master_key, "reset changed the master key");
+
+        // The new passphrase works, the old one does not.
+        assert_eq!(
+            next.unlock_with_passphrase("a replacement passphrase")
+                .expect("new passphrase"),
+            master_key
+        );
+        assert!(next.unlock_with_passphrase("original passphrase").is_err());
+
+        // And the key that was just spent no longer opens anything.
+        assert_ne!(*recovery_key, *fresh_recovery_key);
+        assert!(
+            next.unlock_with_recovery_key(&recovery_key).is_err(),
+            "the spent recovery key still works"
+        );
+        assert_eq!(
+            next.unlock_with_recovery_key(&fresh_recovery_key)
+                .expect("fresh recovery key"),
+            master_key
+        );
+    }
+
+    /// Changing the passphrase keeps the master key, so nothing already
+    /// encrypted has to be rewritten, and leaves the unexposed recovery key be.
+    #[test]
+    fn changing_the_passphrase_keeps_the_key_and_the_recovery_key() {
+        let (bundle, recovery_key, master_key) =
+            SecurityBundle::new_encrypted("first passphrase").expect("new");
+
+        assert!(
+            bundle
+                .change_passphrase("wrong passphrase", "second passphrase")
+                .is_err(),
+            "the current passphrase was not checked"
+        );
+
+        let (next, unchanged) = bundle
+            .change_passphrase("first passphrase", "second passphrase")
+            .expect("change");
+        assert_eq!(unchanged, master_key);
+        assert!(next.unlock_with_passphrase("first passphrase").is_err());
+        assert_eq!(
+            next.unlock_with_passphrase("second passphrase")
+                .expect("new"),
+            master_key
+        );
+        assert_eq!(
+            next.unlock_with_recovery_key(&recovery_key)
+                .expect("recovery"),
+            master_key
+        );
+    }
+
+    /// The length rule used to be written out at each call site, and the reset
+    /// path simply did not have it.
+    #[test]
+    fn every_path_that_sets_a_passphrase_enforces_the_minimum() {
+        assert!(SecurityBundle::new_encrypted("short").is_err());
+
+        let (bundle, recovery_key, _) =
+            SecurityBundle::new_encrypted("long enough passphrase").expect("new");
+        assert!(bundle.recover_and_rewrap(&recovery_key, "short").is_err());
+        assert!(bundle
+            .change_passphrase("long enough passphrase", "short")
+            .is_err());
+
+        // Whitespace does not count towards the minimum, but is kept when it is
+        // part of a passphrase that clears it on its own.
+        assert!(validate_passphrase("       x").is_err());
+        assert!(validate_passphrase(" a passphrase ").is_ok());
+    }
+
+    /// A recovery key pasted out of the downloaded text file arrives with a
+    /// trailing newline. The verifier trimmed and the unwrap did not, so it
+    /// verified and then failed to unwrap, blaming the key.
+    #[test]
+    fn a_recovery_key_with_surrounding_whitespace_still_works() {
+        let (bundle, recovery_key, master_key) =
+            SecurityBundle::new_encrypted("a good passphrase").expect("new");
+
+        let messy = format!("  {}\n", recovery_key.to_lowercase());
+        assert_eq!(
+            bundle.unlock_with_recovery_key(&messy).expect("messy key"),
+            master_key
+        );
+    }
+
+    /// v2 is what every library encrypted before the nonce change is full of, and
+    /// what is already sitting in Telegram. Reading it is not optional.
+    #[test]
+    fn v2_streams_still_decrypt() {
+        let key = random_test_key();
+        let contents = multi_chunk_plaintext();
+
+        let mut sealed_v2 = Vec::new();
+        encrypt_stream_v2(&mut &contents[..], &mut sealed_v2, &key).expect("v2 encrypt");
+        assert_eq!(&sealed_v2[..6], MAGIC_V2);
+
+        assert_eq!(open(&sealed_v2, &key).expect("v2 decrypt"), contents);
+        assert!(
+            open(&sealed_v2, &random_test_key()).is_err(),
+            "a v2 stream opened with the wrong key"
+        );
+
+        // The terminator rules apply to v2 through the shared chunk loop, so a
+        // truncated v2 file must still be caught.
+        let cut = sealed_v2.len() - (4 + TAG_LEN);
+        assert!(
+            open(&sealed_v2[..cut], &key).is_err(),
+            "truncated v2 accepted"
+        );
+    }
+
+    /// The whole point of the format change: two files encrypted under the same
+    /// master key must not share a keystream. Same plaintext, same key, and the
+    /// ciphertexts have to differ everywhere past the header.
+    #[test]
+    fn two_files_never_share_a_keystream() {
+        let key = random_test_key();
+        let contents = b"the same bytes in both files";
+
+        let first = seal(contents, &key);
+        let second = seal(contents, &key);
+
+        let first_id = &first[11..11 + FILE_ID_LEN];
+        let second_id = &second[11..11 + FILE_ID_LEN];
+        assert_ne!(first_id, second_id, "file ids collided");
+
+        assert_ne!(
+            &first[V3_HEADER_LEN..],
+            &second[V3_HEADER_LEN..],
+            "two files produced identical ciphertext"
+        );
+    }
+
+    /// Deriving must depend on both inputs, or the whole exercise is decoration.
+    #[test]
+    fn the_file_key_depends_on_the_master_key_and_the_file_id() {
+        let key = random_test_key();
+        let other = random_test_key();
+        let id_a = [7u8; FILE_ID_LEN];
+        let mut id_b = [7u8; FILE_ID_LEN];
+        id_b[FILE_ID_LEN - 1] = 8;
+
+        let base = derive_file_key(&key, &id_a);
+        assert_ne!(*base, *derive_file_key(&key, &id_b), "file id ignored");
+        assert_ne!(*base, *derive_file_key(&other, &id_a), "master key ignored");
+        // And it is a function, not a random value.
+        assert_eq!(*base, *derive_file_key(&key, &id_a));
+        // It is never simply the master key.
+        assert_ne!(base.as_ref(), key.expose().as_slice());
+    }
+
+    /// A v3 nonce is the chunk counter and nothing else, so it must never repeat
+    /// within a file and must start from zero.
+    #[test]
+    fn v3_nonces_are_unique_within_a_file() {
+        let mut seen = std::collections::HashSet::new();
+        for idx in 0..1000u32 {
+            assert!(
+                seen.insert(v3_chunk_nonce(idx)),
+                "nonce repeated at {}",
+                idx
+            );
+        }
+        assert_eq!(v3_chunk_nonce(0), [0u8; 12]);
+    }
+
     /// and in Telegram. Being unable to read it would be data loss.
     #[test]
     fn v1_streams_still_decrypt() {
@@ -1253,8 +1699,8 @@ mod tests {
 
     /// The writer only ever emits v2, and both magics are recognised on disk.
     #[test]
-    fn encryption_writes_v2_and_both_magics_are_detected() {
-        let dir = std::env::temp_dir().join(format!("wanderer-sec-v2-{}", std::process::id()));
+    fn encryption_writes_v3_and_every_magic_is_detected() {
+        let dir = std::env::temp_dir().join(format!("wanderer-sec-v3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let key = random_test_key();
 
@@ -1262,14 +1708,20 @@ mod tests {
         std::fs::write(&plain, b"contents").expect("write");
         let sealed = dir.join("sealed.wbenc");
         encrypt_file(&plain, &sealed, &key).expect("encrypt");
-        assert_eq!(&std::fs::read(&sealed).expect("read")[..6], MAGIC_V2);
-        assert!(is_encrypted_file(&sealed).expect("detect v2"));
+        assert_eq!(&std::fs::read(&sealed).expect("read")[..6], MAGIC_V3);
+        assert!(is_encrypted_file(&sealed).expect("detect v3"));
 
-        let legacy = dir.join("legacy.wbenc");
+        let legacy_v1 = dir.join("legacy-v1.wbenc");
         let mut out = Vec::new();
         encrypt_stream_v1(&mut &b"contents"[..], &mut out, &key).expect("v1");
-        std::fs::write(&legacy, &out).expect("write legacy");
-        assert!(is_encrypted_file(&legacy).expect("detect v1"));
+        std::fs::write(&legacy_v1, &out).expect("write v1");
+        assert!(is_encrypted_file(&legacy_v1).expect("detect v1"));
+
+        let legacy_v2 = dir.join("legacy-v2.wbenc");
+        let mut out = Vec::new();
+        encrypt_stream_v2(&mut &b"contents"[..], &mut out, &key).expect("v2");
+        std::fs::write(&legacy_v2, &out).expect("write v2");
+        assert!(is_encrypted_file(&legacy_v2).expect("detect v2"));
 
         assert!(!is_encrypted_file(&plain).expect("detect plaintext"));
 
