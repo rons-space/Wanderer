@@ -57,13 +57,18 @@ impl SyncWorker {
     }
 
     async fn sync_once(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let encrypted_mode = self
-            .db
-            .get_config("security_mode")
-            .ok()
-            .flatten()
-            .map(|v| v.eq_ignore_ascii_case("encrypted"))
-            .unwrap_or(false);
+        // Fail closed: an unreadable bundle must not be read as "plaintext is
+        // fine", so the cycle is skipped and retried rather than downgraded.
+        let encrypted_mode = match crate::encryption_required(&self.db) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "SyncWorker: cannot determine encryption state, skipping cycle: {}",
+                    e
+                );
+                return Ok(());
+            }
+        };
         let master_key = if encrypted_mode {
             let maybe = self.security_runtime.lock().await.master_key;
             if maybe.is_none() {
@@ -291,12 +296,17 @@ impl SyncWorker {
                 }
             };
 
-        let encrypted_mode = db_clone
-            .get_config("security_mode")
-            .ok()
-            .flatten()
-            .map(|v| v.eq_ignore_ascii_case("encrypted"))
-            .unwrap_or(false);
+        // Fail closed: when the state is unknown, treat the thumbnail as
+        // requiring encryption rather than leaving a plaintext copy at rest. The
+        // branch below deletes the plaintext thumbnail when it cannot seal it, so
+        // the worst case here is a missing thumbnail, which regenerates.
+        let encrypted_mode = crate::encryption_required(&db_clone).unwrap_or_else(|e| {
+            warn!(
+                "SyncWorker: cannot determine encryption state, treating thumbnail as encrypted: {}",
+                e
+            );
+            true
+        });
         if encrypted_mode {
             if let Some(thumb_str) = thumbnail_path.clone() {
                 let thumb = std::path::PathBuf::from(&thumb_str);

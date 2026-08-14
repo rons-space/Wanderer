@@ -91,7 +91,24 @@ struct RegenerateRecoveryResponse {
     recovery_key: String,
 }
 
-fn load_security_bundle(db: &Database) -> Result<Option<SecurityBundle>, String> {
+/// The authoritative answer to "must this data be encrypted?".
+///
+/// Always derived from the `SecurityBundle`, never from the duplicated
+/// `security_mode` row: the two are written by separate, non-transactional
+/// statements, so a crash or a transient error between them leaves the bundle
+/// saying `encrypted` while the mode row is absent. Reading the mode row with
+/// `.ok().flatten().unwrap_or("unset")` then answered "not encrypted" and the
+/// caller uploaded the plaintext original.
+///
+/// Returns `Err` when the bundle cannot be read or parsed. Callers must fail
+/// closed on that: defer the work, never fall back to sending plaintext.
+pub(crate) fn encryption_required(db: &Database) -> Result<bool, String> {
+    Ok(load_security_bundle(db)?
+        .map(|b| b.mode == EncryptionMode::Encrypted)
+        .unwrap_or(false))
+}
+
+pub(crate) fn load_security_bundle(db: &Database) -> Result<Option<SecurityBundle>, String> {
     let raw = db
         .get_config(SECURITY_BUNDLE_KEY)
         .map_err(|e| e.to_string())?;
@@ -111,6 +128,9 @@ fn save_security_bundle(db: &Database, bundle: &SecurityBundle) -> Result<(), St
         EncryptionMode::Encrypted => "encrypted",
         EncryptionMode::Unencrypted => "unencrypted",
     };
+    // Kept only so an older build installed over this one still finds the row it
+    // expects. Nothing in this codebase reads it as a decision input any more:
+    // use `encryption_required`, which reads the bundle above.
     db.set_config(SECURITY_MODE_KEY, mode)
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -250,16 +270,20 @@ async fn get_security_status_inner(
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let mode = db
-        .get_config(SECURITY_MODE_KEY)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "unset".to_string());
-
     let bundle = load_security_bundle(db)?;
     let encryption_configured = bundle
         .as_ref()
         .map(|b| b.mode == EncryptionMode::Encrypted)
         .unwrap_or(false);
+
+    // Derived from the bundle, like everything else now. Reporting this from the
+    // `security_mode` row was how the UI could say "encrypted" while the workers
+    // read the same row and disagreed.
+    let mode = match bundle.as_ref().map(|b| &b.mode) {
+        Some(EncryptionMode::Encrypted) => "encrypted".to_string(),
+        Some(EncryptionMode::Unencrypted) => "unencrypted".to_string(),
+        None => "unset".to_string(),
+    };
     let encryption_locked = if encryption_configured {
         state.security_runtime.lock().await.master_key.is_none()
     } else {
@@ -2209,10 +2233,7 @@ async fn download_for_view(
     let encrypted_mode = {
         let db_guard = state.db.lock().await;
         let db = db_guard.as_ref().ok_or("Database not initialized")?;
-        db.get_config(SECURITY_MODE_KEY)
-            .map_err(|e| e.to_string())?
-            .map(|v| v.eq_ignore_ascii_case("encrypted"))
-            .unwrap_or(false)
+        encryption_required(db)?
     };
 
     // Determine filename

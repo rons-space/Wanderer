@@ -220,12 +220,17 @@ async fn process_file(
     };
 
     // Encrypt thumbnail at rest when security mode is enabled.
-    let security_mode = db
-        .get_config("security_mode")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unset".to_string());
-    if security_mode.eq_ignore_ascii_case("encrypted") {
+    // Fail closed: if the bundle cannot be read, assume encryption is required.
+    // The branch below deletes the plaintext thumbnail when it cannot seal it,
+    // so the worst case is a missing thumbnail rather than a plaintext one.
+    let thumbnail_needs_encryption = crate::encryption_required(&db).unwrap_or_else(|e| {
+        warn!(
+            "Cannot determine encryption state, treating thumbnail as encrypted: {}",
+            e
+        );
+        true
+    });
+    if thumbnail_needs_encryption {
         if let Some(thumb_str) = thumbnail_path.clone() {
             let thumb_path = PathBuf::from(&thumb_str);
             let maybe_key = security_runtime.lock().await.master_key;
