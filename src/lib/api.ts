@@ -108,8 +108,23 @@ export const api = {
         return await invoke("lock_encryption");
     },
 
-    recoverEncryption: async (recoveryKey: string, newPassphrase: string): Promise<void> => {
+    /**
+     * Reset the passphrase with the recovery key.
+     *
+     * Returns a *new* recovery key: the one just used is retired, because it
+     * has been typed into a machine and came from wherever the user was keeping
+     * it. Callers must show what comes back, since nothing can produce it again.
+     */
+    recoverEncryption: async (
+        recoveryKey: string,
+        newPassphrase: string,
+    ): Promise<{ recoveryKey: string }> => {
         return await invoke("recover_encryption", { recoveryKey, newPassphrase });
+    },
+
+    /** Change the passphrase for someone who still knows the current one. */
+    changePassphrase: async (currentPassphrase: string, newPassphrase: string): Promise<void> => {
+        return await invoke("change_passphrase", { currentPassphrase, newPassphrase });
     },
 
     regenerateRecoveryKey: async (passphrase: string): Promise<{ recoveryKey: string }> => {

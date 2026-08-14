@@ -556,7 +556,7 @@ async fn recover_encryption(
     new_passphrase: String,
     state: State<'_, AppState>,
     app: tauri::AppHandle,
-) -> Result<(), AppError> {
+) -> Result<RegenerateRecoveryResponse, AppError> {
     let recovery_key = Zeroizing::new(recovery_key);
     let new_passphrase = Zeroizing::new(new_passphrase);
     let db_guard = state.db.lock().await;
@@ -565,13 +565,44 @@ async fn recover_encryption(
         .ok_or_else(AppError::database_not_initialized)?;
     let bundle = load_security_bundle(db)?
         .ok_or_else(|| AppError::invalid_input("Encryption is not initialized for this library"))?;
-    let (next_bundle, key) = bundle
+    // The recovery key that was just used is retired, so a fresh one comes back
+    // for the caller to show once. Nothing else can produce it later.
+    let (next_bundle, new_recovery_key, key) = bundle
         .recover_and_rewrap(&recovery_key, &new_passphrase)
         .map_err(AppError::from)?;
     save_security_bundle(db, &next_bundle)?;
     drop(db_guard);
     state.security_runtime.lock().await.master_key = Some(key);
     connect_telegram_after_unlock(&state, &app).await;
+    Ok(RegenerateRecoveryResponse {
+        recovery_key: new_recovery_key.to_string(),
+    })
+}
+
+/// Change the passphrase for someone who still knows the current one.
+///
+/// Separate from `recover_encryption`, which is the path for someone who does
+/// not: this one requires the old passphrase and leaves the recovery key alone.
+#[tauri::command]
+async fn change_passphrase(
+    current_passphrase: String,
+    new_passphrase: String,
+    state: State<'_, AppState>,
+) -> Result<(), AppError> {
+    let current_passphrase = Zeroizing::new(current_passphrase);
+    let new_passphrase = Zeroizing::new(new_passphrase);
+    let db_guard = state.db.lock().await;
+    let db = db_guard
+        .as_ref()
+        .ok_or_else(AppError::database_not_initialized)?;
+    let bundle = load_security_bundle(db)?
+        .ok_or_else(|| AppError::invalid_input("Encryption is not initialized for this library"))?;
+    let (next_bundle, key) = bundle
+        .change_passphrase(&current_passphrase, &new_passphrase)
+        .map_err(AppError::from)?;
+    save_security_bundle(db, &next_bundle)?;
+    drop(db_guard);
+    state.security_runtime.lock().await.master_key = Some(key);
     Ok(())
 }
 
@@ -1497,6 +1528,7 @@ pub fn run() {
             lock_encryption,
             recover_encryption,
             regenerate_recovery_key,
+            change_passphrase,
             complete_onboarding,
             set_telegram_api_credentials,
             clear_telegram_api_credentials,

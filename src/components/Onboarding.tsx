@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { TelegramLoginForm, useTelegramLogin } from "./TelegramLogin";
-import { EnableEncryption } from "./EnableEncryption";
+import { EnableEncryption, RecoveryKeyPanel } from "./EnableEncryption";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -59,6 +59,7 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
     const [unlockPassphrase, setUnlockPassphrase] = useState("");
     const [showRecoveryUnlock, setShowRecoveryUnlock] = useState(false);
     const [unlockRecoveryKey, setUnlockRecoveryKey] = useState("");
+    const [resetRecoveryKey, setResetRecoveryKey] = useState<string | null>(null);
     const [unlockNewPassphrase, setUnlockNewPassphrase] = useState("");
 
     const withBusy = async (fn: () => Promise<void>) => {
@@ -173,14 +174,44 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
         }
         try {
             await withBusy(async () => {
-                await api.recoverEncryption(unlockRecoveryKey.trim(), unlockNewPassphrase.trim());
+                const { recoveryKey } = await api.recoverEncryption(
+                    unlockRecoveryKey.trim(),
+                    unlockNewPassphrase.trim(),
+                );
                 toast.success("Recovery successful. Passphrase has been reset.");
-                await onReady();
+                // The key that was just used is spent, so the user has to be
+                // handed the replacement before they go anywhere.
+                setResetRecoveryKey(recoveryKey);
             });
         } catch (e) {
             toast.error(`Recovery failed: ${toErrorMessage(e)}`);
         }
     };
+
+    if (resetRecoveryKey) {
+        return (
+            <div className="h-screen w-screen flex items-center justify-center bg-background p-6">
+                <Card className="w-full max-w-lg">
+                    <CardHeader>
+                        <CardTitle>Save your new recovery key</CardTitle>
+                        <CardDescription>
+                            The key you just used has been retired. This one replaces it.
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                        <RecoveryKeyPanel
+                            recoveryKey={resetRecoveryKey}
+                            continueLabel="Continue to my library"
+                            onConfirmed={() => {
+                                setResetRecoveryKey(null);
+                                void onReady();
+                            }}
+                        />
+                    </CardContent>
+                </Card>
+            </div>
+        );
+    }
 
     if (needsUnlockOnly) {
         return (

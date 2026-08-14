@@ -117,6 +117,10 @@ export function Settings() {
     const [isSaving, setIsSaving] = useState(false);
     const [encryptionFlowOpen, setEncryptionFlowOpen] = useState(false);
     const [logPath, setLogPath] = useState<string | null>(null);
+    const [currentPassphrase, setCurrentPassphrase] = useState("");
+    const [nextPassphrase, setNextPassphrase] = useState("");
+    const [nextPassphraseConfirm, setNextPassphraseConfirm] = useState("");
+    const [isChangingPassphrase, setIsChangingPassphrase] = useState(false);
     const [backupPath, setBackupPath] = useState<string>("");
     const [appVersion, setAppVersion] = useState<string>("Loading...");
     const [securityStatus, setSecurityStatus] = useState<{
@@ -234,6 +238,29 @@ export function Settings() {
         } catch (e) {
             console.error("Failed to load app version:", e);
             setAppVersion("Unknown");
+        }
+    };
+
+    const handleChangePassphrase = async () => {
+        if (nextPassphrase !== nextPassphraseConfirm) {
+            toast.error("New passphrase confirmation does not match");
+            return;
+        }
+
+        setIsChangingPassphrase(true);
+        try {
+            await api.changePassphrase(currentPassphrase, nextPassphrase);
+            // The backend enforces the length rule and the current-passphrase
+            // check, so there is nothing to validate here beyond the two new
+            // fields agreeing with each other.
+            setCurrentPassphrase("");
+            setNextPassphrase("");
+            setNextPassphraseConfirm("");
+            toast.success("Passphrase changed");
+        } catch (e) {
+            toast.error(`Failed to change passphrase: ${errorMessage(e)}`);
+        } finally {
+            setIsChangingPassphrase(false);
         }
     };
 
@@ -478,6 +505,56 @@ export function Settings() {
                                             This mode is one-way. To avoid privacy regressions, disabling encryption is not available.
                                         </AlertDescription>
                                     </Alert>
+                                )}
+
+                                {securityStatus?.securityMode === "encrypted" && (
+                                    <div className="space-y-3 rounded-md border p-3">
+                                        <div>
+                                            <Label>Change Passphrase</Label>
+                                            <p className="text-muted-foreground text-xs">
+                                                The master key is unchanged, so nothing already encrypted is
+                                                rewritten and your recovery key keeps working.
+                                            </p>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label htmlFor="current-passphrase">Current Passphrase</Label>
+                                            <Input
+                                                id="current-passphrase"
+                                                type="password"
+                                                autoComplete="current-password"
+                                                value={currentPassphrase}
+                                                onChange={(e) => setCurrentPassphrase(e.target.value)}
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label htmlFor="next-passphrase">New Passphrase</Label>
+                                            <Input
+                                                id="next-passphrase"
+                                                type="password"
+                                                autoComplete="new-password"
+                                                value={nextPassphrase}
+                                                onChange={(e) => setNextPassphrase(e.target.value)}
+                                                placeholder="At least 8 characters"
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label htmlFor="next-passphrase-confirm">Confirm New Passphrase</Label>
+                                            <Input
+                                                id="next-passphrase-confirm"
+                                                type="password"
+                                                autoComplete="new-password"
+                                                value={nextPassphraseConfirm}
+                                                onChange={(e) => setNextPassphraseConfirm(e.target.value)}
+                                            />
+                                        </div>
+                                        <Button
+                                            className="w-full"
+                                            onClick={handleChangePassphrase}
+                                            disabled={isChangingPassphrase}
+                                        >
+                                            Change Passphrase
+                                        </Button>
+                                    </div>
                                 )}
 
                                 {securityStatus?.securityMode === "encrypted" && (

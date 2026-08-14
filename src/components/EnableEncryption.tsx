@@ -63,63 +63,32 @@ async function copyRecoveryKey(recoveryKey: string) {
     }
 }
 
-export interface EnableEncryptionProps {
-    /** Runs once encryption is on, before the key is shown. */
-    onEnabled?: () => void | Promise<void>;
-    /** Runs after the user has verified the key and dismissed it. */
-    onComplete: () => void;
-    /** Rendered next to the submit button when present. */
-    onBack?: () => void;
+export interface RecoveryKeyPanelProps {
+    recoveryKey: string;
+    /** Runs once the key has been verified and the user has moved on. */
+    onConfirmed: () => void;
     continueLabel?: string;
 }
 
 /**
- * Turning on encryption, passphrase through to a verified recovery key.
+ * Shows a recovery key once, with the means to keep it, and refuses to move on
+ * until two of its segments have been typed back.
  *
- * Settings used to have its own version of this that called
- * `initializeEncryption` and printed the key as bare text: no download, no
- * print, no copy, and no check that the user had kept it. Encryption is
- * one-way, so that path could leave a library permanently unrecoverable the
- * moment the passphrase was forgotten. Both entry points now run this flow.
+ * Used both when encryption is first enabled and after a passphrase reset,
+ * which retires the key it consumed and issues a new one. Both moments share
+ * the property that matters here: it is the only time the key is ever shown.
  */
-export function EnableEncryption({ onEnabled, onComplete, onBack, continueLabel = "Continue" }: EnableEncryptionProps) {
-    const [passphrase, setPassphrase] = useState("");
-    const [confirmPassphrase, setConfirmPassphrase] = useState("");
-    const [isBusy, setIsBusy] = useState(false);
-
-    const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
+export function RecoveryKeyPanel({
+    recoveryKey,
+    onConfirmed,
+    continueLabel = "Continue",
+}: RecoveryKeyPanelProps) {
     const [answerA, setAnswerA] = useState("");
     const [answerB, setAnswerB] = useState("");
     const [verified, setVerified] = useState(false);
 
-    const segments = useMemo(() => (recoveryKey ? splitRecoveryKey(recoveryKey) : []), [recoveryKey]);
+    const segments = useMemo(() => splitRecoveryKey(recoveryKey), [recoveryKey]);
     const indexes = useMemo(() => verificationIndexes(segments.length), [segments.length]);
-
-    const handleInitialize = async () => {
-        if (passphrase.length < 8) {
-            toast.error("Passphrase must be at least 8 characters.");
-            return;
-        }
-        if (passphrase !== confirmPassphrase) {
-            toast.error("Passphrase confirmation does not match.");
-            return;
-        }
-
-        setIsBusy(true);
-        try {
-            const result = await api.initializeEncryption(passphrase);
-            setRecoveryKey(result.recoveryKey.trim());
-            // The passphrase has served its purpose; do not keep it in state
-            // for the rest of the session.
-            setPassphrase("");
-            setConfirmPassphrase("");
-            await onEnabled?.();
-        } catch (e) {
-            toast.error(`Failed to enable encryption: ${errorMessage(e)}`);
-        } finally {
-            setIsBusy(false);
-        }
-    };
 
     const handleVerify = () => {
         if (!verifySegments(segments, indexes, [answerA, answerB])) {
@@ -129,64 +98,6 @@ export function EnableEncryption({ onEnabled, onComplete, onBack, continueLabel 
         setVerified(true);
         toast.success("Recovery key verified.");
     };
-
-    const handleFinish = () => {
-        // Shown once: drop it from state so it cannot be read again by
-        // reopening the panel.
-        setRecoveryKey(null);
-        setAnswerA("");
-        setAnswerB("");
-        setVerified(false);
-        onComplete();
-    };
-
-    if (!recoveryKey) {
-        return (
-            <div className="space-y-4">
-                <Alert>
-                    <KeyRound className="h-4 w-4" aria-hidden="true" />
-                    <AlertTitle>Enable Encryption (one-way)</AlertTitle>
-                    <AlertDescription>
-                        Once enabled you cannot switch back to unencrypted mode without a full reset. You will
-                        receive a one-time recovery key on the next step.
-                    </AlertDescription>
-                </Alert>
-                <div className="space-y-2">
-                    <Label htmlFor="encryption-passphrase">Passphrase</Label>
-                    <Input
-                        id="encryption-passphrase"
-                        type="password"
-                        autoComplete="new-password"
-                        value={passphrase}
-                        onChange={(e) => setPassphrase(e.target.value)}
-                        placeholder="At least 8 characters"
-                    />
-                </div>
-                <div className="space-y-2">
-                    <Label htmlFor="encryption-passphrase-confirm">Confirm Passphrase</Label>
-                    <Input
-                        id="encryption-passphrase-confirm"
-                        type="password"
-                        autoComplete="new-password"
-                        value={confirmPassphrase}
-                        onChange={(e) => setConfirmPassphrase(e.target.value)}
-                        placeholder="Repeat passphrase"
-                    />
-                </div>
-                <div className="flex gap-2">
-                    {onBack && (
-                        <Button variant="outline" className="w-full" onClick={onBack}>
-                            Back
-                        </Button>
-                    )}
-                    <Button className="w-full" onClick={handleInitialize} disabled={isBusy}>
-                        {isBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
-                        Generate Recovery Key
-                    </Button>
-                </div>
-            </div>
-        );
-    }
 
     return (
         <div className="space-y-4">
@@ -253,9 +164,129 @@ export function EnableEncryption({ onEnabled, onComplete, onBack, continueLabel 
                 )}
             </div>
 
-            <Button className="w-full" disabled={!verified} onClick={handleFinish}>
+            <Button className="w-full" disabled={!verified} onClick={onConfirmed}>
                 {continueLabel}
             </Button>
+        </div>
+    );
+}
+
+export interface EnableEncryptionProps {
+    /** Runs once encryption is on, before the key is shown. */
+    onEnabled?: () => void | Promise<void>;
+    /** Runs after the user has verified the key and dismissed it. */
+    onComplete: () => void;
+    /** Rendered next to the submit button when present. */
+    onBack?: () => void;
+    continueLabel?: string;
+}
+
+/**
+ * Turning on encryption, passphrase through to a verified recovery key.
+ *
+ * Settings used to have its own version of this that called
+ * `initializeEncryption` and printed the key as bare text: no download, no
+ * print, no copy, and no check that the user had kept it. Encryption is
+ * one-way, so that path could leave a library permanently unrecoverable the
+ * moment the passphrase was forgotten. Both entry points now run this flow.
+ */
+export function EnableEncryption({
+    onEnabled,
+    onComplete,
+    onBack,
+    continueLabel = "Continue",
+}: EnableEncryptionProps) {
+    const [passphrase, setPassphrase] = useState("");
+    const [confirmPassphrase, setConfirmPassphrase] = useState("");
+    const [isBusy, setIsBusy] = useState(false);
+    const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
+
+    const handleInitialize = async () => {
+        if (passphrase.length < 8) {
+            toast.error("Passphrase must be at least 8 characters.");
+            return;
+        }
+        if (passphrase !== confirmPassphrase) {
+            toast.error("Passphrase confirmation does not match.");
+            return;
+        }
+
+        setIsBusy(true);
+        try {
+            const result = await api.initializeEncryption(passphrase);
+            setRecoveryKey(result.recoveryKey.trim());
+            // The passphrase has served its purpose; do not keep it in state
+            // for the rest of the session.
+            setPassphrase("");
+            setConfirmPassphrase("");
+            await onEnabled?.();
+        } catch (e) {
+            toast.error(`Failed to enable encryption: ${errorMessage(e)}`);
+        } finally {
+            setIsBusy(false);
+        }
+    };
+
+    const handleFinish = () => {
+        // Shown once: drop it from state so it cannot be read again by
+        // reopening the panel.
+        setRecoveryKey(null);
+        onComplete();
+    };
+
+    if (recoveryKey) {
+        return (
+            <RecoveryKeyPanel
+                recoveryKey={recoveryKey}
+                onConfirmed={handleFinish}
+                continueLabel={continueLabel}
+            />
+        );
+    }
+
+    return (
+        <div className="space-y-4">
+            <Alert>
+                <KeyRound className="h-4 w-4" aria-hidden="true" />
+                <AlertTitle>Enable Encryption (one-way)</AlertTitle>
+                <AlertDescription>
+                    Once enabled you cannot switch back to unencrypted mode without a full reset. You will
+                    receive a one-time recovery key on the next step.
+                </AlertDescription>
+            </Alert>
+            <div className="space-y-2">
+                <Label htmlFor="encryption-passphrase">Passphrase</Label>
+                <Input
+                    id="encryption-passphrase"
+                    type="password"
+                    autoComplete="new-password"
+                    value={passphrase}
+                    onChange={(e) => setPassphrase(e.target.value)}
+                    placeholder="At least 8 characters"
+                />
+            </div>
+            <div className="space-y-2">
+                <Label htmlFor="encryption-passphrase-confirm">Confirm Passphrase</Label>
+                <Input
+                    id="encryption-passphrase-confirm"
+                    type="password"
+                    autoComplete="new-password"
+                    value={confirmPassphrase}
+                    onChange={(e) => setConfirmPassphrase(e.target.value)}
+                    placeholder="Repeat passphrase"
+                />
+            </div>
+            <div className="flex gap-2">
+                {onBack && (
+                    <Button variant="outline" className="w-full" onClick={onBack}>
+                        Back
+                    </Button>
+                )}
+                <Button className="w-full" onClick={handleInitialize} disabled={isBusy}>
+                    {isBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+                    Generate Recovery Key
+                </Button>
+            </div>
         </div>
     );
 }
