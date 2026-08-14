@@ -1,4 +1,4 @@
-use img_hash::ImageHash;
+use image_hasher::ImageHash;
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -183,7 +183,7 @@ const PHASH_DISTANCE_THRESHOLD: u32 = 10;
 
 /// A perceptual hash parsed into raw bits, once.
 ///
-/// The stored text is base64 from `img_hash` for anything imported by this
+/// The stored text is base64 from `image_hasher` for anything imported by this
 /// application, but older rows hold a hex `u64`, and both forms have to keep
 /// comparing. Parsing on every pair, which is what comparing the strings did,
 /// meant two base64 decodes per comparison and O(n^2) of them.

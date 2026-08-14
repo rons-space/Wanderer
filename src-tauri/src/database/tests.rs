@@ -9,7 +9,7 @@ use super::*;
 /// The schema version the chain is expected to reach. Update this together with a
 /// new migration, which is the point: forgetting makes the test fail loudly here
 /// rather than quietly at a user's next startup.
-const CURRENT_SCHEMA_VERSION: i32 = 21;
+const CURRENT_SCHEMA_VERSION: i32 = 22;
 
 fn migrated() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory database");
@@ -1252,4 +1252,29 @@ fn a_second_row_for_a_path_is_refused() {
         second.is_err(),
         "the unique index must reject a second row for the same path"
     );
+}
+
+/// The hashes in an existing library were written by a crate whose replacement
+/// cannot read them, so the migration has to clear them rather than leave rows
+/// that silently drop out of every comparison.
+#[test]
+fn upgrading_clears_perceptual_hashes_for_recomputation() {
+    let conn = migrated();
+    conn.execute(
+        "INSERT INTO media (file_path, phash, created_at) VALUES ('/photos/a.jpg', 'R7e3t3NpaWk=', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute("PRAGMA user_version = 21;", []).unwrap();
+
+    Database::migrate(&conn).unwrap();
+
+    let phash: Option<String> = conn
+        .query_row(
+            "SELECT phash FROM media WHERE file_path = '/photos/a.jpg'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(phash, None);
 }
