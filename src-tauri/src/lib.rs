@@ -43,6 +43,20 @@ const TELEGRAM_CREDS_KEY: &str = "security_telegram_credentials";
 const SECURITY_MIGRATION_STATUS_KEY: &str = "security_migration_status";
 const SECURITY_MIGRATION_PENDING_PREFIX: &str = "security_migration_pending_new_msg_";
 
+/// Prefix for every `config` row that holds security state.
+///
+/// `security_bundle_v1` carries the Argon2id salts and both wrapped copies of
+/// the master key, and `security_telegram_credentials` carries the DPAPI blob.
+/// These rows are written only by the dedicated security commands and must
+/// never be readable from the webview, which is one `execute_js` or one
+/// compromised dependency away from being attacker-controlled.
+const SECURITY_KEY_PREFIX: &str = "security_";
+
+/// True for config keys the webview may neither read nor write.
+fn is_security_key(key: &str) -> bool {
+    key.starts_with(SECURITY_KEY_PREFIX)
+}
+
 fn fallback_app_data_dir() -> Result<std::path::PathBuf, String> {
     let base = dirs::data_local_dir()
         .ok_or_else(|| "Could not find local data directory".to_string())?;
@@ -1724,12 +1738,17 @@ async fn get_all_config(
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_all_config().map_err(|e| e.to_string())
+    let mut config = db.get_all_config().map_err(|e| e.to_string())?;
+    // Mirrors the guard in `set_config`. This command returned the entire config
+    // table, so every `MediaGrid` mount handed the wrapped master key and the
+    // DPAPI credential blob to JavaScript purely to read `timeline_grouping`.
+    config.retain(|key, _| !is_security_key(key));
+    Ok(config)
 }
 
 #[tauri::command]
 async fn set_config(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
-    if key.starts_with("security_") {
+    if is_security_key(&key) {
         return Err("Security settings are managed by dedicated security commands".to_string());
     }
     let db_guard = state.db.lock().await;
@@ -2662,4 +2681,42 @@ async fn index_pending_clip(
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_keys_are_recognised() {
+        // Every key the security commands write must be caught by the prefix,
+        // on both the read and the write path.
+        for key in [
+            SECURITY_BUNDLE_KEY,
+            SECURITY_MODE_KEY,
+            SECURITY_ONBOARDING_COMPLETE_KEY,
+            TELEGRAM_CREDS_KEY,
+            SECURITY_MIGRATION_STATUS_KEY,
+        ] {
+            assert!(is_security_key(key), "{key} must be treated as security state");
+        }
+        assert!(is_security_key(&format!("{SECURITY_MIGRATION_PENDING_PREFIX}42")));
+    }
+
+    #[test]
+    fn ordinary_config_keys_are_not_filtered() {
+        // The six keys the frontend actually reads, plus the one the backend
+        // writes for itself, must survive the filter.
+        for key in [
+            "cache_size_mb",
+            "view_cache_max_size_mb",
+            "view_cache_retention_hours",
+            "ai_face_enabled",
+            "ai_tags_enabled",
+            "timeline_grouping",
+            "device_id",
+        ] {
+            assert!(!is_security_key(key), "{key} must remain readable");
+        }
+    }
 }
