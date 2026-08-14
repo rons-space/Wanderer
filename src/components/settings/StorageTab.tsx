@@ -91,7 +91,7 @@ export function StorageTab({
 
                     <div className="space-y-4">
                         <div className="flex justify-between items-center">
-                            <Label>Maximum Cache Size</Label>
+                            <Label>Maximum Thumbnail Cache Size</Label>
                             <span className="text-sm font-mono bg-muted px-2 py-1 rounded">
                                 {(cacheSizeMb / 1000).toFixed(1)} GB
                             </span>
@@ -114,8 +114,10 @@ export function StorageTab({
                             disabled={isSaving}
                         />
                         <p className="text-xs text-muted-foreground">
-                            Thumbnails and recently viewed photos are cached locally for fast access.
-                            Older cached items are automatically removed when the limit is reached.
+                            Grid thumbnails are kept on disk so the timeline scrolls without
+                            re-reading your photos. Once they pass this limit the least recently
+                            used are removed at startup and regenerated when you next scroll past
+                            them. Full-size previews have their own limit below.
                         </p>
                     </div>
 
