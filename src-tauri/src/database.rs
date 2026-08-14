@@ -1,7 +1,7 @@
 use img_hash::ImageHash;
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use time::OffsetDateTime;
 
@@ -132,6 +132,14 @@ fn hamming_distance(hash1: &str, hash2: &str) -> u32 {
 
 pub struct Database {
     conn: Mutex<Connection>,
+    /// Directories this database is allowed to delete files from.
+    ///
+    /// `file_path` and `thumbnail_path` are just text columns. The delete paths
+    /// used to unlink whatever they contained, so one bad row, one buggy
+    /// importer or one crafted sync manifest turned "empty the trash" into
+    /// "delete an arbitrary file". Derived from the database's own location, so
+    /// it needs no plumbing from the caller.
+    managed_roots: Vec<PathBuf>,
 }
 
 impl Database {
@@ -148,6 +156,11 @@ impl Database {
     }
 
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let app_data = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
         let conn = Connection::open(path)?;
 
         // Enable foreign keys
@@ -158,7 +171,31 @@ impl Database {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            managed_roots: crate::paths::managed_roots(&app_data),
         })
+    }
+
+    /// Unlink a path from a media row, refusing anything outside the managed
+    /// directories. Returns false when the path was rejected or missing.
+    fn delete_managed_file(&self, raw_path: &str) -> bool {
+        let path = Path::new(raw_path);
+        if !crate::paths::is_within_any(&self.managed_roots, path) {
+            log::error!(
+                "Refusing to delete a file outside the managed library: {}",
+                raw_path
+            );
+            return false;
+        }
+        if !path.exists() {
+            return false;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("Failed to delete {}: {}", raw_path, e);
+                false
+            }
+        }
     }
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -2231,23 +2268,13 @@ impl Database {
             Err(e) => return Err(e.into()),
         };
 
-        // Delete local file (ignore errors if file doesn't exist)
-        if std::path::Path::new(&file_path).exists() {
-            if let Err(e) = std::fs::remove_file(&file_path) {
-                log::warn!("Failed to delete local file {}: {}", file_path, e);
-            } else {
-                log::info!("Deleted local file: {}", file_path);
-            }
+        // Both paths are confined to the managed directories before any unlink.
+        if self.delete_managed_file(&file_path) {
+            log::info!("Deleted local file: {}", file_path);
         }
-
-        // Delete thumbnail (ignore errors if doesn't exist)
         if let Some(ref thumb_path) = thumbnail_path {
-            if std::path::Path::new(thumb_path).exists() {
-                if let Err(e) = std::fs::remove_file(thumb_path) {
-                    log::warn!("Failed to delete thumbnail {}: {}", thumb_path, e);
-                } else {
-                    log::info!("Deleted thumbnail: {}", thumb_path);
-                }
+            if self.delete_managed_file(thumb_path) {
+                log::info!("Deleted thumbnail: {}", thumb_path);
             }
         }
 
@@ -2281,16 +2308,10 @@ impl Database {
         let tx = conn.transaction()?;
 
         for (id, file_path, thumbnail_path, telegram_media_id) in items {
-            // Delete local file
-            if std::path::Path::new(&file_path).exists() {
-                let _ = std::fs::remove_file(&file_path);
-            }
-
-            // Delete thumbnail
+            // Confined to the managed directories, like every other unlink.
+            self.delete_managed_file(&file_path);
             if let Some(ref thumb_path) = thumbnail_path {
-                if std::path::Path::new(thumb_path).exists() {
-                    let _ = std::fs::remove_file(thumb_path);
-                }
+                self.delete_managed_file(thumb_path);
             }
 
             // First, clear cover_face_id in persons table for any faces belonging to this media
