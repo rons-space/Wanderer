@@ -2034,8 +2034,15 @@ async fn backup_database(
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    // Copy the database file
-    std::fs::copy(&db_path, &backup_path).map_err(|e| e.to_string())?;
+    // Snapshot through SQLite rather than copying the file. See `Database::backup_to`:
+    // with WAL enabled, a raw copy of library.db can omit committed data that is still
+    // sitting in the write-ahead log.
+    {
+        let db_guard = state.db.lock().await;
+        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        db.backup_to(&backup_path)
+            .map_err(|e| format!("Failed to write the database snapshot: {}", e))?;
+    }
 
     let mut final_backup_path = backup_path.clone();
 
