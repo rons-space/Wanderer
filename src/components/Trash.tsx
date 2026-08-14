@@ -7,12 +7,7 @@ import { Trash2, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import {
-    ContextMenu,
-    ContextMenuContent,
-    ContextMenuItem,
-    ContextMenuTrigger,
-} from "@/components/ui/context-menu";
+import { ContextMenuItem, ContextMenuSeparator } from "@/components/ui/context-menu";
 import {
     AlertDialog,
     AlertDialogAction,
@@ -24,31 +19,6 @@ import {
     AlertDialogTitle,
     AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-
-// Custom wrapper to add restore functionality
-const TrashItemWrapper = ({
-    item,
-    children,
-    onRestore
-}: {
-    item: MediaItem;
-    children: React.ReactNode;
-    onRestore: (item: MediaItem) => void;
-}) => {
-    return (
-        <ContextMenu>
-            <ContextMenuTrigger asChild>
-                {children}
-            </ContextMenuTrigger>
-            <ContextMenuContent>
-                <ContextMenuItem onClick={() => onRestore(item)}>
-                    <RotateCcw className="mr-2 h-4 w-4" />
-                    Restore
-                </ContextMenuItem>
-            </ContextMenuContent>
-        </ContextMenu>
-    );
-};
 
 export function Trash() {
     const [items, setItems] = useState<MediaItem[]>([]);
@@ -91,7 +61,7 @@ export function Trash() {
         }
     };
 
-    const handleRestore = async (item: MediaItem) => {
+    const handleRestore = useCallback(async (item: MediaItem) => {
         try {
             await api.restoreFromTrash(item.id);
             setItems(prev => prev.filter(i => i.id !== item.id));
@@ -100,7 +70,7 @@ export function Trash() {
             console.error("Failed to restore:", e);
             toast.error("Failed to restore item");
         }
-    };
+    }, []);
 
     const handleEmptyTrash = async () => {
         setIsEmptying(true);
@@ -120,12 +90,18 @@ export function Trash() {
         setSelectedItem(item);
     };
 
-    // Custom item wrapper for trash that disables normal actions
-    const ItemWrapper = ({ item, children }: { item: MediaItem; children: React.ReactNode }) => (
-        <TrashItemWrapper item={item} onRestore={handleRestore}>
-            {children}
-        </TrashItemWrapper>
-    );
+    // Restore is contributed to the grid's own context menu. Wrapping the cell
+    // in a second ContextMenu nested the two triggers, and the inner menu won,
+    // so the entry was unreachable.
+    const contextMenuExtras = useCallback((item: MediaItem) => (
+        <>
+            <ContextMenuItem onClick={() => handleRestore(item)}>
+                <RotateCcw className="mr-2 h-4 w-4" />
+                Restore
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+        </>
+    ), [handleRestore]);
 
     return (
         <div className="flex flex-col h-full">
@@ -205,7 +181,7 @@ export function Trash() {
                     hasNextPage={hasNextPage}
                     isNextPageLoading={isNextPageLoading}
                     loadNextPage={loadNextPage}
-                    ItemWrapper={ItemWrapper}
+                    contextMenuExtras={contextMenuExtras}
                     onItemClick={handleItemClick}
                     onItemsChange={loadItems}
                 />

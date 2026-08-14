@@ -15,6 +15,10 @@ export function UploadQueue() {
     const [isLoading, setIsLoading] = useState(true);
     const [currentProgress, setCurrentProgress] = useState<UploadProgressEvent | null>(null);
     const [rateLimitCountdown, setRateLimitCountdown] = useState<number | null>(null);
+    // The bar has to be drawn against the wait Telegram actually asked for. A
+    // FLOOD_WAIT is routinely longer than a minute, and a fixed 60s denominator
+    // made the progress negative for every one of those.
+    const [rateLimitTotal, setRateLimitTotal] = useState<number | null>(null);
     const [rateLimitFile, setRateLimitFile] = useState<string | null>(null);
 
     const loadData = useCallback(async () => {
@@ -60,6 +64,7 @@ export function UploadQueue() {
         const unlistenRateLimit = listen<RateLimitEvent>("upload-rate-limited", (event) => {
             const waitSecs = event.payload.waitSeconds;
             setRateLimitCountdown(waitSecs);
+            setRateLimitTotal(waitSecs > 0 ? waitSecs : null);
             setRateLimitFile(event.payload.filePath.split(/[/\\]/).pop() || event.payload.filePath);
             toast.warning(`Rate limited by Telegram. Waiting ${waitSecs}s...`);
         });
@@ -78,6 +83,7 @@ export function UploadQueue() {
         if (rateLimitCountdown === null || rateLimitCountdown <= 0) {
             if (rateLimitCountdown === 0) {
                 setRateLimitCountdown(null);
+                setRateLimitTotal(null);
                 setRateLimitFile(null);
                 loadData(); // Refresh after rate limit ends
             }
@@ -137,6 +143,11 @@ export function UploadQueue() {
 
     const totalActive = counts.pending + counts.uploading;
 
+    const rateLimitProgress =
+        rateLimitCountdown !== null && rateLimitTotal !== null && rateLimitTotal > 0
+            ? Math.min(100, Math.max(0, ((rateLimitTotal - rateLimitCountdown) / rateLimitTotal) * 100))
+            : 0;
+
     return (
         <div className="flex flex-col h-full">
             {/* Header */}
@@ -182,7 +193,7 @@ export function UploadQueue() {
                             {rateLimitCountdown}s
                         </Badge>
                     </div>
-                    <Progress value={(1 - rateLimitCountdown / 60) * 100} className="h-1 mt-2" />
+                    <Progress value={rateLimitProgress} className="h-1 mt-2" />
                 </div>
             )}
 

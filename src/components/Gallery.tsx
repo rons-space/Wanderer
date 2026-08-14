@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { MediaItem } from "../types";
 import { api } from "../lib/api";
 import { toast } from "sonner";
@@ -7,6 +7,16 @@ import { BulkActionBar } from "./BulkActionBar";
 import { MediaViewer } from "./MediaViewer";
 import { useTheme } from "@/contexts/ThemeContext";
 import { cn } from "@/lib/utils";
+
+// A maximised window shows far more than twenty thumbnails, and a first page
+// that does not overflow the viewport never produces the scroll event that asks
+// for the second one. MediaGrid also nudges when the content does not overflow,
+// but starting with a screenful keeps the common case to a single round trip.
+const PAGE_SIZE = 60;
+
+// The backend clamps a page at MAX_PAGE_SIZE, so a refresh of a very deep scroll
+// position is capped rather than silently truncated by the database layer.
+const MAX_REFRESH = 1000;
 
 export function Gallery() {
     const [items, setItems] = useState<MediaItem[]>([]);
@@ -47,14 +57,27 @@ export function Gallery() {
         }
     };
 
+    // Read through a ref so refreshing keeps a stable identity: it is handed to
+    // the `media-added` listener, which is registered once for the lifetime of
+    // the view.
+    const loadedCountRef = useRef(0);
+
+    useEffect(() => {
+        loadedCountRef.current = items.length;
+    }, [items]);
+
     const refreshItems = useCallback(async () => {
         try {
-            const newItems = await api.getMedia(items.length || 20, 0);
+            // Refresh the window the user has already scrolled through. Resetting
+            // to the first page discarded every page after it, which is what made
+            // a background import jump the gallery back to the top.
+            const loaded = Math.min(Math.max(loadedCountRef.current, PAGE_SIZE), MAX_REFRESH);
+            const newItems = await api.getMedia(loaded, 0);
             setItems(newItems);
         } catch (e) {
             console.error("Failed to refresh:", e);
         }
-    }, [items.length]);
+    }, []);
 
     // Listen for new media events
     useEffect(() => {
@@ -63,7 +86,7 @@ export function Gallery() {
         const setupListener = async () => {
             // Initial Load
             try {
-                const initialItems = await api.getMedia(20, 0);
+                const initialItems = await api.getMedia(PAGE_SIZE, 0);
                 setItems(initialItems);
             } catch (e) {
                 console.error("Initial load failed:", e);
@@ -73,10 +96,7 @@ export function Gallery() {
             // Dynamic import to avoid SSR issues if any
             const { listen } = await import('@tauri-apps/api/event');
             unlisten = await listen('media-added', () => {
-                // Refresh the list
-                api.getMedia(20, 0).then(newItems => {
-                    setItems(newItems);
-                });
+                refreshItems();
             });
         };
         setupListener();
@@ -84,7 +104,7 @@ export function Gallery() {
         return () => {
             if (unlisten) unlisten();
         };
-    }, []);
+    }, [refreshItems]);
 
     // Handle keyboard shortcuts
     useEffect(() => {

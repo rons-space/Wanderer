@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { PLACEHOLDER_SRC, handleImageError } from '@/lib/placeholder';
 import { api } from "@/lib/api";
 import { MediaItem } from "@/types";
 import { Card, CardContent } from "@/components/ui/card";
@@ -139,6 +140,7 @@ export function SmartAlbums() {
                                                 src={convertFileSrc(item.thumbnail_path)}
                                                 alt=""
                                                 className="w-full h-full object-cover"
+                                                onError={handleImageError}
                                             />
                                         ) : item.mime_type?.startsWith('video/') ? (
                                             <div className="w-full h-full flex items-center justify-center bg-muted">
@@ -146,7 +148,7 @@ export function SmartAlbums() {
                                             </div>
                                         ) : (
                                             <img
-                                                src="/placeholder.jpg"
+                                                src={PLACEHOLDER_SRC}
                                                 alt=""
                                                 className="w-full h-full object-cover"
                                             />

@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { PLACEHOLDER_SRC, handleImageError } from "@/lib/placeholder";
 import { api } from "@/lib/api";
 import { MediaItem } from "@/types";
 import { Button } from "@/components/ui/button";
@@ -24,7 +25,7 @@ const getPreviewSrc = (item: MediaItem): string => {
     if (item.file_path) {
         return convertFileSrc(item.file_path);
     }
-    return "/placeholder.jpg";
+    return PLACEHOLDER_SRC;
 };
 
 const getFileType = (item: MediaItem): string => getFileTypeFromPath(item.file_path, item.mime_type);
@@ -202,9 +203,7 @@ export function DuplicateReview() {
                                                 src={getPreviewSrc(item)}
                                                 alt=""
                                                 className="w-32 h-32 object-cover"
-                                                onError={(e) => {
-                                                    e.currentTarget.src = "/placeholder.jpg";
-                                                }}
+                                                onError={handleImageError}
                                             />
                                             {itemIndex === group.keepIndex ? (
                                                 <Badge className="absolute top-1 right-1 bg-green-600">
