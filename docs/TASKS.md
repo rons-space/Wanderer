@@ -40,8 +40,12 @@ Findings by severity in the source review: **4 Critical, 26 High, 26 Medium, 13 
 
 ## Status snapshot
 
-Stages 0 and 1 are complete and promoted to `main`, except T17, which needs a signing certificate
-and an updater keypair that are not in this repository. Stage 2 has not started.
+Stages 0, 1 and 2 are complete and promoted to `main`, except T17, which needs a signing
+certificate and an updater keypair that are not in this repository. Stage 3 has not started.
+
+Stage 2 left two things behind, both filed rather than forgotten: the Windows DPAPI paths added
+for the Telegram session (#30) are compile-checked only, because CI runs on Linux, and
+deduplicating `media.file_path` so its index can be `UNIQUE` is [#98](https://github.com/rons-space/Wanderer/issues/98).
 
 | Check | Result |
 | --- | --- |
@@ -57,6 +61,10 @@ and an updater keypair that are not in this repository. Stage 2 has not started.
 | Stray files | Removed, with the unused 1.2 MB ONNX model |
 | Rust advisories | 11 of 15 cleared; 4 ignored with reasoning in `src-tauri/.cargo/audit.toml` |
 | Downloaded models verified | Yes. SHA-256 and length pinned, checked before the parser sees the bytes |
+| Telegram session at rest | Encrypted. DPAPI with entropy on Windows, master-key sealed elsewhere |
+| Command errors | Typed. `AppError` carries a code; library causes are logged, not displayed |
+| Blocking work on the async runtime | Moved. ONNX, whole-file crypto, hashing and large copies use `spawn_blocking` |
+| Settings writable from the webview | Allowlisted. Six keys, each validated against its domain |
 
 ---
 
@@ -195,95 +203,95 @@ of this stage is additive and low-risk.
 
 ## Stage 2: Correctness and durability
 
-- [ ] [#28](https://github.com/rons-space/Wanderer/issues/28) **T20: Purge decrypted plaintext from `%TEMP%`** (Finding 1.2, **High**)
+- [x] [#28](https://github.com/rons-space/Wanderer/issues/28) **T20: Purge decrypted plaintext from `%TEMP%`** (Finding 1.2, **High**)
   `lock_encryption` (`lib.rs:360-364`) clears only the in-memory key; `wanderer-thumb-cache`,
   `wanderer-view-cache-materialized` and four sibling staging dirs are never cleaned.
   *Done when:* materialized paths are tracked and deleted on lock, on window close and on startup;
   prefer serving decrypted bytes from memory over writing plaintext at all.
 
-- [ ] [#29](https://github.com/rons-space/Wanderer/issues/29) **T21: v2 encrypted file format** (Finding 1.4, **High**)
+- [x] [#29](https://github.com/rons-space/Wanderer/issues/29) **T21: v2 encrypted file format** (Finding 1.4, **High**)
   Bind `magic || version || chunk_size || base_nonce || key_id || total_chunks` into the AAD, add an
   explicit terminator chunk, and require the magic when the bundle says encrypted instead of sniffing
   six bytes.
   *Where:* `security/mod.rs:289-293, 328-348, 380-443`, `lib.rs:2150-2168`.
 
-- [ ] [#30](https://github.com/rons-space/Wanderer/issues/30) **T22: Protect `session.db`** (Finding 1.3, **High**)
+- [x] [#30](https://github.com/rons-space/Wanderer/issues/30) **T22: Protect `session.db`** (Finding 1.3, **High**)
   The MTProto auth key (full Telegram account access) is stored unprotected while the far less
   sensitive api_id/api_hash get DPAPI.
   *Where:* `telegram.rs:105-112`; credential handling at `lib.rs:412-443`.
   *Done when:* the session is DPAPI-wrapped (with secondary entropy, Finding 1.9) or master-key
   encrypted, behind a keychain abstraction that also works off Windows.
 
-- [ ] [#31](https://github.com/rons-space/Wanderer/issues/31) **T23: Zeroize key material** (Finding 1.5, **High**)
+- [x] [#31](https://github.com/rons-space/Wanderer/issues/31) **T23: Zeroize key material** (Finding 1.5, **High**)
   Add `zeroize`; make the master key a non-`Copy` `ZeroizeOnDrop` newtype so every copy is explicit;
   take passphrases as `Zeroizing<String>`.
   *Where:* `security/mod.rs:81-86`, copies at `lib.rs:204-206, 496-531`, `upload_worker.rs:125`,
   `watcher.rs:231`, `sync_worker.rs:68,303`.
 
-- [ ] [#32](https://github.com/rons-space/Wanderer/issues/32) **T24: Move filesystem deletes out of transaction scope** (Finding 2.2, **High**)
+- [x] [#32](https://github.com/rons-space/Wanderer/issues/32) **T24: Move filesystem deletes out of transaction scope** (Finding 2.2, **High**)
   `empty_trash` unlinks before `tx.commit()` (`database.rs:2281-2295`), so a rollback leaves rows
   pointing at deleted bytes; `permanent_delete` (`database.rs:2234-2255`) has no transaction at all.
   *Done when:* paths are collected, the transaction commits, and only then are files unlinked.
 
-- [ ] [#33](https://github.com/rons-space/Wanderer/issues/33) **T25: SQLite durability** (Finding 2.3, **High**)
+- [x] [#33](https://github.com/rons-space/Wanderer/issues/33) **T25: SQLite durability** (Finding 2.3, **High**)
   Set `journal_mode = WAL` and a `busy_timeout` at open (`database.rs:151-157`), and replace the raw
   `std::fs::copy` backup (`lib.rs:1901`) with the online backup API or `VACUUM INTO`.
 
-- [ ] [#34](https://github.com/rons-space/Wanderer/issues/34) **T26: Make the FTS index self-maintaining** (Finding 2.5, **High**)
+- [x] [#34](https://github.com/rons-space/Wanderer/issues/34) **T26: Make the FTS index self-maintaining** (Finding 2.5, **High**)
   Convert `media_fts` to external-content FTS5 with insert/update/delete triggers, removing the single
   discarded manual insert at `database.rs:1069`. Today sync-ingested media is never indexed and
   deleted media is never removed.
 
-- [ ] [#35](https://github.com/rons-space/Wanderer/issues/35) **T27: Add the missing indexes** (Finding 2.6, Medium)
+- [x] [#35](https://github.com/rons-space/Wanderer/issues/35) **T27: Add the missing indexes** (Finding 2.6, Medium)
   `media.file_path`, `is_deleted`, `is_archived`, `created_at`, `date_taken`, `telegram_media_id`, the
   four AI status columns, `album_media.media_id`, `faces.media_id`. Switch the 41 `conn.prepare(`
   call sites to `prepare_cached`.
 
-- [ ] [#36](https://github.com/rons-space/Wanderer/issues/36) **T28: Fix upload-queue atomicity** (Finding 2.7, Medium)
+- [x] [#36](https://github.com/rons-space/Wanderer/issues/36) **T28: Fix upload-queue atomicity** (Finding 2.7, Medium)
   `UNIQUE` on `upload_queue(file_path)`; make `toggle_favorite` a single `RETURNING`
   (`database.rs:2034-2047`); add a reaper for rows stranded in `uploading`.
 
-- [ ] [#37](https://github.com/rons-space/Wanderer/issues/37) **T29: Unpoison the database mutex** (Finding 4.1, **High**)
+- [x] [#37](https://github.com/rons-space/Wanderer/issues/37) **T29: Unpoison the database mutex** (Finding 4.1, **High**)
   `get_conn` maps poisoning to `Err` (`database.rs:138-148`), so one panic disables all 89 database
   methods for the process lifetime; use `.unwrap_or_else(|e| e.into_inner())`. Delete the per-face
   DEBUG `PRAGMA foreign_key_list` block at `database.rs:696-708`, which is the most likely trigger and
   runs on every embedding write.
 
-- [ ] [#38](https://github.com/rons-space/Wanderer/issues/38) **T30: Get blocking work off the async runtime** (Finding 4.2, **High**)
+- [x] [#38](https://github.com/rons-space/Wanderer/issues/38) **T30: Get blocking work off the async runtime** (Finding 4.2, **High**)
   `spawn_blocking` for ONNX inference (`lib.rs:2513-2542`, `2450-2492`), `hash_file_streaming`
   (`sync_worker.rs:55,88,201`) and the 39 `std::fs::` calls in `lib.rs`; stop holding the Telegram
   client mutex across whole transfers (`telegram.rs:276-338, 431-460`); fix the inconsistent lock
   ordering between `lib.rs:511` and `sync_worker.rs:60-68`.
 
-- [ ] [#39](https://github.com/rons-space/Wanderer/issues/39) **T31: Resolve ffmpeg by absolute path** (Finding 3.9, Medium)
+- [x] [#39](https://github.com/rons-space/Wanderer/issues/39) **T31: Resolve ffmpeg by absolute path** (Finding 3.9, Medium)
   A planted `ffmpeg.exe` earlier in `PATH` executes on the next video import.
   *Where:* `media_utils.rs:177, 183, 212`.
 
-- [ ] [#40](https://github.com/rons-space/Wanderer/issues/40) **T32: Wire up typed errors** (Findings 4.5, 6.3, Medium/**High**)
+- [x] [#40](https://github.com/rons-space/Wanderer/issues/40) **T32: Wire up typed errors** (Findings 4.5, 6.3, Medium/**High**)
   `errors.rs` defines `AppError` and is referenced zero times; all 74 commands return
   `Result<T, String>`. Adopting it removes the string-matched startup retry at `App.tsx:43-63` and
   stops raw SQL and absolute paths leaking into the UI.
 
-- [ ] [#41](https://github.com/rons-space/Wanderer/issues/41) **T33: Verify Telegram plaintext purge during migration** (Finding 3.8, Medium)
+- [x] [#41](https://github.com/rons-space/Wanderer/issues/41) **T33: Verify Telegram plaintext purge during migration** (Finding 3.8, Medium)
   `lib.rs:609-623` discards the delete result and marks the migration succeeded regardless.
   *Done when:* deletion is verified, `FLOOD_WAIT` is retried, and un-purged message IDs are recorded
   durably and surfaced in the UI.
 
-- [ ] [#42](https://github.com/rons-space/Wanderer/issues/42) **T34: Bind `camera_make` and clamp pagination** (Findings 3.5, 3.7, **High**/Medium)
+- [x] [#42](https://github.com/rons-space/Wanderer/issues/42) **T34: Bind `camera_make` and clamp pagination** (Findings 3.5, 3.7, **High**/Medium)
   Bind the interpolated filter at `database.rs:1530-1537`; clamp `get_media_by_person`
   (`database.rs:2758-2777`) and `get_media_by_tag` (`database.rs:3074-3092`); fix the
   `-1i32 as usize` cast in `semantic_search` (`lib.rs:2469-2473`) and bound the placeholder counts in
   `get_media_by_ids`, `bulk_delete` and `bulk_set_favorite`.
 
-- [ ] [#43](https://github.com/rons-space/Wanderer/issues/43) **T35: Commit a generated `schema.sql`** (Finding 2.4d, **High**)
+- [x] [#43](https://github.com/rons-space/Wanderer/issues/43) **T35: Commit a generated `schema.sql`** (Finding 2.4d, **High**)
   There is no schema snapshot anywhere; the only definition is ~480 lines of string literals inside
   `migrate()`.
 
-- [ ] [#44](https://github.com/rons-space/Wanderer/issues/44) **T36: Invert `set_config` to an allowlist** (Finding 3.10, Low)
+- [x] [#44](https://github.com/rons-space/Wanderer/issues/44) **T36: Invert `set_config` to an allowlist** (Finding 3.10, Low)
   The `security_` denylist at `lib.rs:1686-1694` still lets script write any other key, including the
   AI opt-in flags. Validate each value against its expected domain.
 
-- [ ] [#45](https://github.com/rons-space/Wanderer/issues/45) **T37: Fix logging** (Finding 4.7, Low)
+- [x] [#45](https://github.com/rons-space/Wanderer/issues/45) **T37: Fix logging** (Finding 4.7, Low)
   Stop logging private Telegram message text (`telegram.rs:139-141`); downgrade the 50 `println!`
   calls to `log::debug` and scrub user paths and IDs.
 
