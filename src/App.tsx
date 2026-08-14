@@ -17,7 +17,7 @@ import { Onboarding } from "./components/Onboarding";
 import "./App.css";
 
 import { useEffect, useState } from "react";
-import { api } from "./lib/api";
+import { api, hasErrorCode } from "./lib/api";
 
 import { Toaster } from "@/components/ui/sonner";
 
@@ -46,8 +46,11 @@ function App() {
       setSecurityStatus(status);
       setSecurityLoading(false);
     } catch (e) {
-      const message = String(e);
-      if (message.includes("Database not initialized")) {
+      // Startup opens the database after the window exists, so the first call can
+      // legitimately arrive too early. This used to match on the message text, which
+      // meant rewording an error string silently turned the retry into a dead splash
+      // screen.
+      if (hasErrorCode(e, "databaseNotInitialized")) {
         setTimeout(() => {
           refreshSecurityStatus();
         }, 250);
