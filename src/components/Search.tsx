@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
+import { useLatestRequest } from "@/hooks/use-latest-request";
 import { MediaItem, SearchFilters, Tag } from "../types";
 import { api } from "../lib/api";
 import { MediaGrid } from "./MediaGrid";
@@ -42,6 +43,7 @@ export function Search() {
     const [hasNextPage, setHasNextPage] = useState(true);
     const [isNextPageLoading, setIsNextPageLoading] = useState(false);
     const [hasSearched, setHasSearched] = useState(false);
+    const beginSearch = useLatestRequest();
 
     // Filter states
     const [showFilters, setShowFilters] = useState(false);
@@ -126,6 +128,10 @@ export function Search() {
         stopIndex: number,
         isNewSearch: boolean
     ) => {
+        // Typing produces overlapping searches, and semantic search in particular
+        // takes long enough that an earlier query routinely lands after a later
+        // one. Everything below writes state only while this is still the newest.
+        const isCurrent = beginSearch();
         setIsNextPageLoading(true);
         try {
             const limit = stopIndex - startIndex + 20;
@@ -154,6 +160,8 @@ export function Search() {
                 newItems = await api.searchFts(searchQuery, filters, limit, offset);
             }
 
+            if (!isCurrent()) return;
+
             if (newItems.length === 0) {
                 setHasNextPage(false);
             }
@@ -175,7 +183,9 @@ export function Search() {
         } catch (error) {
             console.error("Failed to search media", error);
         } finally {
-            setIsNextPageLoading(false);
+            if (isCurrent()) {
+                setIsNextPageLoading(false);
+            }
         }
     };
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { MediaItem } from "../types";
 import { api } from "../lib/api";
+import { subscribe } from "@/lib/events";
 import { toast } from "sonner";
 import { MediaGrid } from "./MediaGrid";
 import { BulkActionBar } from "./BulkActionBar";
@@ -79,32 +80,30 @@ export function Gallery() {
         }
     }, []);
 
-    // Listen for new media events
+    // Initial load, separate from the subscription so neither waits on the other.
     useEffect(() => {
-        let unlisten: (() => void) | undefined;
+        let cancelled = false;
 
-        const setupListener = async () => {
-            // Initial Load
-            try {
-                const initialItems = await api.getMedia(PAGE_SIZE, 0);
-                setItems(initialItems);
-            } catch (e) {
+        api.getMedia(PAGE_SIZE, 0)
+            .then((initialItems) => {
+                if (!cancelled) {
+                    setItems(initialItems);
+                }
+            })
+            .catch((e) => {
                 console.error("Initial load failed:", e);
                 toast.error("Failed to load gallery");
-            }
-
-            // Dynamic import to avoid SSR issues if any
-            const { listen } = await import('@tauri-apps/api/event');
-            unlisten = await listen('media-added', () => {
-                refreshItems();
             });
-        };
-        setupListener();
 
         return () => {
-            if (unlisten) unlisten();
+            cancelled = true;
         };
-    }, [refreshItems]);
+    }, []);
+
+    // Listen for new media events
+    useEffect(() => subscribe('media-added', () => {
+        refreshItems();
+    }), [refreshItems]);
 
     // Handle keyboard shortcuts
     useEffect(() => {

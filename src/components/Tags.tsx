@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useLatestRequest } from "@/hooks/use-latest-request";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "@/lib/api";
 import { PLACEHOLDER_SRC, handleImageError } from "@/lib/placeholder";
@@ -14,6 +15,7 @@ export function Tags() {
     const [isLoading, setIsLoading] = useState(true);
     const [selectedTag, setSelectedTag] = useState<string | null>(null);
     const [tagMedia, setTagMedia] = useState<MediaItem[]>([]);
+    const beginTagRequest = useLatestRequest();
 
     const loadTags = async () => {
         setIsLoading(true);
@@ -34,10 +36,15 @@ export function Tags() {
 
     const handleSelectTag = async (tag: string) => {
         setSelectedTag(tag);
+        // Clicking through tags faster than they load used to leave whichever
+        // request finished last on screen, under whichever tag was selected last.
+        const isCurrent = beginTagRequest();
         try {
             const media = await api.getMediaByTag(tag, 100, 0);
+            if (!isCurrent()) return;
             setTagMedia(media);
         } catch (e) {
+            if (!isCurrent()) return;
             console.error("Failed to load photos for this tag:", e);
             toast.error("Failed to load photos for this tag");
         }
