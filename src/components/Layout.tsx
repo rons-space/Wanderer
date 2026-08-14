@@ -69,10 +69,10 @@ export function Layout({ children, currentView, onViewChange }: LayoutProps) {
                         <div className="flex items-center gap-1">
                             <SidebarTrigger className="h-8 w-8" />
                             <Separator orientation="vertical" className="h-5 mx-1" />
-                            <Button variant="ghost" size="icon" className="h-8 w-8" disabled>
+                            <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Back" disabled>
                                 <ChevronLeft className="h-4 w-4" />
                             </Button>
-                            <Button variant="ghost" size="icon" className="h-8 w-8" disabled>
+                            <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Forward" disabled>
                                 <ChevronRight className="h-4 w-4" />
                             </Button>
                         </div>
@@ -112,14 +112,14 @@ export function Layout({ children, currentView, onViewChange }: LayoutProps) {
                             </div>
                             <Separator orientation="vertical" className="h-5" />
                             <div className="flex items-center gap-0.5">
-                                <Button variant="ghost" size="icon" className="h-8 w-8">
+                                <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Grid view">
                                     <LayoutGrid className="h-4 w-4" />
                                 </Button>
-                                <Button variant="ghost" size="icon" className="h-8 w-8">
+                                <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="List view">
                                     <List className="h-4 w-4" />
                                 </Button>
                             </div>
-                            <Button variant="ghost" size="icon" className="h-8 w-8">
+                            <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Refresh">
                                 <RefreshCw className="h-4 w-4" />
                             </Button>
                         </div>

@@ -67,7 +67,7 @@ export function AlbumDetail({ album, onBack }: AlbumDetailProps) {
     return (
         <div className="h-full w-full flex flex-col">
             <div className="flex items-center gap-2 p-4 border-b">
-                <Button variant="ghost" size="icon" onClick={onBack}>
+                <Button variant="ghost" size="icon" onClick={onBack} aria-label="Back to albums">
                     <ArrowLeft className="h-4 w-4" />
                 </Button>
                 <h1 className="text-xl font-bold">{album.name}</h1>

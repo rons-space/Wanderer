@@ -5,7 +5,7 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter }
 import { Label } from "./ui/label";
 import { Input } from "./ui/input";
 import { Button } from "./ui/button";
-import { Loader2, HardDrive, Brain, User, LayoutGrid, Copy, Info, Github, MessageCircle, Users, HandHeart, ExternalLink } from "lucide-react";
+import { Loader2, HardDrive, Brain, User, LayoutGrid, Copy, Info, Github, MessageCircle, Users, HandHeart, ExternalLink, type LucideIcon } from "lucide-react";
 import { Alert, AlertTitle, AlertDescription } from "./ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { Switch } from "./ui/switch";
@@ -52,6 +52,48 @@ type ModelDownloadProgress = {
     current: number;
     total: number;
 };
+
+/**
+ * One row of the About tab's link list. The four rows were copies of each
+ * other, and the copy/open buttons in each carried no accessible name: they
+ * render an icon only, so a screen reader announced four pairs of unlabelled
+ * buttons. The title now names the buttons as well as the row.
+ */
+function AboutLink({
+    icon: Icon,
+    title,
+    url,
+    onCopy,
+    onOpen,
+}: {
+    icon: LucideIcon;
+    title: string;
+    url: string;
+    onCopy: () => void;
+    onOpen: () => void;
+}) {
+    return (
+        <div className="rounded-lg border p-3 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 min-w-0">
+                    <Icon className="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+                    <div className="min-w-0">
+                        <p className="text-sm font-medium">{title}</p>
+                        <p className="text-muted-foreground truncate text-xs">{url || "Not configured yet"}</p>
+                    </div>
+                </div>
+                <div className="flex items-center gap-2">
+                    <Button size="icon" variant="outline" disabled={!url} onClick={onCopy} aria-label={`Copy ${title} link`}>
+                        <Copy className="h-4 w-4" aria-hidden="true" />
+                    </Button>
+                    <Button size="icon" variant="outline" disabled={!url} onClick={onOpen} aria-label={`Open ${title} link`}>
+                        <ExternalLink className="h-4 w-4" aria-hidden="true" />
+                    </Button>
+                </div>
+            </div>
+        </div>
+    );
+}
 
 const ABOUT_LINKS = {
     github: "https://github.com/rons-space/Wanderer",
@@ -1164,121 +1206,34 @@ export function Settings() {
                                 <div className="space-y-3">
                                     <Label>Links</Label>
 
-                                    <div className="rounded-lg border p-3 space-y-3">
-                                        <div className="flex items-center justify-between gap-3">
-                                            <div className="flex items-center gap-2 min-w-0">
-                                                <Github className="h-4 w-4 text-muted-foreground" />
-                                                <div className="min-w-0">
-                                                    <p className="text-sm font-medium">GitHub Repository</p>
-                                                    <p className="text-xs text-muted-foreground truncate">{ABOUT_LINKS.github}</p>
-                                                </div>
-                                            </div>
-                                            <div className="flex items-center gap-2">
-                                                <Button size="icon" variant="outline" onClick={() => copyText(ABOUT_LINKS.github, "GitHub link copied")}>
-                                                    <Copy className="h-4 w-4" />
-                                                </Button>
-                                                <Button size="icon" variant="outline" onClick={() => openExternalLink(ABOUT_LINKS.github)}>
-                                                    <ExternalLink className="h-4 w-4" />
-                                                </Button>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div className="rounded-lg border p-3 space-y-3">
-                                        <div className="flex items-center justify-between gap-3">
-                                            <div className="flex items-center gap-2 min-w-0">
-                                                <MessageCircle className="h-4 w-4 text-muted-foreground" />
-                                                <div className="min-w-0">
-                                                    <p className="text-sm font-medium">Telegram Channel</p>
-                                                    <p className="text-xs text-muted-foreground truncate">
-                                                        {ABOUT_LINKS.telegramChannel || "Not configured yet"}
-                                                    </p>
-                                                </div>
-                                            </div>
-                                            <div className="flex items-center gap-2">
-                                                <Button
-                                                    size="icon"
-                                                    variant="outline"
-                                                    disabled={!ABOUT_LINKS.telegramChannel}
-                                                    onClick={() => copyText(ABOUT_LINKS.telegramChannel, "Telegram channel link copied")}
-                                                >
-                                                    <Copy className="h-4 w-4" />
-                                                </Button>
-                                                <Button
-                                                    size="icon"
-                                                    variant="outline"
-                                                    disabled={!ABOUT_LINKS.telegramChannel}
-                                                    onClick={() => openExternalLink(ABOUT_LINKS.telegramChannel)}
-                                                >
-                                                    <ExternalLink className="h-4 w-4" />
-                                                </Button>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div className="rounded-lg border p-3 space-y-3">
-                                        <div className="flex items-center justify-between gap-3">
-                                            <div className="flex items-center gap-2 min-w-0">
-                                                <Users className="h-4 w-4 text-muted-foreground" />
-                                                <div className="min-w-0">
-                                                    <p className="text-sm font-medium">Support Group</p>
-                                                    <p className="text-xs text-muted-foreground truncate">
-                                                        {ABOUT_LINKS.supportGroup || "Not configured yet"}
-                                                    </p>
-                                                </div>
-                                            </div>
-                                            <div className="flex items-center gap-2">
-                                                <Button
-                                                    size="icon"
-                                                    variant="outline"
-                                                    disabled={!ABOUT_LINKS.supportGroup}
-                                                    onClick={() => copyText(ABOUT_LINKS.supportGroup, "Support group link copied")}
-                                                >
-                                                    <Copy className="h-4 w-4" />
-                                                </Button>
-                                                <Button
-                                                    size="icon"
-                                                    variant="outline"
-                                                    disabled={!ABOUT_LINKS.supportGroup}
-                                                    onClick={() => openExternalLink(ABOUT_LINKS.supportGroup)}
-                                                >
-                                                    <ExternalLink className="h-4 w-4" />
-                                                </Button>
-                                            </div>
-                                        </div>
-                                    </div>
-
-                                    <div className="rounded-lg border p-3 space-y-3">
-                                        <div className="flex items-center justify-between gap-3">
-                                            <div className="flex items-center gap-2 min-w-0">
-                                                <HandHeart className="h-4 w-4 text-muted-foreground" />
-                                                <div className="min-w-0">
-                                                    <p className="text-sm font-medium">Donation</p>
-                                                    <p className="text-xs text-muted-foreground truncate">
-                                                        {ABOUT_LINKS.donate || "Not configured yet"}
-                                                    </p>
-                                                </div>
-                                            </div>
-                                            <div className="flex items-center gap-2">
-                                                <Button
-                                                    size="icon"
-                                                    variant="outline"
-                                                    disabled={!ABOUT_LINKS.donate}
-                                                    onClick={() => copyText(ABOUT_LINKS.donate, "Donation link copied")}
-                                                >
-                                                    <Copy className="h-4 w-4" />
-                                                </Button>
-                                                <Button
-                                                    size="icon"
-                                                    variant="outline"
-                                                    disabled={!ABOUT_LINKS.donate}
-                                                    onClick={() => openExternalLink(ABOUT_LINKS.donate)}
-                                                >
-                                                    <ExternalLink className="h-4 w-4" />
-                                                </Button>
-                                            </div>
-                                        </div>
-                                    </div>
+                                    <AboutLink
+                                        icon={Github}
+                                        title="GitHub Repository"
+                                        url={ABOUT_LINKS.github}
+                                        onCopy={() => copyText(ABOUT_LINKS.github, "GitHub link copied")}
+                                        onOpen={() => openExternalLink(ABOUT_LINKS.github)}
+                                    />
+                                    <AboutLink
+                                        icon={MessageCircle}
+                                        title="Telegram Channel"
+                                        url={ABOUT_LINKS.telegramChannel}
+                                        onCopy={() => copyText(ABOUT_LINKS.telegramChannel, "Telegram channel link copied")}
+                                        onOpen={() => openExternalLink(ABOUT_LINKS.telegramChannel)}
+                                    />
+                                    <AboutLink
+                                        icon={Users}
+                                        title="Support Group"
+                                        url={ABOUT_LINKS.supportGroup}
+                                        onCopy={() => copyText(ABOUT_LINKS.supportGroup, "Support group link copied")}
+                                        onOpen={() => openExternalLink(ABOUT_LINKS.supportGroup)}
+                                    />
+                                    <AboutLink
+                                        icon={HandHeart}
+                                        title="Donation"
+                                        url={ABOUT_LINKS.donate}
+                                        onCopy={() => copyText(ABOUT_LINKS.donate, "Donation link copied")}
+                                        onOpen={() => openExternalLink(ABOUT_LINKS.donate)}
+                                    />
                                 </div>
                             </CardContent>
                         </Card>

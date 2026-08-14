@@ -136,6 +136,8 @@ export function MediaListView({
                     item={selectedItem}
                     open={!!selectedItem}
                     onClose={() => setSelectedItem(null)}
+                    items={items}
+                    onNavigate={setSelectedItem}
                 />
             )}
         </div>

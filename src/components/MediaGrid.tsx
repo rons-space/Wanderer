@@ -1,4 +1,4 @@
-import { useState, useRef, useLayoutEffect, useCallback, ComponentType, ReactNode, useMemo, useEffect } from "react";
+import { useState, useRef, useLayoutEffect, useCallback, memo, ComponentType, ReactNode, useMemo, useEffect } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { MediaItem, Album } from "../types";
@@ -88,6 +88,29 @@ const getTimelineTimestamp = (item: MediaItem): number => {
     return parseDateTakenToTimestamp(item.date_taken) ?? item.created_at;
 };
 
+/**
+ * What a screen reader announces for a cell. The filename is the only thing
+ * that distinguishes one photo from another to a non-sighted user, so it leads,
+ * and the rest of the badges the cell draws are spelled out after it.
+ */
+const describeItem = (item: MediaItem): string => {
+    const name = item.file_path.split(/[\\/]/).pop() || `Media ${item.id}`;
+    const kind = item.mime_type?.startsWith("video") ? "Video" : "Photo";
+    const notes: string[] = [];
+
+    if (item.is_favorite) {
+        notes.push("favorite");
+    }
+    if (item.rating > 0) {
+        notes.push(`rated ${item.rating} of 5`);
+    }
+    if (item.is_cloud_only) {
+        notes.push("cloud only");
+    }
+
+    return notes.length > 0 ? `${kind} ${name}, ${notes.join(", ")}` : `${kind} ${name}`;
+};
+
 // --- Custom AutoSizer ---
 const useResizeObserver = (ref: React.RefObject<HTMLElement | null>) => {
     const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
@@ -162,6 +185,17 @@ const VirtualGrid = ({
 }: VirtualGridProps) => {
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const [scrollTop, setScrollTop] = useState(0);
+    const scrollFrameRef = useRef<number | null>(null);
+    const pendingScrollRef = useRef<{ scrollTop: number; clientHeight: number; scrollHeight: number } | null>(null);
+
+    useEffect(
+        () => () => {
+            if (scrollFrameRef.current !== null) {
+                cancelAnimationFrame(scrollFrameRef.current);
+            }
+        },
+        [],
+    );
 
     const SEPARATOR_ROW_HEIGHT = 36;
     const ITEM_ROW_HEIGHT = columnWidth + gap;
@@ -270,32 +304,52 @@ const VirtualGrid = ({
         onScroll(0, height, totalHeight, 0);
     }, [totalHeight, height, onScroll]);
 
+    /**
+     * Coalesced onto the next animation frame. A trackpad flick fires scroll
+     * events far faster than the display refreshes, and each one used to
+     * re-render every visible cell and restart the floating date header's
+     * timer. One frame's worth of work per frame is all that can be shown.
+     */
     const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
         const { scrollTop, clientHeight, scrollHeight } = e.currentTarget;
-        setScrollTop(scrollTop);
+        pendingScrollRef.current = { scrollTop, clientHeight, scrollHeight };
 
-        const visibleRowIndex = findRowIndexAtOffset(scrollTop);
-        let visibleItemIndex: number | undefined;
-
-        if (visibleRowIndex >= 0) {
-            for (let index = visibleRowIndex; index < rowsWithLoading.length; index += 1) {
-                const row = rowsWithLoading[index];
-
-                if (row.type === 'separator') {
-                    visibleItemIndex = row.firstItemIndex;
-                    break;
-                }
-
-                if (items.length > 0) {
-                    visibleItemIndex = Math.min(row.startIndex, items.length - 1);
-                }
-                break;
-            }
+        if (scrollFrameRef.current !== null) {
+            return;
         }
 
-        onScroll(scrollTop, clientHeight, scrollHeight, visibleItemIndex);
-    };
+        scrollFrameRef.current = requestAnimationFrame(() => {
+            scrollFrameRef.current = null;
+            const pending = pendingScrollRef.current;
+            if (!pending) {
+                return;
+            }
+            pendingScrollRef.current = null;
 
+            setScrollTop(pending.scrollTop);
+
+            const visibleRowIndex = findRowIndexAtOffset(pending.scrollTop);
+            let visibleItemIndex: number | undefined;
+
+            if (visibleRowIndex >= 0) {
+                for (let index = visibleRowIndex; index < rowsWithLoading.length; index += 1) {
+                    const row = rowsWithLoading[index];
+
+                    if (row.type === 'separator') {
+                        visibleItemIndex = row.firstItemIndex;
+                        break;
+                    }
+
+                    if (items.length > 0) {
+                        visibleItemIndex = Math.min(row.startIndex, items.length - 1);
+                    }
+                    break;
+                }
+            }
+
+            onScroll(pending.scrollTop, pending.clientHeight, pending.scrollHeight, visibleItemIndex);
+        });
+    };
 
 
     return (
@@ -346,8 +400,12 @@ const VirtualGrid = ({
                         const top = rowTop;
 
                         columns.push(
+                            // Keyed by identity, not position: keying by index
+                            // makes React reuse a cell's DOM for a different
+                            // photo after any insertion or removal, so the old
+                            // image stays on screen until the new one decodes.
                             <div
-                                key={itemIndex}
+                                key={item ? `item-${item.id}` : `placeholder-${itemIndex}`}
                                 style={{
                                     position: "absolute",
                                     left,
@@ -383,7 +441,13 @@ const VirtualGrid = ({
 };
 
 // --- Cell Component ---
-const Cell = ({
+/**
+ * Memoised because the grid re-renders on every scroll frame while the cells it
+ * draws almost never change. This only pays off while every prop below keeps a
+ * stable identity, which is why the handlers arrive from `useMediaActions` and
+ * `ItemWrapper` lives at module scope rather than being redefined per render.
+ */
+const Cell = memo(({
     item,
     isLoading,
     ItemWrapper,
@@ -425,15 +489,31 @@ const Cell = ({
 
     const imagePath = item.thumbnail_path || item.file_path;
     const src = convertFileSrc(imagePath);
+    const label = describeItem(item);
 
     const content = (
+        // A div rather than a button because the cell contains its own buttons,
+        // which cannot be nested inside one. The role, tabindex and key handler
+        // are what a button would have given us for free.
         <div
-            className="group relative w-full h-full overflow-hidden rounded-xl border bg-muted shadow-sm transition-all hover:shadow-md cursor-pointer"
+            role="button"
+            tabIndex={0}
+            aria-label={label}
+            className="group focus-visible:ring-ring relative h-full w-full cursor-pointer overflow-hidden rounded-xl border bg-muted shadow-sm transition-all hover:shadow-md focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
             onClick={(e) => onItemClick && item && onItemClick(item, e)}
+            onKeyDown={(e) => {
+                if (e.key !== "Enter" && e.key !== " ") {
+                    return;
+                }
+                // Space scrolls the grid otherwise, which moves the cell the
+                // user was about to open out from under the focus ring.
+                e.preventDefault();
+                onItemClick?.(item);
+            }}
         >
             <img
                 src={src}
-                alt={`Media ${item.id}`}
+                alt=""
                 loading="lazy"
                 decoding="async"
                 className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
@@ -445,6 +525,9 @@ const Cell = ({
 
             {/* Favorite Heart Icon - Always visible if favorited, otherwise on hover */}
             <button
+                type="button"
+                aria-label={item.is_favorite ? "Remove from favorites" : "Add to favorites"}
+                aria-pressed={item.is_favorite}
                 className={`absolute top-2 left-2 flex items-center justify-center rounded-full p-1.5 backdrop-blur-sm transition-all ${item.is_favorite
                     ? 'bg-red-500/80 opacity-100'
                     : 'bg-black/50 opacity-0 group-hover:opacity-100'
@@ -642,7 +725,8 @@ const Cell = ({
             </ContextMenuContent>
         </ContextMenu>
     );
-};
+});
+Cell.displayName = "Cell";
 
 // --- Main MediaGrid Export ---
 

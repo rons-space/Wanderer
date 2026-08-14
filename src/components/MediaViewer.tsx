@@ -5,11 +5,19 @@ import { Badge } from "@/components/ui/badge";
 import { MediaItem, Face } from "@/types";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { api } from "@/lib/api";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 
 interface MediaViewerProps {
     item: MediaItem | null;
     open: boolean;
     onClose: () => void;
+    /**
+     * The list `item` was opened from. Supplying it turns on arrow-key and
+     * on-screen navigation; without it the viewer shows the one item, which is
+     * what the surfaces that open a single photo out of context want.
+     */
+    items?: MediaItem[];
+    onNavigate?: (item: MediaItem) => void;
 }
 
 interface TouchPoint {
@@ -17,7 +25,7 @@ interface TouchPoint {
     y: number;
 }
 
-export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
+export function MediaViewer({ item, open, onClose, items, onNavigate }: MediaViewerProps) {
     const [faces, setFaces] = useState<Face[]>([]);
     const [tags, setTags] = useState<string[]>([]);
     const [imgState, setImgState] = useState<{ clientW: number; clientH: number; naturalW: number; naturalH: number } | null>(null);
@@ -275,6 +283,32 @@ export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
         lastPanPoint.current = null;
     }, []);
 
+    const index = items && item ? items.findIndex((candidate) => candidate.id === item.id) : -1;
+    const previousItem = index > 0 ? items?.[index - 1] : undefined;
+    const nextItem = index >= 0 && items && index < items.length - 1 ? items[index + 1] : undefined;
+
+    // Arrow keys page through the list. Bound on the window rather than on the
+    // dialog because the focus lands wherever Radix puts it, which is not always
+    // inside a node that would see a bubbling key event.
+    useEffect(() => {
+        if (!open || !onNavigate) {
+            return;
+        }
+
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if (e.key === "ArrowLeft" && previousItem) {
+                e.preventDefault();
+                onNavigate(previousItem);
+            } else if (e.key === "ArrowRight" && nextItem) {
+                e.preventDefault();
+                onNavigate(nextItem);
+            }
+        };
+
+        window.addEventListener("keydown", handleKeyDown);
+        return () => window.removeEventListener("keydown", handleKeyDown);
+    }, [open, onNavigate, previousItem, nextItem]);
+
     if (!item) return null;
 
     return (
@@ -364,6 +398,27 @@ export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
                         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/70 text-white px-3 py-1 rounded-full text-sm">
                             {Math.round(scale * 100)}%
                         </div>
+                    )}
+
+                    {previousItem && onNavigate && (
+                        <button
+                            type="button"
+                            aria-label="Previous item"
+                            className="absolute top-1/2 left-4 -translate-y-1/2 rounded-full bg-black/60 p-2 text-white backdrop-blur-sm transition-colors hover:bg-black/80 focus-visible:ring-2 focus-visible:ring-white focus-visible:outline-none"
+                            onClick={() => onNavigate(previousItem)}
+                        >
+                            <ChevronLeft className="h-6 w-6" aria-hidden="true" />
+                        </button>
+                    )}
+                    {nextItem && onNavigate && (
+                        <button
+                            type="button"
+                            aria-label="Next item"
+                            className="absolute top-1/2 right-4 -translate-y-1/2 rounded-full bg-black/60 p-2 text-white backdrop-blur-sm transition-colors hover:bg-black/80 focus-visible:ring-2 focus-visible:ring-white focus-visible:outline-none"
+                            onClick={() => onNavigate(nextItem)}
+                        >
+                            <ChevronRight className="h-6 w-6" aria-hidden="true" />
+                        </button>
                     )}
                 </div>
             </DialogContent>
