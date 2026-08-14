@@ -12,7 +12,7 @@ import { Slider } from "./ui/slider";
 import { Separator } from "./ui/separator";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 import { toast } from "sonner";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { subscribe } from "@/lib/events";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Progress } from "./ui/progress";
@@ -115,14 +115,16 @@ export function Settings() {
 
         window.addEventListener('auth-changed', handleAuthChange);
 
-        let unlisten: UnlistenFn | undefined;
-        listen<ModelDownloadProgress>("model_download_progress", (event) => {
-            setDownloadProgress(event.payload);
-        }).then(u => { unlisten = u; });
+        const unsubscribe = subscribe<ModelDownloadProgress>(
+            "model_download_progress",
+            (event) => {
+                setDownloadProgress(event.payload);
+            },
+        );
 
         return () => {
             window.removeEventListener('auth-changed', handleAuthChange);
-            if (unlisten) unlisten();
+            unsubscribe();
         }
     }, []);
 

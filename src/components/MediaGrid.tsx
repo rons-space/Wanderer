@@ -673,16 +673,42 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
         setLocalItems(items);
     }, [items]);
 
+    // The floating date header schedules a hide on every scroll event. Without
+    // this, the last one outlives the component and fires setState on it.
+    useEffect(
+        () => () => {
+            if (hideHeaderTimeout.current) {
+                clearTimeout(hideHeaderTimeout.current);
+            }
+        },
+        [],
+    );
+
     // Load timeline grouping config
     useEffect(() => {
+        let cancelled = false;
+
         api.getAllConfig().then((data) => {
+            if (cancelled) return;
             const grouping = data?.timeline_grouping as TimelineGrouping || 'day';
             setTimelineGrouping(grouping);
         }).catch(console.error);
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     useEffect(() => {
-        api.getAlbums().then(setAlbums).catch(console.error);
+        let cancelled = false;
+
+        api.getAlbums().then((loaded) => {
+            if (!cancelled) setAlbums(loaded);
+        }).catch(console.error);
+
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     const handleAddToAlbum = async (mediaId: number, albumId: number) => {

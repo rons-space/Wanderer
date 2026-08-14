@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useLatestRequest } from "@/hooks/use-latest-request";
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { PLACEHOLDER_SRC, handleImageError } from '@/lib/placeholder';
 import { api } from "@/lib/api";
@@ -46,6 +47,7 @@ export function SmartAlbums() {
     const [selectedAlbum, setSelectedAlbum] = useState<SmartAlbumType | null>(null);
     const [albumItems, setAlbumItems] = useState<MediaItem[]>([]);
     const [selectedItem, setSelectedItem] = useState<MediaItem | null>(null);
+    const beginAlbumRequest = useLatestRequest();
 
     const loadCounts = useCallback(async () => {
         try {
@@ -65,6 +67,9 @@ export function SmartAlbums() {
 
     const loadAlbum = async (type: SmartAlbumType) => {
         setSelectedAlbum(type);
+        // Switching albums while one is loading used to render the slower album's
+        // contents under the newer album's heading.
+        const isCurrent = beginAlbumRequest();
         try {
             let items: MediaItem[];
             switch (type) {
@@ -78,8 +83,10 @@ export function SmartAlbums() {
                     items = await api.getTopRated(100, 0);
                     break;
             }
+            if (!isCurrent()) return;
             setAlbumItems(items);
         } catch (e) {
+            if (!isCurrent()) return;
             console.error("Failed to load album contents:", e);
             toast.error("Failed to load album contents");
         }

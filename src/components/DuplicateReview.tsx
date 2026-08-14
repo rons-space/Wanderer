@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { subscribe, subscribeAll } from "@/lib/events";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { PLACEHOLDER_SRC, handleImageError } from "@/lib/placeholder";
 import { api } from "@/lib/api";
@@ -60,22 +60,18 @@ export function DuplicateReview() {
         loadDuplicates();
 
         // Listen for scan progress events
-        const unlistenProgress = listen<[number, number]>("scan-duplicates-progress", (event) => {
-            setScanProgress({ current: event.payload[0], total: event.payload[1] });
-        });
-
-        const unlistenFinished = listen<number>("scan-duplicates-finished", (event) => {
-            setIsScanning(false);
-            if (event.payload > 0) {
-                toast.success(`Scanned ${event.payload} images`);
-                loadDuplicates(); // Reload to find new duplicates
-            }
-        });
-
-        return () => {
-            unlistenProgress.then(fn => fn());
-            unlistenFinished.then(fn => fn());
-        };
+        return subscribeAll([
+            subscribe<[number, number]>("scan-duplicates-progress", (event) => {
+                setScanProgress({ current: event.payload[0], total: event.payload[1] });
+            }),
+            subscribe<number>("scan-duplicates-finished", (event) => {
+                setIsScanning(false);
+                if (event.payload > 0) {
+                    toast.success(`Scanned ${event.payload} images`);
+                    loadDuplicates(); // Reload to find new duplicates
+                }
+            }),
+        ]);
     }, []);
 
     const handleScanLibrary = async () => {

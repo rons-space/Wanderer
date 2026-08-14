@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { api } from "@/lib/api";
 import { QueueItem, UploadEvent, UploadProgressEvent, QueueCounts, RateLimitEvent } from "@/types";
-import { listen } from "@tauri-apps/api/event";
+import { subscribe, subscribeAll } from "@/lib/events";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -40,42 +40,30 @@ export function UploadQueue() {
         loadData();
 
         // Listen for upload events
-        const unlistenStarted = listen<UploadEvent>("upload-started", () => {
-            loadData();
-        });
-
-        const unlistenCompleted = listen<UploadEvent>("upload-completed", (event) => {
-            toast.success(`Uploaded: ${getFileName(event.payload.filePath)}`);
-            loadData();
-        });
-
-        const unlistenFailed = listen<UploadEvent>("upload-failed", (event) => {
-            toast.error(`Upload failed: ${event.payload.error || "Unknown error"}`);
-            setCurrentProgress(null);
-            loadData();
-        });
-
-        // Listen for progress updates
-        const unlistenProgress = listen<UploadProgressEvent>("upload-progress", (event) => {
-            setCurrentProgress(event.payload);
-        });
-
-        // Listen for rate limit events
-        const unlistenRateLimit = listen<RateLimitEvent>("upload-rate-limited", (event) => {
-            const waitSecs = event.payload.waitSeconds;
-            setRateLimitCountdown(waitSecs);
-            setRateLimitTotal(waitSecs > 0 ? waitSecs : null);
-            setRateLimitFile(event.payload.filePath.split(/[/\\]/).pop() || event.payload.filePath);
-            toast.warning(`Rate limited by Telegram. Waiting ${waitSecs}s...`);
-        });
-
-        return () => {
-            unlistenStarted.then((fn) => fn());
-            unlistenCompleted.then((fn) => fn());
-            unlistenFailed.then((fn) => fn());
-            unlistenProgress.then((fn) => fn());
-            unlistenRateLimit.then((fn) => fn());
-        };
+        return subscribeAll([
+            subscribe<UploadEvent>("upload-started", () => {
+                loadData();
+            }),
+            subscribe<UploadEvent>("upload-completed", (event) => {
+                toast.success(`Uploaded: ${getFileName(event.payload.filePath)}`);
+                loadData();
+            }),
+            subscribe<UploadEvent>("upload-failed", (event) => {
+                toast.error(`Upload failed: ${event.payload.error || "Unknown error"}`);
+                setCurrentProgress(null);
+                loadData();
+            }),
+            subscribe<UploadProgressEvent>("upload-progress", (event) => {
+                setCurrentProgress(event.payload);
+            }),
+            subscribe<RateLimitEvent>("upload-rate-limited", (event) => {
+                const waitSecs = event.payload.waitSeconds;
+                setRateLimitCountdown(waitSecs);
+                setRateLimitTotal(waitSecs > 0 ? waitSecs : null);
+                setRateLimitFile(event.payload.filePath.split(/[/\\]/).pop() || event.payload.filePath);
+                toast.warning(`Rate limited by Telegram. Waiting ${waitSecs}s...`);
+            }),
+        ]);
     }, [loadData]);
 
     // Countdown timer for rate limiting

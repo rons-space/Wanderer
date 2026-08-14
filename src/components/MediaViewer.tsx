@@ -1,4 +1,5 @@
 import { useRef, useState, useEffect, useCallback } from "react";
+import { useLatestRequest } from "@/hooks/use-latest-request";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { MediaItem, Face } from "@/types";
@@ -22,6 +23,7 @@ export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
     const [imgState, setImgState] = useState<{ clientW: number; clientH: number; naturalW: number; naturalH: number } | null>(null);
     const [viewPath, setViewPath] = useState<string>("");
     const [isLoadingCloud, setIsLoadingCloud] = useState(false);
+    const beginItemLoad = useLatestRequest();
 
     // Zoom and pan state
     const [scale, setScale] = useState(1);
@@ -71,6 +73,12 @@ export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
 
     // Reset zoom when item changes or viewer closes
     useEffect(() => {
+        // Paging through an encrypted library decrypts and materialises each file,
+        // which takes long enough that a previous item routinely resolves after the
+        // current one. Without this guard the viewer shows the wrong photo, and in
+        // encrypted mode it is a photo the user did not ask to decrypt.
+        const isCurrent = beginItemLoad();
+
         if (item && open) {
             // Reset zoom/pan states
             setScale(1);
@@ -84,13 +92,15 @@ export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
                 setViewPath("");
                 api.downloadForView(item.id)
                     .then(path => {
-                        console.log("Downloaded cache path:", path);
+                        if (!isCurrent()) return;
                         setViewPath(path);
                     })
                     .catch(err => {
                         console.error("Failed to download cloud file:", err);
                     })
-                    .finally(() => setIsLoadingCloud(false));
+                    .finally(() => {
+                        if (isCurrent()) setIsLoadingCloud(false);
+                    });
             } else {
                 setViewPath(item.file_path);
                 setIsLoadingCloud(false);
@@ -99,14 +109,17 @@ export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
             // Load faces
             api.getFaces(item.id)
                 .then(faces => {
-                    console.log("Loaded faces:", faces);
+                    if (!isCurrent()) return;
                     setFaces(faces);
                 })
                 .catch(err => console.error("Failed to load faces:", err));
 
             // Load tags
             api.getTagsForMedia(item.id)
-                .then(setTags)
+                .then(loaded => {
+                    if (!isCurrent()) return;
+                    setTags(loaded);
+                })
                 .catch(console.error);
         } else {
             setFaces([]);
@@ -118,7 +131,7 @@ export function MediaViewer({ item, open, onClose }: MediaViewerProps) {
             setIsPanning(false);
             lastPanPoint.current = null;
         }
-    }, [item, open, setTranslateImmediate]);
+    }, [item, open, setTranslateImmediate, beginItemLoad]);
 
     const handleImageLoad = (e: React.SyntheticEvent<HTMLImageElement>) => {
         const { clientWidth, clientHeight, naturalWidth, naturalHeight } = e.currentTarget;
