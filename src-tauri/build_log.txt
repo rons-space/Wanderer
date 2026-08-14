@@ -1,1 +1,0 @@
-Build logs are generated locally during development and intentionally not kept in source control history.

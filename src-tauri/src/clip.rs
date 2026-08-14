@@ -22,6 +22,9 @@ use tokenizers::Tokenizer;
 use tract_onnx::tract_hir::internal::*;
 
 /// CLIP embedding dimension (ViT-B/32)
+// Nothing validates embedding length against this today; kept as the documented shape of
+// what `clip_embedding` rows contain.
+#[allow(dead_code)]
 pub const EMBEDDING_DIM: usize = 512;
 
 /// Model filenames
@@ -36,7 +39,10 @@ const TEXTUAL_MODEL_CANDIDATES: &[&str] = &[TEXTUAL_MODEL_NAME, LEGACY_TEXTUAL_M
 type RunnableModel = tract_onnx::prelude::SimplePlan<
     tract_onnx::prelude::TypedFact,
     Box<dyn tract_onnx::prelude::TypedOp>,
-    tract_onnx::prelude::Graph<tract_onnx::prelude::TypedFact, Box<dyn tract_onnx::prelude::TypedOp>>,
+    tract_onnx::prelude::Graph<
+        tract_onnx::prelude::TypedFact,
+        Box<dyn tract_onnx::prelude::TypedOp>,
+    >,
 >;
 
 /// Static storage for loaded models
@@ -81,14 +87,19 @@ impl tract_onnx::tract_hir::ops::expandable::Expansion for ClipRange {
         s.equals(&inputs[1].rank, 0)?;
         s.equals(&inputs[2].rank, 0)?;
         s.equals(&outputs[0].rank, 1)?;
-        s.given_3(&inputs[0].value, &inputs[1].value, &inputs[2].value, move |s, v0, v1, v2| {
-            let v0 = v0.cast_to::<TDim>()?;
-            let v1 = v1.cast_to::<TDim>()?;
-            let v2 = v2.cast_to::<i64>()?;
-            let out = (v1.to_scalar::<TDim>()?.clone() - v0.to_scalar::<TDim>()?)
-                .divceil(*v2.to_scalar::<i64>()? as _);
-            s.equals(&outputs[0].shape[0], out)
-        })?;
+        s.given_3(
+            &inputs[0].value,
+            &inputs[1].value,
+            &inputs[2].value,
+            move |s, v0, v1, v2| {
+                let v0 = v0.cast_to::<TDim>()?;
+                let v1 = v1.cast_to::<TDim>()?;
+                let v2 = v2.cast_to::<i64>()?;
+                let out = (v1.to_scalar::<TDim>()?.clone() - v0.to_scalar::<TDim>()?)
+                    .divceil(*v2.to_scalar::<i64>()? as _);
+                s.equals(&outputs[0].shape[0], out)
+            },
+        )?;
         Ok(())
     }
 
@@ -120,7 +131,10 @@ impl tract_onnx::tract_hir::ops::expandable::Expansion for ClipRange {
 fn clip_onnx() -> tract_onnx::Onnx {
     let mut onnx = tract_onnx::onnx();
     onnx.op_register.insert("Range", |_, _| {
-        Ok((tract_onnx::tract_hir::ops::expandable::expand(ClipRange), vec![]))
+        Ok((
+            tract_onnx::tract_hir::ops::expandable::expand(ClipRange),
+            vec![],
+        ))
     });
     onnx
 }
@@ -326,13 +340,17 @@ pub fn encode_image(image_path: &Path) -> Result<Vec<f32>, String> {
 
     // Normalize and convert to NCHW
     // CLIP Mean and Std for normalization
+    // The published CLIP constants, kept as written upstream rather than truncated to the
+    // nearest `f32`, so they stay recognisable against the reference implementation.
+    #[allow(clippy::excessive_precision)]
     let mean = [0.48145466, 0.4578275, 0.40821073];
+    #[allow(clippy::excessive_precision)]
     let std = [0.26862954, 0.26130258, 0.27577711];
 
     let image_tensor: Tensor =
         tract_ndarray::Array4::from_shape_fn((1, 3, 224, 224), |(_, c, y, x)| {
             let pixel = resized.get_pixel(x as u32, y as u32);
-            let val = pixel[c as usize] as f32 / 255.0;
+            let val = pixel[c] as f32 / 255.0;
             (val - mean[c]) / std[c]
         })
         .into();

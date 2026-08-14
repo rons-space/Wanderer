@@ -77,7 +77,9 @@ pub async fn run_upload_worker(
 
                 // Defensive dedupe at worker time: if current bytes already match an uploaded
                 // media hash, skip re-upload. This protects against transient watcher races.
-                if let Ok(hash) = media_utils::hash_file_streaming(std::path::Path::new(&item.file_path)) {
+                if let Ok(hash) =
+                    media_utils::hash_file_streaming(std::path::Path::new(&item.file_path))
+                {
                     if let Ok(true) = db.is_media_uploaded(&hash) {
                         info!(
                             "Skipping upload for {} (hash already uploaded)",

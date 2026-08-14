@@ -52,7 +52,7 @@ pub fn cleanup_cache(
         );
 
         // Sort by accessed time (oldest first)
-        files.sort_by(|a, b| a.2.cmp(&b.2));
+        files.sort_by_key(|(_, _, accessed)| *accessed);
 
         for (path, size, _) in files {
             if total_size <= max_size_bytes {

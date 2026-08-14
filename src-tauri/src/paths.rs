@@ -146,6 +146,10 @@ pub fn managed_roots(app_data: &Path) -> Vec<PathBuf> {
 ///
 /// Returns `None` when nothing usable survives, so the caller can fall back
 /// rather than create a directory named after whatever was in the file.
+// Nothing calls it yet: export sanitises date fragments with `sanitize_date_fragment`
+// below, and album names still reach the filesystem unsanitised. Kept for the caller that
+// should be using it.
+#[allow(dead_code)]
 pub fn sanitize_component(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
@@ -267,6 +271,6 @@ mod tests {
             Some("holiday2026")
         );
         assert_eq!(sanitize_component("../../etc").as_deref(), Some("etc"));
-        assert_eq!(sanitize_component("///").is_none(), true);
+        assert!(sanitize_component("///").is_none());
     }
 }

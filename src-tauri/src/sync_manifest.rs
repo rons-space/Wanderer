@@ -166,6 +166,10 @@ impl SyncManifest {
     ///
     /// For each media item, the version with the later `last_modified` timestamp wins.
     /// Albums are merged by name, with the remote version winning on conflict.
+    // Exercised by the tests below but not by the sync worker, which uploads a freshly
+    // built manifest instead of reconciling against the remote one. Kept because the
+    // last-write-wins rule it encodes is the intended behaviour.
+    #[allow(dead_code)]
     pub fn merge_from(&mut self, remote: &SyncManifest) {
         // Merge media metadata using LWW
         for (hash, remote_meta) in &remote.media {

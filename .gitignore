@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Environment files, which hold Telegram credentials during development
+.env
+.env.*
+!.env.example
+
+# Rust build output
+src-tauri/target

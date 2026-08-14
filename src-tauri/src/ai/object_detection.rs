@@ -10,28 +10,28 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tract_onnx::prelude::*;
 
-/// Model singleton
-static CLASSIFIER: OnceLock<
-    Option<
-        tract_onnx::prelude::SimplePlan<
-            tract_onnx::prelude::TypedFact,
-            Box<dyn tract_onnx::prelude::TypedOp>,
-            tract_onnx::prelude::Graph<
-                tract_onnx::prelude::TypedFact,
-                Box<dyn tract_onnx::prelude::TypedOp>,
-            >,
-        >,
+/// A loaded, runnable ONNX graph. Named for the same reason `clip.rs` names its own:
+/// the inferred type is four lines of `tract` generics.
+type RunnableModel = tract_onnx::prelude::SimplePlan<
+    tract_onnx::prelude::TypedFact,
+    Box<dyn tract_onnx::prelude::TypedOp>,
+    tract_onnx::prelude::Graph<
+        tract_onnx::prelude::TypedFact,
+        Box<dyn tract_onnx::prelude::TypedOp>,
     >,
-> = OnceLock::new();
+>;
+
+/// Model singleton
+static CLASSIFIER: OnceLock<Option<RunnableModel>> = OnceLock::new();
 
 const PRIMARY_MODEL_NAME: &str = "mobilenet_v2.onnx";
-const MODEL_ALIASES: &[&str] = &[
-    "MobileNetV2.onnx",
-    "mobilenetv2.onnx",
-    "mobilenet-v2.onnx",
-];
+const MODEL_ALIASES: &[&str] = &["MobileNetV2.onnx", "mobilenetv2.onnx", "mobilenet-v2.onnx"];
 
 /// ImageNet class labels (top 100 most useful for photo tagging)
+// Unread: `map_class_to_tag` below returns tags from hard-coded class ranges instead of
+// indexing this table. Kept because it is the vocabulary that mapping approximates, and
+// the replacement for that mapping needs it.
+#[allow(dead_code)]
 const IMAGENET_LABELS: &[&str] = &[
     "person",
     "bicycle",
@@ -318,11 +318,7 @@ where
     let mut last_error = String::new();
 
     for (idx, url) in urls.iter().enumerate() {
-        log::info!(
-            "Downloading MobileNet V2 from mirror {}: {}",
-            idx + 1,
-            url
-        );
+        log::info!("Downloading MobileNet V2 from mirror {}: {}", idx + 1, url);
 
         match download_from_url(
             &client,
@@ -437,8 +433,7 @@ where
         ));
     }
 
-    std::fs::rename(&temp_path, model_path)
-        .map_err(|e| format!("Failed to rename file: {}", e))?;
+    std::fs::rename(&temp_path, model_path).map_err(|e| format!("Failed to rename file: {}", e))?;
     Ok(())
 }
 

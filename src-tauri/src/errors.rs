@@ -1,3 +1,8 @@
+// Not referenced anywhere yet: all 74 commands return `Result<T, String>`, and the
+// frontend string-matches the messages. T32 (issue #40) wires this up and removes that
+// matching; until then the module is the contract it will be wired to.
+#![allow(dead_code)]
+
 use serde::Serialize;
 use thiserror::Error;
 

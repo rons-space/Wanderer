@@ -17,7 +17,9 @@ mod view_cache;
 mod watcher;
 
 use database::Database;
-use security::{EncryptionMode, MigrationStatus, RuntimeState, SecurityBundle, TelegramApiCredentials};
+use security::{
+    EncryptionMode, MigrationStatus, RuntimeState, SecurityBundle, TelegramApiCredentials,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
@@ -57,8 +59,8 @@ fn is_security_key(key: &str) -> bool {
 }
 
 fn fallback_app_data_dir() -> Result<std::path::PathBuf, String> {
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| "Could not find local data directory".to_string())?;
+    let base =
+        dirs::data_local_dir().ok_or_else(|| "Could not find local data directory".to_string())?;
     Ok(base.join(APP_DATA_FALLBACK_DIR_NAME))
 }
 
@@ -215,7 +217,9 @@ async fn materialize_thumbnail_path_for_response(
         return None;
     }
 
-    let cache_key = blake3::hash(src.to_string_lossy().as_bytes()).to_hex().to_string();
+    let cache_key = blake3::hash(src.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
     let output = cache_dir.join(format!("{}.jpg", cache_key));
 
     let needs_refresh = if output.exists() {
@@ -534,10 +538,7 @@ async fn start_encryption_migration(
 ) -> Result<(), String> {
     let db = {
         let db_guard = state.db.lock().await;
-        db_guard
-            .as_ref()
-            .ok_or("Database not initialized")?
-            .clone()
+        db_guard.as_ref().ok_or("Database not initialized")?.clone()
     };
 
     let bundle = load_security_bundle(&db)?
@@ -939,7 +940,7 @@ pub fn run() {
             db: Mutex::new(None),
             watcher: Mutex::new(None),
             security_runtime,
-            face_detector: face_detector,
+            face_detector,
         })
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -1014,14 +1015,17 @@ pub fn run() {
                     // Load BYOK Telegram API credentials from DPAPI-protected config.
                     match db.get_config(TELEGRAM_CREDS_KEY) {
                         Ok(Some(blob)) => {
-                            match security::unprotect_and_deserialize::<TelegramApiCredentials>(&blob)
-                            {
+                            match security::unprotect_and_deserialize::<TelegramApiCredentials>(
+                                &blob,
+                            ) {
                                 Ok(creds) => {
                                     state
                                         .telegram
                                         .set_credentials(creds.api_id, creds.api_hash)
                                         .await;
-                                    log::info!("Loaded Telegram API credentials from secure storage");
+                                    log::info!(
+                                        "Loaded Telegram API credentials from secure storage"
+                                    );
                                 }
                                 Err(e) => {
                                     log::warn!(
@@ -1072,8 +1076,11 @@ pub fn run() {
 
                     // Start AI Worker
                     let models_dir = app_dir.join("models");
-                    let ai_worker =
-                        ai::worker::AiWorker::new(db.clone(), state.face_detector.clone(), models_dir);
+                    let ai_worker = ai::worker::AiWorker::new(
+                        db.clone(),
+                        state.face_detector.clone(),
+                        models_dir,
+                    );
 
                     let worker_cancel = tokio_util::sync::CancellationToken::new();
                     let worker_cancel_clone = worker_cancel.clone();
@@ -1330,7 +1337,7 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
             }
 
             // Copy the file
-            if let Err(e) = std::fs::copy(&path, &dest_path) {
+            if let Err(e) = std::fs::copy(path, &dest_path) {
                 log::error!("Failed to copy file {:?} to {:?}: {}", path, dest_path, e);
             } else {
                 success_count += 1;
@@ -1521,14 +1528,15 @@ async fn export_media(
             std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
         }
 
-        let file_name = source_hint
-            .file_name()
-            .ok_or("Invalid file name")?;
+        let file_name = source_hint.file_name().ok_or("Invalid file name")?;
         let dest_file = folder.join(file_name);
 
         // Handle duplicate filenames
         let final_dest = if dest_file.exists() {
-            let stem = source_hint.file_stem().unwrap_or_default().to_string_lossy();
+            let stem = source_hint
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
             let ext = source_hint
                 .extension()
                 .map(|e| e.to_string_lossy().to_string())
@@ -2400,7 +2408,8 @@ async fn download_for_view(
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("bin");
-        let materialized_path = materialized_dir.join(format!("{}_{}.{}", media_id, cache_key, ext));
+        let materialized_path =
+            materialized_dir.join(format!("{}_{}.{}", media_id, cache_key, ext));
 
         let needs_refresh = if materialized_path.exists() {
             let src_m = std::fs::metadata(&cache_blob_path).and_then(|m| m.modified());
@@ -2576,7 +2585,7 @@ async fn import_sync_manifest(path: String, state: State<'_, AppState>) -> Resul
     }
 
     // Create any new albums from the manifest
-    for (_, album_meta) in &remote_manifest.albums {
+    for album_meta in remote_manifest.albums.values() {
         if db
             .get_album_by_name(&album_meta.name)
             .map_err(|e| e.to_string())?
@@ -2775,9 +2784,14 @@ mod tests {
             TELEGRAM_CREDS_KEY,
             SECURITY_MIGRATION_STATUS_KEY,
         ] {
-            assert!(is_security_key(key), "{key} must be treated as security state");
+            assert!(
+                is_security_key(key),
+                "{key} must be treated as security state"
+            );
         }
-        assert!(is_security_key(&format!("{SECURITY_MIGRATION_PENDING_PREFIX}42")));
+        assert!(is_security_key(&format!(
+            "{SECURITY_MIGRATION_PENDING_PREFIX}42"
+        )));
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use image::GenericImageView;
 use ndarray::Array4;
 use tract_onnx::prelude::*;
 
@@ -52,7 +51,7 @@ impl ArcFace {
 
         let tensor: Tensor = Array4::from_shape_fn((1, 3, 112, 112), |(_, c, y, x)| {
             let pixel = resized.get_pixel(x as u32, y as u32);
-            let val = pixel[c as usize] as f32;
+            let val = pixel[c] as f32;
             (val - 127.5) / 128.0
         })
         .into();

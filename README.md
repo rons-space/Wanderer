@@ -346,3 +346,13 @@ Production build:
 ```bash
 npm run build
 ```
+
+---
+
+## 📄 License
+
+[GNU Affero General Public License v3.0](LICENSE).
+
+The Affero clause is the point: if you run a modified Wander(er) as a network service,
+the people using it are entitled to your source. Running it on your own machine, which
+is what this application is for, carries no obligation at all.

@@ -10,7 +10,9 @@ import "leaflet.markercluster/dist/MarkerCluster.css";
 import "leaflet.markercluster/dist/MarkerCluster.Default.css";
 
 // Fix for default marker icons in webpack/vite
-delete (L.Icon.Default.prototype as any)._getIconUrl;
+// Leaflet resolves its default icon URLs through a private field that its own
+// types do not declare, so name the field rather than casting the prototype to any.
+delete (L.Icon.Default.prototype as { _getIconUrl?: unknown })._getIconUrl;
 L.Icon.Default.mergeOptions({
     iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
     iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",

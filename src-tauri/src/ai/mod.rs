@@ -88,7 +88,7 @@ impl FaceDetector {
         // Preprocess: (x - 127) / 128
         let tensor: Tensor = Array4::from_shape_fn((1, 3, 240, 320), |(_, c, y, x)| {
             let pixel = resized.get_pixel(x as u32, y as u32);
-            let val = pixel[c as usize] as f32;
+            let val = pixel[c] as f32;
             (val - 127.0) / 128.0
         })
         .into();
@@ -203,13 +203,10 @@ pub async fn download_arcface_model<F>(
 where
     F: Fn(&str, u64, u64) + Send + 'static + Clone,
 {
-    use futures_util::StreamExt;
-    use std::io::Write;
-
     // List of mirrors to try.
     // The buffalo_l one seems to return 401 sometimes or is gated.
     // We can try other known hosting locations or mirrors.
-    let urls = vec![
+    let urls = [
         // Mirror 1: yakhyo GitHub Release (v0.0.1) - Verified public asset
         "https://github.com/yakhyo/face-reidentification/releases/download/v0.0.1/w600k_r50.onnx",
         // Mirror 2: "maze" HuggingFace (seems public/ungated)

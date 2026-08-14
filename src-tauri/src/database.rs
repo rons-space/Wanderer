@@ -34,6 +34,10 @@ pub struct MediaItem {
     pub is_cloud_only: bool, // Local file removed, exists only on Telegram
 }
 
+/// One row of `get_uploaded_unencrypted_media`: media id, local path, Telegram media id
+/// and the thumbnail path where the item has one.
+pub type UnencryptedUpload = (i64, String, String, Option<String>);
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueueItem {
     pub id: i64,
@@ -198,6 +202,11 @@ impl Database {
         }
     }
 
+    // Every step in the chain closes with `version = N;` so the next one can be appended
+    // without reading the one above it. That makes the final assignment dead by
+    // construction, and deleting it would leave the last step shaped differently from
+    // all the others and the next author with a silently skipped migration.
+    #[allow(unused_assignments)]
     fn migrate(conn: &Connection) -> Result<()> {
         let mut version: i32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         log::info!("Database schema version: {}", version);
@@ -752,7 +761,7 @@ impl Database {
             Ok(_) => {}
             Err(e) => {
                 println!("CRITICAL DB ERROR updating faces: {}", e);
-                return Err(e.into());
+                return Err(e);
             }
         }
 
@@ -858,6 +867,9 @@ impl Database {
         Ok(Some(new_id))
     }
 
+    // Superseded by `get_people`; `search_media` is the only caller of the broken
+    // `escape_like_pattern`. Both go in T55 (issue #63), which owns their removal.
+    #[allow(dead_code)]
     pub fn get_persons(&self) -> Result<Vec<Person>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -889,7 +901,7 @@ impl Database {
     // --- CLIP Operations ---
 
     pub fn store_clip_embedding(&self, media_id: i64, embedding: &[f32]) -> Result<()> {
-        let mut conn = self.get_conn()?;
+        let conn = self.get_conn()?;
 
         // Convert f32 vector to bytes (Little Endian)
         let mut bytes = Vec::with_capacity(embedding.len() * 4);
@@ -942,7 +954,7 @@ impl Database {
                 let bytes: Vec<u8> = row.get(1)?;
 
                 // Convert bytes back to f32
-                if bytes.len() % 4 != 0 {
+                if !bytes.len().is_multiple_of(4) {
                     // Return empty or handle error? silently skip bad data
                     return Ok((id, Vec::new()));
                 }
@@ -1071,6 +1083,10 @@ impl Database {
 
     // --- Media Operations ---
 
+    // Eight and nine positional arguments mirror the columns being inserted. The fix is
+    // a parameter struct, which belongs with the `database.rs` split in T58 (issue #66)
+    // rather than in a CI change.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_media(
         &self,
         file_path: &str,
@@ -1108,6 +1124,7 @@ impl Database {
         Ok(media_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_media_synced(
         &self,
         file_path: &str,
@@ -1168,13 +1185,13 @@ impl Database {
 
     pub fn mark_media_encrypted_by_id(&self, media_id: i64) -> Result<usize> {
         let conn = self.get_conn()?;
-        conn.execute("UPDATE media SET is_encrypted = 1 WHERE id = ?1", [media_id])
+        conn.execute(
+            "UPDATE media SET is_encrypted = 1 WHERE id = ?1",
+            [media_id],
+        )
     }
 
-    pub fn get_uploaded_unencrypted_media(
-        &self,
-        limit: i32,
-    ) -> Result<Vec<(i64, String, String, Option<String>)>> {
+    pub fn get_uploaded_unencrypted_media(&self, limit: i32) -> Result<Vec<UnencryptedUpload>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, file_path, telegram_media_id, thumbnail_path
@@ -1235,7 +1252,7 @@ impl Database {
 
     pub fn get_media(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
         // Validate and clamp pagination parameters
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -1385,7 +1402,7 @@ impl Database {
 
     /// Get all videos
     pub fn get_videos(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -1402,7 +1419,7 @@ impl Database {
 
     /// Get recent media (last 30 days)
     pub fn get_recent(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -1419,7 +1436,7 @@ impl Database {
 
     /// Get top rated media (4+ stars)
     pub fn get_top_rated(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
@@ -1470,9 +1487,12 @@ impl Database {
         })
     }
 
+    // Unreachable: FTS5 search replaced it. Removed in T55 (issue #63) together with
+    // `escape_like_pattern`, whose only caller it is.
+    #[allow(dead_code)]
     pub fn search_media(&self, query: &str, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
         // Validate and clamp pagination parameters
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -1538,7 +1558,7 @@ impl Database {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
         let conn = self.get_conn()?;
 
@@ -1553,7 +1573,7 @@ impl Database {
         }
 
         if let Some(min_rating) = filters.min_rating {
-            conditions.push(format!("rating >= {}", min_rating.max(0).min(5)));
+            conditions.push(format!("rating >= {}", min_rating.clamp(0, 5)));
         }
 
         if let Some(date_from) = filters.date_from {
@@ -2009,7 +2029,7 @@ impl Database {
         offset: i32,
     ) -> Result<Vec<MediaItem>> {
         // Validate and clamp pagination parameters
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2097,7 +2117,7 @@ impl Database {
 
     /// Get all favorite media items.
     pub fn get_favorites(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2175,7 +2195,7 @@ impl Database {
 
     /// Get all items in trash.
     pub fn get_trash(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2231,6 +2251,10 @@ impl Database {
     }
 
     /// Permanently delete items that have been in trash for more than 30 days.
+    // No command or worker calls this yet, so trash grows without bound. Wiring it up
+    // is behaviour work, not lint work, so it keeps the retention policy documented here
+    // until then.
+    #[allow(dead_code)]
     pub fn empty_old_trash(&self) -> Result<usize> {
         let thirty_days_ago = OffsetDateTime::now_utc().unix_timestamp() - (30 * 24 * 60 * 60);
         let conn = self.get_conn()?;
@@ -2456,7 +2480,10 @@ impl Database {
         let mut updated = 0usize;
         for (media_id, file_path) in candidates {
             if !Path::new(&file_path).exists() {
-                conn.execute("UPDATE media SET is_cloud_only = 1 WHERE id = ?1", [media_id])?;
+                conn.execute(
+                    "UPDATE media SET is_cloud_only = 1 WHERE id = ?1",
+                    [media_id],
+                )?;
                 updated += 1;
             }
         }
@@ -2527,7 +2554,7 @@ impl Database {
 
     /// Get all archived media items.
     pub fn get_archived_media(&self, limit: i32, offset: i32) -> Result<Vec<MediaItem>> {
-        let limit = limit.max(0).min(1000);
+        let limit = limit.clamp(0, 1000);
         let offset = offset.max(0);
 
         let conn = self.get_conn()?;
@@ -2683,12 +2710,9 @@ impl Database {
         let mut grouped: std::collections::HashMap<usize, Vec<MediaItem>> =
             std::collections::HashMap::new();
 
-        for idx in 0..n {
+        for (idx, candidate) in candidates.iter().enumerate() {
             let root = find(&mut parent, idx);
-            grouped
-                .entry(root)
-                .or_default()
-                .push(candidates[idx].0.clone());
+            grouped.entry(root).or_default().push(candidate.0.clone());
         }
 
         let mut groups: Vec<Vec<MediaItem>> = grouped
@@ -2700,7 +2724,7 @@ impl Database {
             group.sort_by_key(|item| item.created_at);
         }
 
-        groups.sort_by(|a, b| b.len().cmp(&a.len()));
+        groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
         Ok(groups)
     }
 
@@ -2851,7 +2875,7 @@ impl Database {
         match result {
             Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -3032,7 +3056,7 @@ impl Database {
         match result {
             Ok(item) => Ok(Some(item)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -3055,7 +3079,7 @@ impl Database {
         match result {
             Ok(album) => Ok(Some(album)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -3174,6 +3198,9 @@ impl Database {
         Ok(())
     }
 
+    // The tag worker logs failures instead of recording them, so nothing calls this.
+    // Kept as the counterpart to `mark_clip_failed` until the worker uses it.
+    #[allow(dead_code)]
     pub fn mark_tags_failed(&self, media_id: i64) -> Result<()> {
         let conn = self.get_conn()?;
         conn.execute(
@@ -3222,6 +3249,10 @@ impl Database {
         Ok(())
     }
 
+    // Recovery helper with no caller: the startup path requeues through
+    // `queue_pending_tag_scans` instead. Kept because the NULL-embedding case it repairs
+    // is real and undetected elsewhere.
+    #[allow(dead_code)]
     pub fn reset_stuck_scans(&self) -> Result<usize> {
         let conn = self.get_conn()?;
 

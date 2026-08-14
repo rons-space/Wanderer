@@ -1,0 +1,5 @@
+# Empty on purpose beyond this note: the default clippy configuration is what CI
+# enforces, and every exception should be an explicit `#[allow]` at the site that
+# needs it, with a reason, rather than a repository-wide setting that hides the
+# same problem everywhere else.
+avoid-breaking-exported-api = false
