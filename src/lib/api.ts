@@ -1,6 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { MediaItem, Album, QueueItem, Face, QueueCounts, SearchFilters, Tag, Person } from "../types";
 
+export interface MigrationStatus {
+    running: boolean;
+    total: number;
+    processed: number;
+    succeeded: number;
+    failed: number;
+    lastError?: string | null;
+    /** Telegram message IDs whose unencrypted copy is still in the cloud. */
+    unpurgedPlaintext: number[];
+}
+
 export const api = {
     getSecurityStatus: async (): Promise<{
         onboardingComplete: boolean;
@@ -8,14 +19,7 @@ export const api = {
         encryptionConfigured: boolean;
         encryptionLocked: boolean;
         telegramCredentialsConfigured: boolean;
-        migration: {
-            running: boolean;
-            total: number;
-            processed: number;
-            succeeded: number;
-            failed: number;
-            lastError?: string | null;
-        };
+        migration: MigrationStatus;
     }> => {
         return await invoke("get_security_status");
     },
@@ -60,15 +64,16 @@ export const api = {
         return await invoke("start_encryption_migration");
     },
 
-    getEncryptionMigrationStatus: async (): Promise<{
-        running: boolean;
-        total: number;
-        processed: number;
-        succeeded: number;
-        failed: number;
-        lastError?: string | null;
-    }> => {
+    getEncryptionMigrationStatus: async (): Promise<MigrationStatus> => {
         return await invoke("get_encryption_migration_status");
+    },
+
+    /**
+     * Retry deleting plaintext copies the migration left in Telegram.
+     * Resolves with the number confirmed deleted by this attempt.
+     */
+    retryPlaintextPurge: async (): Promise<number> => {
+        return await invoke("retry_plaintext_purge");
     },
 
     getMe: async (): Promise<string> => {
