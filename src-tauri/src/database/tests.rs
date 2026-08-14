@@ -9,7 +9,7 @@ use super::*;
 /// The schema version the chain is expected to reach. Update this together with a
 /// new migration, which is the point: forgetting makes the test fail loudly here
 /// rather than quietly at a user's next startup.
-const CURRENT_SCHEMA_VERSION: i32 = 20;
+const CURRENT_SCHEMA_VERSION: i32 = 21;
 
 fn migrated() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory database");
@@ -1060,4 +1060,196 @@ fn a_backup_refuses_to_overwrite_an_existing_file() {
 
     assert!(tmp.db.backup_to(&dest).is_err());
     assert_eq!(std::fs::read(&dest).unwrap(), b"not a database");
+}
+
+/// A database at the state migration 21 inherits: the path index exists but is
+/// not unique, so rows can share a `file_path`.
+fn at_version_20() -> Connection {
+    let conn = migrated();
+    conn.execute_batch(
+        "DROP INDEX idx_media_file_path;
+         CREATE INDEX idx_media_file_path ON media(file_path);
+         PRAGMA user_version = 20;",
+    )
+    .unwrap();
+    conn
+}
+
+fn insert_media_row(
+    conn: &Connection,
+    path: &str,
+    hash: Option<&str>,
+    telegram_id: Option<&str>,
+    thumbnail: Option<&str>,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO media (file_path, file_hash, telegram_media_id, thumbnail_path, created_at)
+         VALUES (?1, ?2, ?3, ?4, 0)",
+        params![path, hash, telegram_id, thumbnail],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn media_ids(conn: &Connection) -> Vec<i64> {
+    let mut stmt = conn.prepare("SELECT id FROM media ORDER BY id").unwrap();
+    let ids = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<i64>, _>>()
+        .unwrap();
+    ids
+}
+
+/// The migration has to be invisible to everyone whose library is already
+/// consistent, which is nearly everyone.
+#[test]
+fn deduplication_leaves_a_healthy_library_alone() {
+    let conn = at_version_20();
+    let first = insert_media_row(&conn, "/photos/a.jpg", Some("hash-a"), None, None);
+    let second = insert_media_row(&conn, "/photos/b.jpg", Some("hash-b"), None, None);
+
+    Database::migrate(&conn).unwrap();
+
+    assert_eq!(media_ids(&conn), vec![first, second]);
+}
+
+/// The row with a Telegram copy is the one the cloud, the sync manifest and any
+/// other device already refer to, so it wins even when it is not the oldest.
+#[test]
+fn the_row_with_a_cloud_copy_survives_a_collision() {
+    let conn = at_version_20();
+    let local_only = insert_media_row(&conn, "/photos/a.jpg", Some("hash-a"), None, None);
+    let uploaded = insert_media_row(&conn, "/photos/a.jpg", Some("hash-b"), Some("tg-1"), None);
+
+    Database::migrate(&conn).unwrap();
+
+    assert_eq!(media_ids(&conn), vec![uploaded]);
+    assert!(!media_ids(&conn).contains(&local_only));
+}
+
+/// With nothing to choose between them, the oldest row wins, because everything
+/// else in the library has had longest to point at it.
+#[test]
+fn the_oldest_row_survives_when_neither_is_uploaded() {
+    let conn = at_version_20();
+    let first = insert_media_row(&conn, "/photos/a.jpg", None, None, None);
+    insert_media_row(&conn, "/photos/a.jpg", None, None, None);
+    insert_media_row(&conn, "/photos/a.jpg", None, None, None);
+
+    Database::migrate(&conn).unwrap();
+
+    assert_eq!(media_ids(&conn), vec![first]);
+}
+
+/// Cascading the loser away would silently drop the album memberships, faces and
+/// tags that hung off it, which is a worse outcome than the duplicate was.
+#[test]
+fn the_survivor_inherits_the_albums_faces_and_tags_of_the_loser() {
+    let conn = at_version_20();
+    let keeper = insert_media_row(&conn, "/photos/a.jpg", None, Some("tg-1"), None);
+    let loser = insert_media_row(&conn, "/photos/a.jpg", None, None, None);
+
+    conn.execute(
+        "INSERT INTO albums (id, name, created_at) VALUES (1, 'Trip', 0), (2, 'Best', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO album_media (album_id, media_id, added_at) VALUES (1, ?1, 0), (1, ?2, 0), (2, ?2, 0)",
+        params![keeper, loser],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO tags (id, name) VALUES (1, 'beach')", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO media_tags (media_id, tag_id, confidence) VALUES (?1, 1, 0.9)",
+        params![loser],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO faces (media_id, x, y, width, height, score) VALUES (?1, 0.1, 0.1, 0.2, 0.2, 0.9)",
+        params![loser],
+    )
+    .unwrap();
+
+    Database::migrate(&conn).unwrap();
+
+    let albums: Vec<i64> = conn
+        .prepare("SELECT album_id FROM album_media WHERE media_id = ?1 ORDER BY album_id")
+        .unwrap()
+        .query_map([keeper], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    // Album 1 held both rows, so the duplicate membership collapses rather than
+    // being inserted twice; album 2 moves across.
+    assert_eq!(albums, vec![1, 2]);
+
+    let faces: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM faces WHERE media_id = ?1",
+            [keeper],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(faces, 1);
+
+    let tags: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM media_tags WHERE media_id = ?1",
+            [keeper],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tags, 1);
+}
+
+/// The loser is often the row that was scanned first, so its hash and thumbnail
+/// are worth keeping when the survivor has none of its own.
+#[test]
+fn the_survivor_adopts_what_it_was_missing() {
+    let conn = at_version_20();
+    insert_media_row(
+        &conn,
+        "/photos/a.jpg",
+        Some("hash-a"),
+        None,
+        Some("/thumbs/a.jpg"),
+    );
+    let keeper = insert_media_row(&conn, "/photos/a.jpg", None, Some("tg-1"), None);
+
+    Database::migrate(&conn).unwrap();
+
+    // The newer row wins on the Telegram copy, then takes the scan results the
+    // older one had.
+    assert_eq!(media_ids(&conn), vec![keeper]);
+    let (hash, telegram, thumbnail): (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT file_hash, telegram_media_id, thumbnail_path FROM media WHERE id = ?1",
+            [keeper],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(hash.as_deref(), Some("hash-a"));
+    assert_eq!(telegram.as_deref(), Some("tg-1"));
+    assert_eq!(thumbnail.as_deref(), Some("/thumbs/a.jpg"));
+}
+
+/// The point of the migration: from here the invariant is the schema's problem
+/// rather than a convention every path-keyed write has to remember.
+#[test]
+fn a_second_row_for_a_path_is_refused() {
+    let conn = migrated();
+    insert_media(&conn, "/photos/a.jpg");
+
+    let second = conn.execute(
+        "INSERT INTO media (file_path, created_at) VALUES ('/photos/a.jpg', 0)",
+        [],
+    );
+
+    assert!(
+        second.is_err(),
+        "the unique index must reject a second row for the same path"
+    );
 }
