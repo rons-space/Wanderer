@@ -144,7 +144,7 @@ pub(crate) fn load_security_bundle(db: &Database) -> Result<Option<SecurityBundl
     match raw {
         Some(json) => serde_json::from_str::<SecurityBundle>(&json)
             .map(Some)
-            .map_err(|e| format!("Invalid security bundle: {}", e)),
+            .map_err(AppError::from),
         None => Ok(None),
     }
 }
@@ -432,9 +432,9 @@ async fn initialize_unencrypted_mode(state: State<'_, AppState>) -> Result<(), A
             .ok_or_else(AppError::database_not_initialized)?;
         if let Some(bundle) = load_security_bundle(db)? {
             if bundle.mode == EncryptionMode::Encrypted {
-                return Err(
-                    "Encryption is already enabled and cannot be downgraded in-place".to_string(),
-                );
+                return Err(AppError::invalid_input(
+                    "Encryption is already enabled and cannot be downgraded in-place",
+                ));
             }
         }
         let bundle = SecurityBundle::unencrypted();
@@ -877,7 +877,7 @@ async fn start_encryption_migration(
                         .await;
                     let _ = std::fs::remove_file(&temp_path);
 
-                    let uploaded_id = upload_res.map_err(AppError::from)?;
+                    let uploaded_id = upload_res.map_err(|e| AppError::telegram(e.to_string()))?;
                     db.set_config(&pending_key, &uploaded_id.to_string())
                         .map_err(AppError::from)?;
                     uploaded_id
@@ -957,9 +957,9 @@ async fn login_request_code(
     app: tauri::AppHandle,
 ) -> Result<(), AppError> {
     if !state.telegram.has_credentials().await {
-        return Err(
-            "Telegram API credentials are not configured. Complete onboarding first.".to_string(),
-        );
+        return Err(AppError::unavailable(
+            "Telegram API credentials are not configured. Complete onboarding first.",
+        ));
     }
     let app_dir = resolve_app_data_dir(&app)?;
     let master_key = state.security_runtime.lock().await.master_key.clone();
@@ -976,7 +976,11 @@ async fn login_request_code(
 
 #[tauri::command]
 async fn login_sign_in(code: String, state: State<'_, AppState>) -> Result<String, AppError> {
-    state.telegram.sign_in(&code).await
+    state
+        .telegram
+        .sign_in(&code)
+        .await
+        .map_err(AppError::telegram)
 }
 
 #[tauri::command]
@@ -986,14 +990,18 @@ async fn get_me(state: State<'_, AppState>) -> Result<String, AppError> {
             "Telegram API credentials are not configured",
         ));
     }
-    state.telegram.get_me().await
+    state.telegram.get_me().await.map_err(AppError::telegram)
 }
 
 #[tauri::command]
 async fn logout(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), AppError> {
     let app_dir = resolve_app_data_dir(&app)?;
 
-    state.telegram.logout(app_dir).await
+    state
+        .telegram
+        .logout(app_dir)
+        .await
+        .map_err(AppError::telegram)
 }
 
 #[tauri::command]
@@ -3184,6 +3192,7 @@ async fn download_clip_models(app: tauri::AppHandle) -> Result<(), AppError> {
         );
     })
     .await
+    .map_err(AppError::from)
 }
 
 /// Semantic search using CLIP embeddings
