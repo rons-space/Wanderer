@@ -160,24 +160,205 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
-fn hamming_distance(hash1: &str, hash2: &str) -> u32 {
-    let parsed_base64 = || -> Option<u32> {
-        let h1: ImageHash = ImageHash::from_base64(hash1).ok()?;
-        let h2: ImageHash = ImageHash::from_base64(hash2).ok()?;
-        Some(h1.dist(&h2))
-    };
+/// Largest pHash distance still considered the same picture.
+///
+/// The banding in `cluster_by_phash` is derived from this value, so the two have to
+/// move together: `THRESHOLD + 1` bands is what makes the bucketing exact.
+const PHASH_DISTANCE_THRESHOLD: u32 = 10;
 
-    if let Some(distance) = parsed_base64() {
-        return distance;
+/// A perceptual hash parsed into raw bits, once.
+///
+/// The stored text is base64 from `img_hash` for anything imported by this
+/// application, but older rows hold a hex `u64`, and both forms have to keep
+/// comparing. Parsing on every pair, which is what comparing the strings did,
+/// meant two base64 decodes per comparison and O(n^2) of them.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ParsedHash {
+    bits: Vec<u8>,
+}
+
+impl ParsedHash {
+    fn parse(text: &str) -> Option<Self> {
+        // base64 first, matching the order the string comparison used: a hex hash
+        // is also valid base64, so changing the order here would reinterpret every
+        // legacy hash and silently change which items are duplicates.
+        //
+        // The annotation picks `ImageHash`'s default byte container; without it the
+        // generic parameter is ambiguous at the call site.
+        let decoded: std::result::Result<ImageHash, _> = ImageHash::from_base64(text);
+        if let Ok(hash) = decoded {
+            return Some(Self {
+                bits: hash.as_bytes().to_vec(),
+            });
+        }
+
+        u64::from_str_radix(text, 16).ok().map(|value| Self {
+            bits: value.to_be_bytes().to_vec(),
+        })
     }
 
-    let parsed_hex = || -> Option<u32> {
-        let h1 = u64::from_str_radix(hash1, 16).ok()?;
-        let h2 = u64::from_str_radix(hash2, 16).ok()?;
-        Some((h1 ^ h2).count_ones())
-    };
+    fn width_bits(&self) -> usize {
+        self.bits.len() * 8
+    }
 
-    parsed_hex().unwrap_or(u32::MAX)
+    fn distance(&self, other: &Self) -> u32 {
+        debug_assert_eq!(self.bits.len(), other.bits.len());
+        self.bits
+            .iter()
+            .zip(other.bits.iter())
+            .map(|(a, b)| (a ^ b).count_ones())
+            .sum()
+    }
+
+    /// The bits of the half-open range `[from, to)`, as a bucket key.
+    fn band(&self, from: usize, to: usize) -> u64 {
+        let mut key = 0u64;
+        for bit in from..to {
+            key <<= 1;
+            let byte = self.bits[bit / 8];
+            key |= ((byte >> (7 - (bit % 8))) & 1) as u64;
+        }
+        key
+    }
+}
+
+/// Group items whose perceptual hashes are within `threshold` bits of each other.
+///
+/// The pairwise scan this replaces was O(n^2) *distance computations*, each one
+/// re-parsing two base64 strings, and it ran with the database lock held. Here each
+/// hash is parsed once, and pairs are proposed by bucketing rather than by trying
+/// all of them.
+///
+/// The bucketing is exact rather than approximate. Splitting a hash into
+/// `threshold + 1` bands means two hashes within `threshold` bits differ in at most
+/// `threshold` bands, so at least one band is identical and the pair always meets in
+/// some bucket. Every proposed pair is still checked with the real distance, so the
+/// result is what the exhaustive scan produced.
+fn cluster_by_phash(candidates: Vec<(MediaItem, String)>, threshold: u32) -> Vec<Vec<MediaItem>> {
+    let parsed: Vec<(MediaItem, Option<ParsedHash>)> = candidates
+        .into_iter()
+        .map(|(item, text)| {
+            let hash = ParsedHash::parse(&text);
+            (item, hash)
+        })
+        .collect();
+
+    let n = parsed.len();
+    if n < 2 {
+        return Vec::new();
+    }
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut rank = vec![0usize; n];
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+
+    fn union(parent: &mut [usize], rank: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra == rb {
+            return;
+        }
+        match rank[ra].cmp(&rank[rb]) {
+            std::cmp::Ordering::Less => parent[ra] = rb,
+            std::cmp::Ordering::Greater => parent[rb] = ra,
+            std::cmp::Ordering::Equal => {
+                parent[rb] = ra;
+                rank[ra] += 1;
+            }
+        }
+    }
+
+    let band_count = threshold as usize + 1;
+
+    // Hashes of different widths are not comparable, so bucket within a width.
+    let mut by_width: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, (_, hash)) in parsed.iter().enumerate() {
+        if let Some(hash) = hash {
+            by_width.entry(hash.width_bits()).or_default().push(index);
+        }
+    }
+
+    for (width, indices) in by_width {
+        if width < band_count {
+            // Too narrow to band: fall back to comparing the group directly. This is
+            // the degenerate case of a hash shorter than 11 bits, which no supported
+            // configuration produces.
+            for (a, &i) in indices.iter().enumerate() {
+                for &j in &indices[a + 1..] {
+                    let (Some(hi), Some(hj)) = (&parsed[i].1, &parsed[j].1) else {
+                        continue;
+                    };
+                    if hi.distance(hj) <= threshold {
+                        union(&mut parent, &mut rank, i, j);
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mut buckets: std::collections::HashMap<(usize, u64), Vec<usize>> =
+            std::collections::HashMap::new();
+
+        for band in 0..band_count {
+            let from = width * band / band_count;
+            let to = width * (band + 1) / band_count;
+            for &index in &indices {
+                let Some(hash) = &parsed[index].1 else {
+                    continue;
+                };
+                buckets
+                    .entry((band, hash.band(from, to)))
+                    .or_default()
+                    .push(index);
+            }
+        }
+
+        for members in buckets.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+            for (a, &i) in members.iter().enumerate() {
+                for &j in &members[a + 1..] {
+                    if find(&mut parent, i) == find(&mut parent, j) {
+                        continue;
+                    }
+                    let (Some(hi), Some(hj)) = (&parsed[i].1, &parsed[j].1) else {
+                        continue;
+                    };
+                    if hi.distance(hj) <= threshold {
+                        union(&mut parent, &mut rank, i, j);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut grouped: std::collections::HashMap<usize, Vec<MediaItem>> =
+        std::collections::HashMap::new();
+    for (index, (item, _)) in parsed.into_iter().enumerate() {
+        let root = find(&mut parent, index);
+        grouped.entry(root).or_default().push(item);
+    }
+
+    let mut groups: Vec<Vec<MediaItem>> = grouped
+        .into_values()
+        .filter(|items| items.len() > 1)
+        .collect();
+
+    for group in &mut groups {
+        group.sort_by_key(|item| item.created_at);
+    }
+
+    groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
+    groups
 }
 
 pub struct Database {
@@ -2252,15 +2433,6 @@ impl Database {
     // --- Duplicate Detection (FR-12) ---
 
     /// Update the perceptual hash for a media item
-    pub fn update_phash(&self, media_id: i64, phash: &str) -> Result<()> {
-        let conn = self.get_conn()?;
-        conn.execute(
-            "UPDATE media SET phash = ?1 WHERE id = ?2",
-            (phash, media_id),
-        )?;
-        Ok(())
-    }
-
     /// Get media items that don't have a phash computed yet
     /// Returns (id, file_path) pairs for images only (not videos)
     pub fn get_media_without_phash(&self) -> Result<Vec<(i64, String)>> {
@@ -2337,33 +2509,82 @@ impl Database {
 
     /// Reconcile cloud-only flags against filesystem state.
     /// If local file is missing but Telegram ID exists, mark as cloud-only.
+    ///
+    /// This runs at startup over the whole library. It used to hold the connection
+    /// while stat-ing every candidate file and then commit one implicit transaction
+    /// per missing file, which is one fsync each on a path where nothing else can
+    /// touch the database. The stat pass now happens with the lock released, and the
+    /// writes go in as a single transaction.
     pub fn reconcile_cloud_only_flags(&self) -> Result<usize> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, file_path
-             FROM media
-             WHERE (is_deleted = 0 OR is_deleted IS NULL)
-               AND telegram_media_id IS NOT NULL
-               AND telegram_media_id != ''
-               AND (is_cloud_only IS NULL OR is_cloud_only = 0)",
-        )?;
+        let candidates: Vec<(i64, String)> = {
+            let conn = self.get_conn()?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, file_path
+                 FROM media
+                 WHERE (is_deleted = 0 OR is_deleted IS NULL)
+                   AND telegram_media_id IS NOT NULL
+                   AND telegram_media_id != ''
+                   AND (is_cloud_only IS NULL OR is_cloud_only = 0)",
+            )?;
 
-        let candidates: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        let missing: Vec<i64> = candidates
+            .into_iter()
+            .filter(|(_, file_path)| !Path::new(file_path).exists())
+            .map(|(media_id, _)| media_id)
             .collect();
 
-        let mut updated = 0usize;
-        for (media_id, file_path) in candidates {
-            if !Path::new(&file_path).exists() {
-                conn.execute(
-                    "UPDATE media SET is_cloud_only = 1 WHERE id = ?1",
-                    [media_id],
-                )?;
-                updated += 1;
-            }
+        if missing.is_empty() {
+            return Ok(0);
         }
 
+        self.mark_cloud_only(&missing)
+    }
+
+    /// Mark a batch of media items as cloud-only, in one transaction.
+    pub fn mark_cloud_only(&self, media_ids: &[i64]) -> Result<usize> {
+        if media_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        let mut updated = 0usize;
+        {
+            let mut stmt = tx.prepare("UPDATE media SET is_cloud_only = 1 WHERE id = ?1")?;
+            for media_id in media_ids {
+                updated += stmt.execute([media_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Store a batch of perceptual hashes in one transaction.
+    ///
+    /// The scan paths compute thousands of these. Writing them one statement at a
+    /// time meant one implicit transaction, and one fsync, per photo.
+    pub fn update_phashes(&self, hashes: &[(i64, String)]) -> Result<usize> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        let mut updated = 0usize;
+        {
+            let mut stmt = tx.prepare("UPDATE media SET phash = ?1 WHERE id = ?2")?;
+            for (media_id, phash) in hashes {
+                updated += stmt.execute(params![phash, media_id])?;
+            }
+        }
+        tx.commit()?;
         Ok(updated)
     }
 
@@ -2416,84 +2637,31 @@ impl Database {
         Ok(media)
     }
 
-    /// Find potential duplicates based on perceptual hash
-    /// Returns groups of media items with similar pHash values.
+    /// Find potential duplicates based on perceptual hash.
+    ///
+    /// Returns groups of media items with similar pHash values, oldest first
+    /// within a group and largest group first.
     pub fn find_duplicates(&self) -> Result<Vec<Vec<MediaItem>>> {
-        let conn = self.get_conn()?;
-        const PHASH_DISTANCE_THRESHOLD: u32 = 10;
+        let candidates: Vec<(MediaItem, String)> = {
+            let conn = self.get_conn()?;
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {MEDIA_COLUMNS}, phash
+                 FROM media
+                 WHERE phash IS NOT NULL AND is_deleted = 0
+                 ORDER BY created_at ASC"
+            ))?;
 
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {MEDIA_COLUMNS}, phash
-             FROM media
-             WHERE phash IS NOT NULL AND is_deleted = 0
-             ORDER BY created_at ASC"
-        ))?;
+            let rows = stmt
+                .query_map([], |row| Ok((Self::map_media_row(row)?, row.get(24)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+            // The connection guard is dropped here, deliberately: clustering is pure
+            // computation over data already in memory, and holding the single
+            // database lock across it blocked every other query in the process.
+        };
 
-        let candidates: Vec<(MediaItem, String)> = stmt
-            .query_map([], |row| Ok((Self::map_media_row(row)?, row.get(24)?)))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let n = candidates.len();
-        if n < 2 {
-            return Ok(Vec::new());
-        }
-
-        let mut parent: Vec<usize> = (0..n).collect();
-        let mut rank = vec![0usize; n];
-
-        fn find(parent: &mut [usize], x: usize) -> usize {
-            if parent[x] != x {
-                let root = find(parent, parent[x]);
-                parent[x] = root;
-            }
-            parent[x]
-        }
-
-        fn union(parent: &mut [usize], rank: &mut [usize], a: usize, b: usize) {
-            let ra = find(parent, a);
-            let rb = find(parent, b);
-            if ra == rb {
-                return;
-            }
-            if rank[ra] < rank[rb] {
-                parent[ra] = rb;
-            } else if rank[ra] > rank[rb] {
-                parent[rb] = ra;
-            } else {
-                parent[rb] = ra;
-                rank[ra] += 1;
-            }
-        }
-
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let distance = hamming_distance(&candidates[i].1, &candidates[j].1);
-                if distance <= PHASH_DISTANCE_THRESHOLD {
-                    union(&mut parent, &mut rank, i, j);
-                }
-            }
-        }
-
-        let mut grouped: std::collections::HashMap<usize, Vec<MediaItem>> =
-            std::collections::HashMap::new();
-
-        for (idx, candidate) in candidates.iter().enumerate() {
-            let root = find(&mut parent, idx);
-            grouped.entry(root).or_default().push(candidate.0.clone());
-        }
-
-        let mut groups: Vec<Vec<MediaItem>> = grouped
-            .into_values()
-            .filter(|items| items.len() > 1)
-            .collect();
-
-        for group in &mut groups {
-            group.sort_by_key(|item| item.created_at);
-        }
-
-        groups.sort_by_key(|group| std::cmp::Reverse(group.len()));
-        Ok(groups)
+        Ok(cluster_by_phash(candidates, PHASH_DISTANCE_THRESHOLD))
     }
 
     // --- People / Face Recognition (FR-6) ---
@@ -2710,6 +2878,35 @@ impl Database {
             .collect();
 
         Ok(albums)
+    }
+
+    /// Album names for every media item that is in at least one album.
+    ///
+    /// The sync manifest needs names and nothing else. Calling
+    /// `get_albums_for_media` per photo ran two correlated cover subqueries over the
+    /// whole library for each one, to build a cover path the manifest then threw
+    /// away. This is the same information in a single scan.
+    pub fn album_names_by_media(&self) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT am.media_id, a.name
+             FROM album_media am
+             INNER JOIN albums a ON a.id = am.album_id
+             ORDER BY am.media_id",
+        )?;
+
+        let mut by_media: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (media_id, name) = row?;
+            by_media.entry(media_id).or_default().push(name);
+        }
+
+        Ok(by_media)
     }
 
     /// Get a media item by its blake3 hash
@@ -3130,6 +3327,255 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    /// The batched writes have to behave exactly like the per-row statements they
+    /// replace, including the count they report back.
+    #[test]
+    fn batched_writes_report_what_they_changed() {
+        let temp = TempDb::new();
+        let a = insert_media_with_camera(&temp.db, "/library/a.jpg", "Canon");
+        let b = insert_media_with_camera(&temp.db, "/library/b.jpg", "Canon");
+
+        assert_eq!(temp.db.update_phashes(&[]).unwrap(), 0);
+        let written = temp
+            .db
+            .update_phashes(&[(a, "aaaa".to_string()), (b, "bbbb".to_string())])
+            .unwrap();
+        assert_eq!(written, 2);
+
+        let stored: Vec<String> = {
+            let conn = temp.db.get_conn().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT phash FROM media WHERE phash IS NOT NULL ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(stored, vec!["aaaa".to_string(), "bbbb".to_string()]);
+
+        assert_eq!(temp.db.mark_cloud_only(&[]).unwrap(), 0);
+        assert_eq!(temp.db.mark_cloud_only(&[a, b]).unwrap(), 2);
+        assert!(temp.db.get_media_by_id(a).unwrap().unwrap().is_cloud_only);
+        assert!(temp.db.get_media_by_id(b).unwrap().unwrap().is_cloud_only);
+    }
+
+    /// The manifest export reads album membership in one pass. It has to see the
+    /// same names the per-photo query returned, for every photo in an album.
+    #[test]
+    fn album_names_are_read_in_one_pass() {
+        let temp = TempDb::new();
+        let a = insert_media_with_camera(&temp.db, "/library/a.jpg", "Canon");
+        let b = insert_media_with_camera(&temp.db, "/library/b.jpg", "Canon");
+        let _lonely = insert_media_with_camera(&temp.db, "/library/c.jpg", "Canon");
+
+        let holiday = temp.db.create_album("Holiday").unwrap();
+        let family = temp.db.create_album("Family").unwrap();
+        temp.db.add_media_to_album(holiday, a).unwrap();
+        temp.db.add_media_to_album(family, a).unwrap();
+        temp.db.add_media_to_album(holiday, b).unwrap();
+
+        let by_media = temp.db.album_names_by_media().unwrap();
+        assert_eq!(by_media.len(), 2);
+
+        let mut for_a = by_media.get(&a).cloned().unwrap();
+        for_a.sort();
+        assert_eq!(for_a, vec!["Family".to_string(), "Holiday".to_string()]);
+        assert_eq!(by_media.get(&b).cloned().unwrap(), vec!["Holiday"]);
+
+        // Same names the per-photo query reports, which is what the export replaced.
+        let mut per_photo: Vec<String> = temp
+            .db
+            .get_albums_for_media(a)
+            .unwrap()
+            .into_iter()
+            .map(|album| album.name)
+            .collect();
+        per_photo.sort();
+        assert_eq!(per_photo, for_a);
+    }
+
+    /// A `MediaItem` with only the fields the clustering reads set.
+    fn item_with_id(id: i64) -> MediaItem {
+        MediaItem {
+            id,
+            file_path: format!("/library/{id}.jpg"),
+            file_hash: None,
+            telegram_media_id: None,
+            mime_type: None,
+            width: None,
+            height: None,
+            duration: None,
+            size_bytes: None,
+            created_at: id,
+            uploaded_at: None,
+            thumbnail_path: None,
+            date_taken: None,
+            latitude: None,
+            longitude: None,
+            camera_make: None,
+            camera_model: None,
+            is_favorite: false,
+            rating: 0,
+            is_deleted: false,
+            deleted_at: None,
+            is_archived: false,
+            archived_at: None,
+            is_cloud_only: false,
+        }
+    }
+
+    /// The exhaustive scan the bucketing replaces, kept as the oracle.
+    fn cluster_pairwise(candidates: &[(MediaItem, String)], threshold: u32) -> Vec<Vec<i64>> {
+        let n = candidates.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn root(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                x = parent[x];
+            }
+            x
+        }
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let a = ParsedHash::parse(&candidates[i].1);
+                let b = ParsedHash::parse(&candidates[j].1);
+                let (Some(a), Some(b)) = (a, b) else { continue };
+                if a.bits.len() != b.bits.len() {
+                    continue;
+                }
+                if a.distance(&b) <= threshold {
+                    let (ra, rb) = (root(&mut parent, i), root(&mut parent, j));
+                    if ra != rb {
+                        parent[ra] = rb;
+                    }
+                }
+            }
+        }
+
+        let mut groups: std::collections::HashMap<usize, Vec<i64>> =
+            std::collections::HashMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let r = root(&mut parent, index);
+            groups.entry(r).or_default().push(candidate.0.id);
+        }
+
+        let mut out: Vec<Vec<i64>> = groups
+            .into_values()
+            .filter(|group| group.len() > 1)
+            .collect();
+        for group in &mut out {
+            group.sort_unstable();
+        }
+        out.sort();
+        out
+    }
+
+    fn hex_hash(value: u64) -> String {
+        format!("{value:016x}")
+    }
+
+    /// Bucketing by band is only worth doing if it produces exactly what comparing
+    /// every pair produced. Generate hashes with a deterministic pseudo-random
+    /// sequence, seeded so a failure is reproducible, and compare the two.
+    #[test]
+    fn bucketed_clustering_matches_the_exhaustive_scan() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            // xorshift64: no dependency, and the sequence is fixed.
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut candidates: Vec<(MediaItem, String)> = Vec::new();
+        let mut id = 1i64;
+
+        for _ in 0..40 {
+            let base = next();
+            candidates.push((item_with_id(id), hex_hash(base)));
+            id += 1;
+
+            // A few near-copies at varying distances, straddling the threshold.
+            for flips in [1u32, 4, 9, 10, 11, 20] {
+                let mut variant = base;
+                for bit in 0..flips {
+                    variant ^= 1u64 << ((next() as u32 + bit) % 64);
+                }
+                candidates.push((item_with_id(id), hex_hash(variant)));
+                id += 1;
+            }
+        }
+
+        let expected = cluster_pairwise(&candidates, PHASH_DISTANCE_THRESHOLD);
+
+        let mut actual: Vec<Vec<i64>> = cluster_by_phash(candidates, PHASH_DISTANCE_THRESHOLD)
+            .into_iter()
+            .map(|group| {
+                let mut ids: Vec<i64> = group.into_iter().map(|item| item.id).collect();
+                ids.sort_unstable();
+                ids
+            })
+            .collect();
+        actual.sort();
+
+        assert_eq!(actual, expected);
+        assert!(
+            !actual.is_empty(),
+            "the fixture should produce at least one duplicate group"
+        );
+    }
+
+    /// Groups come back oldest-first inside a group, biggest group first, which is
+    /// what the review UI relies on to pick a default "keep" item.
+    #[test]
+    fn duplicate_groups_keep_their_ordering() {
+        let identical = hex_hash(0xdead_beef_dead_beef);
+        let other = hex_hash(0x0f0f_0f0f_0f0f_0f0f);
+
+        let candidates = vec![
+            (item_with_id(3), identical.clone()),
+            (item_with_id(1), identical.clone()),
+            (item_with_id(2), identical),
+            (item_with_id(5), other.clone()),
+            (item_with_id(4), other),
+        ];
+
+        let groups = cluster_by_phash(candidates, PHASH_DISTANCE_THRESHOLD);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            groups[1].iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+    }
+
+    /// A hash that parses as neither base64 nor hex must not join a group, and must
+    /// not take the rest of the library down with it.
+    #[test]
+    fn unparseable_hashes_are_left_alone() {
+        let candidates = vec![
+            (item_with_id(1), hex_hash(0xaaaa_aaaa_aaaa_aaaa)),
+            (item_with_id(2), hex_hash(0xaaaa_aaaa_aaaa_aaab)),
+            (item_with_id(3), "not a hash".to_string()),
+            (item_with_id(4), String::new()),
+        ];
+
+        let groups = cluster_by_phash(candidates, PHASH_DISTANCE_THRESHOLD);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     /// Every read that returns a `MediaItem` goes through `map_media_row`, which

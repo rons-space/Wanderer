@@ -1933,6 +1933,26 @@ async fn export_media(
 
 // --- Phase 7: Duplicate Detection ---
 
+/// Photos hashed per blocking batch during a library scan.
+///
+/// Large enough that the transaction and thread hop are amortised, small enough
+/// that the progress bar still moves and a cancelled window does not lose much.
+const PHASH_SCAN_CHUNK: usize = 32;
+
+/// Compute perceptual hashes for a batch of files, dropping the ones that fail.
+///
+/// Runs on a blocking thread: each hash decodes and resizes an image, which is
+/// exactly the work that must not happen on a runtime worker.
+fn hash_batch(items: &[(i64, String)]) -> Vec<(i64, String)> {
+    items
+        .iter()
+        .filter_map(|(media_id, file_path)| {
+            let path = std::path::Path::new(file_path);
+            media_utils::generate_phash(path).map(|phash| (*media_id, phash))
+        })
+        .collect()
+}
+
 #[tauri::command]
 async fn find_duplicates(
     state: State<'_, AppState>,
@@ -1948,13 +1968,17 @@ async fn find_duplicates(
     };
 
     if !items_to_scan.is_empty() {
-        for (media_id, file_path) in items_to_scan {
-            let path = std::path::Path::new(&file_path);
-            if let Some(phash) = media_utils::generate_phash(path) {
-                let db_guard = state.db.lock().await;
-                if let Some(db) = db_guard.as_ref() {
-                    let _ = db.update_phash(media_id, &phash);
-                }
+        // Hashing decodes and resizes every image, so it belongs on a blocking
+        // thread, and the results are written in one transaction rather than
+        // reacquiring the database lock per photo.
+        let hashes = tauri::async_runtime::spawn_blocking(move || hash_batch(&items_to_scan))
+            .await
+            .map_err(AppError::from)?;
+
+        if !hashes.is_empty() {
+            let db_guard = state.db.lock().await;
+            if let Some(db) = db_guard.as_ref() {
+                db.update_phashes(&hashes).map_err(AppError::from)?;
             }
         }
     }
@@ -2007,25 +2031,27 @@ async fn scan_duplicates(
     let _ = app.emit("scan-duplicates-started", total);
 
     let mut success_count = 0;
+    let mut scanned = 0usize;
 
-    for (idx, (media_id, file_path)) in items_to_scan.into_iter().enumerate() {
-        let path = std::path::Path::new(&file_path);
+    // A chunk at a time: hashing runs off the async runtime, each chunk's results
+    // are one transaction instead of one per photo, and progress still moves.
+    for chunk in items_to_scan.chunks(PHASH_SCAN_CHUNK) {
+        let chunk = chunk.to_vec();
+        let chunk_len = chunk.len();
 
-        // Compute phash
-        if let Some(phash) = media_utils::generate_phash(path) {
-            // Update database
+        let hashes = tauri::async_runtime::spawn_blocking(move || hash_batch(&chunk))
+            .await
+            .map_err(AppError::from)?;
+
+        if !hashes.is_empty() {
             let db_guard = state.db.lock().await;
             if let Some(db) = db_guard.as_ref() {
-                if db.update_phash(media_id, &phash).is_ok() {
-                    success_count += 1;
-                }
+                success_count += db.update_phashes(&hashes).map_err(AppError::from)?;
             }
         }
 
-        // Emit progress every 5 items or on last item
-        if (idx + 1) % 5 == 0 || idx + 1 == total {
-            let _ = app.emit("scan-duplicates-progress", (idx + 1, total));
-        }
+        scanned += chunk_len;
+        let _ = app.emit("scan-duplicates-progress", (scanned, total));
     }
 
     log::info!("Scan complete: {} of {} items hashed", success_count, total);
@@ -3028,18 +3054,14 @@ async fn export_sync_manifest(
     // Create manifest from current database state
     let mut manifest = sync_manifest::SyncManifest::new(device_id);
 
-    // Export all media metadata
+    // Export all media metadata. Album membership is read once for the whole
+    // library rather than per photo: the per-photo call ran two correlated cover
+    // subqueries over every album, for a cover path the manifest does not use.
     let all_media = db.get_all_media_for_sync().map_err(AppError::from)?;
+    let albums_by_media = db.album_names_by_media().map_err(AppError::from)?;
     for item in all_media {
         if let Some(hash) = &item.file_hash {
-            // Get albums for this item
-            let albums = db
-                .get_albums_for_media(item.id)
-                .map_err(AppError::from)?
-                .iter()
-                .map(|a| a.name.clone())
-                .collect();
-
+            let albums = albums_by_media.get(&item.id).cloned().unwrap_or_default();
             manifest.update_media(hash, item.is_favorite, item.rating, albums);
         }
     }
