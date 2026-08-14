@@ -16,6 +16,7 @@ import {
     ContextMenuSeparator,
 } from "@/components/ui/context-menu";
 import { api, errorMessage } from "@/lib/api";
+import type { MediaActions } from "@/hooks/use-media-actions";
 import { handleImageError } from "@/lib/placeholder";
 import { toast } from "sonner";
 import { useTheme, type ThemeVariant } from "@/contexts/ThemeContext";
@@ -653,25 +654,20 @@ interface MediaGridProps {
     ItemWrapper?: ComponentType<{ item: MediaItem; children: ReactNode }>;
     contextMenuExtras?: (item: MediaItem) => ReactNode;
     onItemClick?: (item: MediaItem, e?: React.MouseEvent) => void;
-    onItemsChange?: () => void; // Callback to refresh items after changes
+    /** Item mutations, owned by whoever owns `items`. */
+    actions: MediaActions;
 }
 
-export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage, ItemWrapper, contextMenuExtras, onItemClick, onItemsChange }: MediaGridProps) {
+export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage, ItemWrapper, contextMenuExtras, onItemClick, actions }: MediaGridProps) {
     const containerRef = useRef<HTMLDivElement>(null);
     const { width, height } = useResizeObserver(containerRef);
     const { theme } = useTheme();
 
     const [albums, setAlbums] = useState<Album[]>([]);
-    const [localItems, setLocalItems] = useState<MediaItem[]>(items);
     const [timelineGrouping, setTimelineGrouping] = useState<TimelineGrouping>('day');
     const [currentDateHeader, setCurrentDateHeader] = useState<string | null>(null);
     const [showDateHeader, setShowDateHeader] = useState(false);
     const hideHeaderTimeout = useRef<NodeJS.Timeout | null>(null);
-
-    // Sync local items with props
-    useEffect(() => {
-        setLocalItems(items);
-    }, [items]);
 
     // The floating date header schedules a hide on every scroll event. Without
     // this, the last one outlives the component and fires setState on it.
@@ -711,116 +707,6 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
         };
     }, []);
 
-    const handleAddToAlbum = async (mediaId: number, albumId: number) => {
-        try {
-            await api.addMediaToAlbum(albumId, mediaId);
-            toast.success("Added to album");
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to add to album");
-        }
-    };
-
-    const handleToggleFavorite = async (item: MediaItem) => {
-        try {
-            const newFavoriteState = await api.toggleFavorite(item.id);
-            // Optimistic update
-            setLocalItems(prev =>
-                prev.map(i =>
-                    i.id === item.id ? { ...i, is_favorite: newFavoriteState } : i
-                )
-            );
-            toast.success(newFavoriteState ? "Added to favorites" : "Removed from favorites");
-            // Notify parent to refresh (especially important for Favorites view)
-            if (!newFavoriteState) {
-                onItemsChange?.();
-            }
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to update favorite");
-        }
-    };
-
-    const handleSetRating = async (mediaId: number, rating: number) => {
-        try {
-            await api.setRating(mediaId, rating);
-            // Optimistic update
-            setLocalItems(prev =>
-                prev.map(i =>
-                    i.id === mediaId ? { ...i, rating } : i
-                )
-            );
-            toast.success(rating > 0 ? `Rated ${rating} stars` : "Rating removed");
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to set rating");
-        }
-    };
-
-    const handleDelete = async (mediaId: number) => {
-        try {
-            await api.softDeleteMedia(mediaId);
-            // Remove from local state
-            setLocalItems(prev => prev.filter(i => i.id !== mediaId));
-            toast.success("Moved to trash");
-            onItemsChange?.();
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to move to trash");
-        }
-    };
-
-    const handleArchive = async (mediaId: number) => {
-        try {
-            await api.archiveMedia(mediaId);
-            // Remove from view immediately (instead of just setting flag)
-            setLocalItems(prev => prev.filter(i => i.id !== mediaId));
-            toast.success("Archived");
-            onItemsChange?.();
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to archive");
-        }
-    };
-
-    const handleUnarchive = async (mediaId: number) => {
-        try {
-            await api.unarchiveMedia(mediaId);
-            setLocalItems(prev => prev.map(i => i.id === mediaId ? { ...i, is_archived: false } : i));
-            toast.success("Unarchived");
-            onItemsChange?.();
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to unarchive");
-        }
-    };
-
-    const handleRemoveLocalCopy = async (mediaId: number) => {
-        try {
-            await api.removeLocalCopy(mediaId);
-            setLocalItems(prev => prev.map(i => i.id === mediaId ? { ...i, is_cloud_only: true } : i));
-            toast.success("Local copy removed (Cloud Only)");
-        } catch (e) {
-            console.error(e);
-            toast.error("Failed to remove local copy");
-        }
-    };
-
-    const handleDownloadLocalCopy = async (mediaId: number) => {
-        try {
-            toast.promise(api.downloadLocalCopy(mediaId), {
-                loading: 'Downloading...',
-                success: () => {
-                    setLocalItems(prev => prev.map(i => i.id === mediaId ? { ...i, is_cloud_only: false } : i));
-                    return "Downloaded local copy";
-                },
-                error: (err) => `Failed to download: ${errorMessage(err)}`
-            });
-        } catch (e) {
-            console.error(e);
-        }
-    };
-
     const GAP = 16;
     const MIN_COLUMN_WIDTH = 180;
     const PADDING_LEFT = 16;  // p-4 = 16px
@@ -837,15 +723,15 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
     const columnWidth = Math.floor((contentWidth - ((columnCount - 1) * GAP)) / columnCount);
 
     const displayRows = useMemo<DisplayRow[]>(() => {
-        if (localItems.length === 0 || columnCount <= 0) {
+        if (items.length === 0 || columnCount <= 0) {
             return [];
         }
 
         const rows: DisplayRow[] = [];
         let index = 0;
 
-        while (index < localItems.length) {
-            const dateKey = getDateKey(getTimelineTimestamp(localItems[index]), timelineGrouping);
+        while (index < items.length) {
+            const dateKey = getDateKey(getTimelineTimestamp(items[index]), timelineGrouping);
             rows.push({
                 type: 'separator',
                 dateKey,
@@ -855,8 +741,8 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
 
             let groupEnd = index + 1;
             while (
-                groupEnd < localItems.length &&
-                getDateKey(getTimelineTimestamp(localItems[groupEnd]), timelineGrouping) === dateKey
+                groupEnd < items.length &&
+                getDateKey(getTimelineTimestamp(items[groupEnd]), timelineGrouping) === dateKey
             ) {
                 groupEnd += 1;
             }
@@ -877,7 +763,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
         }
 
         return rows;
-    }, [localItems, timelineGrouping, columnCount]);
+    }, [items, timelineGrouping, columnCount]);
 
     // Stable identity: VirtualGrid depends on this in an effect to break the
     // no-overflow deadlock, and a fresh function each render would re-run it.
@@ -886,13 +772,13 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
 
         // Load more when near bottom (e.g. 2 screens away)
         if (scrollHeight - (scrollTop + clientHeight) < clientHeight * 2) {
-            loadNextPage(localItems.length, localItems.length + 20);
+            loadNextPage(items.length, items.length + 20);
         }
 
         // Calculate current visible item for date header
-        if (localItems.length > 0) {
-            const index = Math.max(0, Math.min(visibleItemIndex ?? 0, localItems.length - 1));
-            const visibleItem = localItems[index];
+        if (items.length > 0) {
+            const index = Math.max(0, Math.min(visibleItemIndex ?? 0, items.length - 1));
+            const visibleItem = items[index];
             if (visibleItem) {
                 const dateKey = getDateKey(getTimelineTimestamp(visibleItem), timelineGrouping);
                 const formatted = formatDateKey(dateKey, timelineGrouping);
@@ -908,7 +794,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
                 }, 1500);
             }
         }
-    }, [hasNextPage, isNextPageLoading, loadNextPage, localItems, timelineGrouping]);
+    }, [hasNextPage, isNextPageLoading, loadNextPage, items, timelineGrouping]);
 
     return (
         <div ref={containerRef} className="w-full h-full flex-1 min-h-0 overflow-hidden bg-background relative">
@@ -925,7 +811,7 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
 
             {width > 0 && height > 0 ? (
                 <VirtualGrid
-                    items={localItems || []}
+                    items={items || []}
                     rows={displayRows}
                     columnCount={columnCount}
                     columnWidth={columnWidth}
@@ -937,15 +823,15 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
                     ItemWrapper={ItemWrapper}
                     contextMenuExtras={contextMenuExtras}
                     albums={albums}
-                    onAddToAlbum={handleAddToAlbum}
+                    onAddToAlbum={actions.addToAlbum}
                     onItemClick={onItemClick}
-                    onToggleFavorite={handleToggleFavorite}
-                    onSetRating={handleSetRating}
-                    onDelete={handleDelete}
-                    onArchive={handleArchive}
-                    onUnarchive={handleUnarchive}
-                    onRemoveLocalCopy={handleRemoveLocalCopy}
-                    onDownloadLocalCopy={handleDownloadLocalCopy}
+                    onToggleFavorite={actions.toggleFavorite}
+                    onSetRating={actions.setRating}
+                    onDelete={actions.remove}
+                    onArchive={actions.archive}
+                    onUnarchive={actions.unarchive}
+                    onRemoveLocalCopy={actions.removeLocalCopy}
+                    onDownloadLocalCopy={actions.downloadLocalCopy}
                     theme={theme}
                 />
             ) : (

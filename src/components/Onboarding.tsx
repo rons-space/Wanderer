@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { api } from "@/lib/api";
+import { TelegramLoginForm, useTelegramLogin } from "./TelegramLogin";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -38,6 +39,13 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
         status.securityMode === "encrypted" && status.encryptionLocked;
 
     const [step, setStep] = useState<OnboardingStep>("mode");
+    const login = useTelegramLogin({
+        onAuthenticated: () => {
+            toast.success("Telegram login successful.");
+            setStep("finish");
+        },
+        onError: (message) => toast.error(message),
+    });
     const [isBusy, setIsBusy] = useState(false);
 
     const [mode, setMode] = useState<"encrypted" | "unencrypted">("encrypted");
@@ -58,9 +66,6 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
     const [apiId, setApiId] = useState("");
     const [apiHash, setApiHash] = useState("");
 
-    const [phone, setPhone] = useState("");
-    const [code, setCode] = useState("");
-    const [telegramStep, setTelegramStep] = useState<"phone" | "code">("phone");
 
     const [unlockPassphrase, setUnlockPassphrase] = useState("");
     const [showRecoveryUnlock, setShowRecoveryUnlock] = useState(false);
@@ -212,42 +217,6 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
             });
         } catch (e) {
             toast.error(`Failed to save credentials: ${toErrorMessage(e)}`);
-        }
-    };
-
-    const handleRequestCode = async () => {
-        if (!phone.trim()) {
-            toast.error("Phone number is required.");
-            return;
-        }
-        try {
-            await withBusy(async () => {
-                await api.loginRequestCode(phone.trim());
-                setTelegramStep("code");
-                toast.success("Verification code sent.");
-            });
-        } catch (e) {
-            toast.error(`Failed to send code: ${toErrorMessage(e)}`);
-        }
-    };
-
-    const handleSignIn = async () => {
-        if (!code.trim()) {
-            toast.error("Verification code is required.");
-            return;
-        }
-        try {
-            await withBusy(async () => {
-                await api.loginSignIn(code.trim());
-                toast.success("Telegram login successful.");
-                setStep("finish");
-            });
-        } catch (e) {
-            const message = toErrorMessage(e);
-            toast.error(`Sign in failed: ${message}`);
-            if (message.includes("No pending login request")) {
-                setTelegramStep("phone");
-            }
         }
     };
 
@@ -636,46 +605,7 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
                     {step === "telegram" && (
                         <div className="space-y-4">
                             <h3 className="font-semibold">Connect Telegram Account</h3>
-                            {telegramStep === "phone" ? (
-                                <div className="space-y-3">
-                                    <div className="space-y-2">
-                                        <Label htmlFor="phone">Phone Number</Label>
-                                        <Input
-                                            id="phone"
-                                            value={phone}
-                                            onChange={(e) => setPhone(e.target.value)}
-                                            placeholder="+1234567890"
-                                        />
-                                    </div>
-                                    <Button className="w-full" onClick={handleRequestCode} disabled={isBusy}>
-                                        {isBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                                        Send Code
-                                    </Button>
-                                </div>
-                            ) : (
-                                <div className="space-y-3">
-                                    <div className="space-y-2">
-                                        <Label htmlFor="code">Verification Code</Label>
-                                        <Input
-                                            id="code"
-                                            value={code}
-                                            onChange={(e) => setCode(e.target.value)}
-                                            placeholder="12345"
-                                        />
-                                    </div>
-                                    <Button className="w-full" onClick={handleSignIn} disabled={isBusy}>
-                                        {isBusy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                                        Sign In
-                                    </Button>
-                                    <Button
-                                        variant="outline"
-                                        className="w-full"
-                                        onClick={() => setTelegramStep("phone")}
-                                    >
-                                        Back
-                                    </Button>
-                                </div>
-                            )}
+                            <TelegramLoginForm login={login} idPrefix="onboarding" />
                         </div>
                     )}
 
