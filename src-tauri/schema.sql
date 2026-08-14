@@ -1,6 +1,6 @@
 -- Generated from the migration chain in src/database.rs. Do not edit by hand.
 -- Refresh with: WANDERER_BLESS_SCHEMA=1 cargo test schema
--- PRAGMA user_version = 21;
+-- PRAGMA user_version = 22;
 
 CREATE TABLE album_media (
     album_id INTEGER NOT NULL,

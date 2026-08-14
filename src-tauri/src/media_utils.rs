@@ -113,16 +113,13 @@ pub fn hash_file_streaming(path: &Path) -> std::io::Result<String> {
 /// Perceptual hashes are similar for visually similar images,
 /// enabling duplicate detection regardless of resolution/compression.
 pub fn generate_phash(path: &Path) -> Option<String> {
-    use img_hash::{HasherConfig, ImageHash};
+    use image_hasher::HasherConfig;
 
-    // Decode via explicitly configured image 0.23 dependency (with codecs enabled).
-    // This matches img_hash's expected image types while ensuring JPEG/PNG decode works.
-    let img = image_023::open(path).ok()?;
+    let img = image::open(path).ok()?;
     let hasher = HasherConfig::new()
         .hash_size(8, 8) // 64-bit hash
         .to_hasher();
-    let hash: ImageHash = hasher.hash_image(&img);
-    Some(hash.to_base64())
+    Some(hasher.hash_image(&img).to_base64())
 }
 
 /// Generate a thumbnail for an image file.

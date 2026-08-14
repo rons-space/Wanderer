@@ -664,6 +664,30 @@ impl Database {
             version = 21;
         }
 
+        if version < 22 {
+            // Migration 22: drop every stored perceptual hash so it is recomputed.
+            //
+            // The hashes were written by `img_hash` 3.2.0, which has been
+            // unmaintained since 2020 and pulls in a `transpose` with a buffer
+            // overflow (RUSTSEC-2023-0080) reachable from any imported image. The
+            // maintained fork, `image_hasher`, is a drop-in for the API used here
+            // but not for the values: the same image hashes to different bits, and
+            // the fork writes unpadded base64 where the old crate wrote padded, so
+            // it rejects every string already in this column.
+            //
+            // Left in place, those rows would fail to parse, be dropped from the
+            // comparison, and take duplicate detection quietly to nothing. Nulled,
+            // they are refilled by the pass that already exists for media imported
+            // before hashing ran, on the next duplicate scan.
+            conn.execute_batch(
+                "BEGIN;
+                 UPDATE media SET phash = NULL;
+                 PRAGMA user_version = 22;
+                 COMMIT;",
+            )?;
+            version = 22;
+        }
+
         // Rows left in `uploading` by a process that died mid-transfer are invisible to
         // `get_next_pending_item` forever, so the file silently never uploads. Nothing
         // can legitimately be uploading at startup, before any worker has run.

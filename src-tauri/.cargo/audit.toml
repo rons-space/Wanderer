@@ -17,11 +17,4 @@ ignore = [
     # Mitigated instead by verifying a pinned SHA-256 before any model is parsed
     # (issue #22), and cleared properly by moving to tract 0.23 (issue #81).
     "RUSTSEC-2026-0217",
-
-    # transpose buffer overflow, reached through img_hash 3.2.0, which has been
-    # unmaintained since 2020. The maintained fork, image_hasher, is a drop-in for
-    # the API used here, but perceptual hashes are persisted in library.db and a
-    # change in hash output would silently break duplicate detection for existing
-    # libraries, so the swap needs its own change with a migration (issue #82).
-    "RUSTSEC-2023-0080",
 ]
