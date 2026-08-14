@@ -3,6 +3,7 @@ name = "tauri-app"
 version = "0.1.0"
 description = "Wander(er), a desktop media manager with encrypted Telegram backup"
 authors = ["rons-space"]
+license = "AGPL-3.0-only"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
