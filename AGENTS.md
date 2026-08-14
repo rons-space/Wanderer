@@ -28,33 +28,42 @@ down instead and leaves `dev` containing `main` but ahead of it.
 
 ## CI
 
-There is no CI in this repository yet. `sync-dev-to-main.yml` is the only workflow, and it
-moves branch refs rather than building or testing anything. Nothing type-checks, lints,
-builds or tests on push, so a pull request being green means only that nothing ran.
+`.github/workflows/ci.yml` runs on every pull request to `dev` and `main`, in three jobs:
+the frontend one (`npm ci`, `npm run build`, `npm run lint`, `npm test`), the Rust one
+(`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`) and
+`cargo audit`. A full cycle takes two to four minutes, and a green pull request now means
+something.
 
-Until that changes, the checks that exist are local and are worth running on what you
-touched:
+The lint budget is a ratchet: `npm run lint` is `eslint . --max-warnings 34`, so a new
+warning fails the build and removing warnings means lowering the number in `package.json`.
+Advisories that cannot be cleared are listed with their reasoning in
+`src-tauri/.cargo/audit.toml` rather than silenced.
 
-- `npm run build` (`tsc && vite build`) type-checks and bundles the frontend.
-- `npm test` runs the Vitest suite.
-- `cargo test` and `cargo fmt --check` in `src-tauri/`.
+Locally, the frontend checks all work and are worth running before pushing:
+
+- `npx tsc --noEmit` type-checks without bundling, and is the fastest of the three.
+- `npm run lint` and `npm test`.
+- `cargo fmt --check` in `src-tauri/`, which needs no compilation.
 
 Do not try to build or run the whole desktop application to validate a change. A full
 `cargo build` compiles ONNX Runtime, bundled SQLite and the image stack from scratch, which
-costs far more than the change is usually worth. Prefer the narrowest check that actually
-covers the edit, and when CI exists, push and let it do the work rather than reproducing
-it locally.
+costs far more than the change is usually worth and does not fit in a small sandbox. Prefer
+the narrowest check that actually covers the edit, and let CI do the rest.
 
 ## Conventions
 
 - Match the surrounding code. This repository favours explanatory comments that record
   *why* a non-obvious choice was made, especially in the security and cryptography module,
-  the SQLite migration chain in `database.rs`, and workflow configuration. Preserve them,
+  the SQLite migration chain in `database/migrations.rs`, and workflow configuration. Preserve them,
   and add to them when the reasoning is not self-evident.
 - The frontend is strict TypeScript and the codebase honours it: no `@ts-ignore`, no
   `@ts-expect-error`, and `as any` only where a dependency genuinely requires it. Keep it
   that way.
 - Every frontend call into Rust goes through the typed facade in `src/lib/api.ts`. Do not
-  call `invoke()` directly from a component. The one file that does, `LoginView.tsx`, is
-  dead code that is never imported, so treat it as a counterexample rather than a
-  pattern.
+  call `invoke()` directly from a component; nothing does any more, and the dead file that
+  used to is gone.
+- The Rust side is split by domain rather than by layer. `database/` is one module per
+  table group, each re-opening `impl Database`; `commands/` is one module per domain, and
+  `lib.rs` keeps only the shared state, the helpers and `run()`. Settings is the same shape
+  on the frontend: `components/settings/` is one component per tab. Put a new method or
+  command in the module it belongs to rather than at the end of the largest file.
