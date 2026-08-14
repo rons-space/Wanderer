@@ -22,8 +22,10 @@ conditions. Medium = correctness or reliability defect. Low = hygiene.
   **T11 (CI) is what stops everything else on this list from silently regressing**.
 - Branch per task (or per small cluster) off `dev`, PR into `dev`, per
   [`GIT_WORKFLOW.md`](GIT_WORKFLOW.md).
-- There is no CI yet (T11). Until then run the narrowest local check that covers the edit:
-  `npm run build`, `npm test`, `cargo test`, `cargo fmt --check`. Do not attempt a full `cargo build`.
+- CI runs on every pull request (`.github/workflows/ci.yml`): frontend type check, bundle, lint and
+  tests; `cargo fmt`, `clippy -D warnings` and `cargo test`; `cargo audit` and `npm audit`. Push and
+  let it do the work rather than reproducing it locally, and never attempt a full `cargo build` in a
+  sandbox: it compiles ONNX Runtime and bundled SQLite from scratch.
 
 ## Counts
 
@@ -38,19 +40,23 @@ Findings by severity in the source review: **4 Critical, 26 High, 26 Medium, 13 
 
 ## Status snapshot
 
-Re-verified against the current tip of `dev` while writing this list. Nothing from the review has
-been remediated yet; the only change since the review is the branching workflow.
+Stages 0 and 1 are complete and promoted to `main`, except T17, which needs a signing certificate
+and an updater keypair that are not in this repository. Stage 2 has not started.
 
 | Check | Result |
 | --- | --- |
-| `tauri_plugin_mcp_bridge::init()` gated | No, still unconditional at `src-tauri/src/lib.rs:863` |
-| Thumbnail eviction listener deletes files | Yes, still at `src-tauri/src/cache.rs:12-24` |
-| `Tags.tsx` hand-built `asset://` URL | Yes, still at `src/components/Tags.tsx:86` |
-| CI workflow (build / lint / test) | None. `.github/workflows/` holds only `sync-dev-to-main.yml` |
-| ESLint / Prettier / `rustfmt.toml` / `clippy.toml` | Absent |
-| `LICENSE` / `SECURITY.md` | Absent |
-| Lockfiles committed | Two (`package-lock.json`, `pnpm-lock.yaml`) |
-| Stray files | `src-tauri/2`, `src-tauri/build_log.txt`, `src-tauri/output.txt` still tracked |
+| `tauri_plugin_mcp_bridge::init()` gated | Yes. Opt-in `mcp-bridge` feature, debug builds only, bound to localhost |
+| Thumbnail eviction listener deletes files | No. `cache.rs` and the `moka` dependency are gone |
+| Encrypted backup is recoverable | Yes. `WBAK01` carries wrapped key material, openable with passphrase or recovery key |
+| Caller-supplied paths confined | Yes, through `paths::confine` and `Database::delete_managed_file` |
+| `Tags.tsx` hand-built `asset://` URL | Yes, still at `src/components/Tags.tsx:86` (T38, Stage 3) |
+| CI workflow (build / lint / test) | Yes. `.github/workflows/ci.yml`: frontend, Rust, audit |
+| ESLint / `rustfmt.toml` / `clippy.toml` | Present. 0 lint errors, 47 warnings pinned as a ratchet |
+| `LICENSE` / `SECURITY.md` | Present. AGPL-3.0 |
+| Lockfiles committed | One (`package-lock.json`) |
+| Stray files | Removed, with the unused 1.2 MB ONNX model |
+| Rust advisories | 11 of 15 cleared; 4 ignored with reasoning in `src-tauri/.cargo/audit.toml` |
+| Downloaded models verified | Yes. SHA-256 and length pinned, checked before the parser sees the bytes |
 
 ---
 
@@ -59,13 +65,13 @@ been remediated yet; the only change since the review is the branching workflow.
 Ship immediately. T1, T2 and T5 are the three that change the risk profile of the product; the rest
 of this stage is additive and low-risk.
 
-- [ ] [#9](https://github.com/rons-space/Wanderer/issues/9) **T1: Gate or delete the MCP bridge plugin** (Finding 3.1, **Critical**)
+- [x] [#9](https://github.com/rons-space/Wanderer/issues/9) **T1: Gate or delete the MCP bridge plugin** (Finding 3.1, **Critical**)
   Read the plugin's source first and confirm what it binds and whether it authenticates.
   *Where:* `src-tauri/src/lib.rs:863`, `src-tauri/Cargo.toml:43`.
   *Done when:* the plugin is deleted, or registered only under `#[cfg(debug_assertions)]`, and a
   release build is confirmed to open no listener.
 
-- [ ] [#10](https://github.com/rons-space/Wanderer/issues/10) **T2: Make the encrypted backup decryptable** (Finding 2.1, **Critical**)
+- [x] [#10](https://github.com/rons-space/Wanderer/issues/10) **T2: Make the encrypted backup decryptable** (Finding 2.1, **Critical**)
   The wrapped master key lives only inside `library.db`, and the backup of `library.db` is encrypted
   with that key, so the artifact seals in its own key material. Export the `SecurityBundle`
   unencrypted alongside the `.wbenc` artifact (it is already Argon2id-protected by the passphrase),
@@ -74,11 +80,11 @@ of this stage is additive and low-risk.
   *Done when:* a test restores a backup on a machine with no prior `library.db`, using only the
   passphrase, and separately using only the recovery key.
 
-- [ ] [#11](https://github.com/rons-space/Wanderer/issues/11) **T3: Withdraw the current backup guidance** (Finding 2.1, **Critical**)
+- [x] [#11](https://github.com/rons-space/Wanderer/issues/11) **T3: Withdraw the current backup guidance** (Finding 2.1, **Critical**)
   Tell existing encrypted-mode users to keep a copy of `library.db`, and treat prior "encrypted
   backup" guidance in the README and in-app copy as withdrawn until T2 ships.
 
-- [ ] [#12](https://github.com/rons-space/Wanderer/issues/12) **T4: Derive `should_encrypt` from the security bundle and fail closed** (Finding 1.1, **Critical**)
+- [x] [#12](https://github.com/rons-space/Wanderer/issues/12) **T4: Derive `should_encrypt` from the security bundle and fail closed** (Finding 1.1, **Critical**)
   `.ok().flatten().unwrap_or("unset")` on the duplicated `security_mode` row silently yields
   "not encrypted" on a read error or a missing row, and plaintext is uploaded while the UI reports
   the library as encrypted.
@@ -88,7 +94,7 @@ of this stage is additive and low-risk.
   upload instead of sending plaintext, and `FILE_MAGIC` (`WBENC1`) is asserted on the artifact
   immediately before `upload_file_with_progress`.
 
-- [ ] [#13](https://github.com/rons-space/Wanderer/issues/13) **T5: Stop the thumbnail cache from deleting live thumbnails** (Finding 2.8, **High, data loss**)
+- [x] [#13](https://github.com/rons-space/Wanderer/issues/13) **T5: Stop the thumbnail cache from deleting live thumbnails** (Finding 2.8, **High, data loss**)
   The moka eviction listener unlinks the `.jpg` while `media.thumbnail_path` still points at it, at
   capacity 2000, and the cache is never read except on insert.
   *Where:* `src-tauri/src/cache.rs:12-24`, capacity at `lib.rs:845`, inserts at `watcher.rs:198,211`
@@ -96,7 +102,7 @@ of this stage is additive and low-risk.
   *Done when:* either the listener is gone, or eviction nulls `media.thumbnail_path` in the same
   operation and the cache is consulted on the thumbnail resolution path.
 
-- [ ] [#14](https://github.com/rons-space/Wanderer/issues/14) **T6: Filter `security_*` out of `get_all_config`** (Finding 3.2, **Critical**)
+- [x] [#14](https://github.com/rons-space/Wanderer/issues/14) **T6: Filter `security_*` out of `get_all_config`** (Finding 3.2, **Critical**)
   The command returns the whole `config` table, including `security_bundle_v1` (Argon2 salts plus
   both wrapped master keys) and the DPAPI credential blob, to JavaScript on every `MediaGrid` mount.
   *Where:* `lib.rs:1677-1684`, `database.rs:2856-2858`; callers `src/lib/api.ts:211`,
@@ -104,13 +110,13 @@ of this stage is additive and low-risk.
   *Done when:* no key with the `security_` prefix can reach the webview, mirroring the existing
   write-path guard at `lib.rs:1686-1690`.
 
-- [ ] [#15](https://github.com/rons-space/Wanderer/issues/15) **T7: Tighten CSP and filesystem scopes** (Finding 3.3, **High**)
+- [x] [#15](https://github.com/rons-space/Wanderer/issues/15) **T7: Tighten CSP and filesystem scopes** (Finding 3.3, **High**)
   *Where:* `src-tauri/tauri.conf.json:25` (CSP), `:26-35` (`assetProtocol.scope`),
   `src-tauri/capabilities/default.json:13-40` (`fs:allow-read`, `fs:allow-exists`).
   *Done when:* `'unsafe-eval'` and `'unsafe-inline'` are gone from `script-src`, and `**` / `C:\**`
   are replaced with the app-data subdirectories actually served (thumbnails, view cache, backup).
 
-- [ ] [#16](https://github.com/rons-space/Wanderer/issues/16) **T8: Confine every command that takes a caller-supplied path** (Finding 3.4, **High**)
+- [x] [#16](https://github.com/rons-space/Wanderer/issues/16) **T8: Confine every command that takes a caller-supplied path** (Finding 3.4, **High**)
   *Where:* `import_files` (`lib.rs:1216-1244`), `import_sync_manifest`
   (`lib.rs:2325-2331` / `sync_manifest.rs:102-106`), `export_media` (`lib.rs:1371-1410`),
   `backup_database` (`lib.rs:1862-1902`), and the delete paths `remove_local_copy` /
@@ -120,13 +126,13 @@ of this stage is additive and low-risk.
   EXIF-derived export folder name is sanitized, and every unlink asserts the path is inside a managed
   root.
 
-- [ ] [#17](https://github.com/rons-space/Wanderer/issues/17) **T9: Bound `ct_len` by the header's `chunk_size`** (Finding 3.6, Medium)
+- [x] [#17](https://github.com/rons-space/Wanderer/issues/17) **T9: Bound `ct_len` by the header's `chunk_size`** (Finding 3.6, Medium)
   A corrupted or hostile blob can declare `0xFFFFFFFF` and force a ~4 GiB allocation per chunk before
   any tag is verified.
   *Where:* `src-tauri/src/security/mod.rs:417-423`; the validated bound is at `:392-394`.
   *Done when:* `ct_len` is rejected unless `16 <= ct_len <= chunk_size + 16`.
 
-- [ ] [#18](https://github.com/rons-space/Wanderer/issues/18) **T10: Fix the release links and set a real version** (Findings 5.2, 7.6, **High** documentation)
+- [x] [#18](https://github.com/rons-space/Wanderer/issues/18) **T10: Fix the release links and set a real version** (Findings 5.2, 7.6, **High** documentation)
   Three different GitHub locations are referenced today: the repo (`rons-space/Wanderer`), the README
   download links (`ronimuliawan/Wanderer`, `README.md:34-36`) and the in-app About tab
   (`ronimuliawan/wanderbackup-rust`, `Settings.tsx:49-53`). For an unsigned installer this reads like
@@ -138,34 +144,34 @@ of this stage is additive and low-risk.
 
 ## Stage 1: Make regression impossible
 
-- [ ] [#19](https://github.com/rons-space/Wanderer/issues/19) **T11: Add `.github/workflows/ci.yml`** (Findings 7.1, 8.2, **High**)
+- [x] [#19](https://github.com/rons-space/Wanderer/issues/19) **T11: Add `.github/workflows/ci.yml`** (Findings 7.1, 8.2, **High**)
   `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo audit`,
   `npm ci && npm run build && npm test`, on pull requests to `dev` and `main`. Roughly 40 lines of
   YAML, and it is what converts the rest of this list from "will drift again" to "cannot drift again".
 
-- [ ] [#20](https://github.com/rons-space/Wanderer/issues/20) **T12: Add lint and format configuration** (Finding 7.3, **High**)
+- [x] [#20](https://github.com/rons-space/Wanderer/issues/20) **T12: Add lint and format configuration** (Finding 7.3, **High**)
   ESLint 9 flat config with `react-hooks`, `jsx-a11y` and `@typescript-eslint`; a `lint` script;
   `rustfmt.toml` and `clippy.toml`. Expect a large first-pass backlog: `react-hooks` alone covers T43
   and parts of T48, and `jsx-a11y` mechanically covers most of T44.
 
-- [ ] [#21](https://github.com/rons-space/Wanderer/issues/21) **T13: Clear the dependency advisories** (Findings 8.2, 8.1, **High**)
+- [x] [#21](https://github.com/rons-space/Wanderer/issues/21) **T13: Clear the dependency advisories** (Findings 8.2, 8.1, **High**)
   `cargo update` the 15 flagged crates and re-run `cargo audit` clean; `npm audit fix`.
   **Priorities: `tract-nnef` (integer overflow to OOB read on model load) and `quick-xml`**, both of
   which parse untrusted input here; then `quinn-proto`, `rustls-webpki`, `bytes`, `time`, `tar`,
   `crossbeam-epoch`. The npm advisories are all build tooling, not shipped runtime code.
 
-- [ ] [#22](https://github.com/rons-space/Wanderer/issues/22) **T14: Verify AI model downloads** (Finding 1.11, Medium)
+- [x] [#22](https://github.com/rons-space/Wanderer/issues/22) **T14: Verify AI model downloads** (Finding 1.11, Medium)
   *Where:* ArcFace `ai/mod.rs:199-325` (size check only), MobileNet `object_detection.rs:311-314`,
   CLIP `clip.rs:444-508` (no check at all).
   *Done when:* every download has a pinned SHA-256 verified before the first parse, and revisions are
   pinned immutably rather than to moving tags.
 
-- [ ] [#23](https://github.com/rons-space/Wanderer/issues/23) **T15: Add the tests that would have caught the Criticals** (Finding 7.4, Medium)
+- [x] [#23](https://github.com/rons-space/Wanderer/issues/23) **T15: Add the tests that would have caught the Criticals** (Finding 7.4, Medium)
   `WBENC1` encrypt/decrypt round-trip byte-for-byte; a truncated `.wbenc` must fail; a tampered chunk
   must fail; the 0-to-19 migration chain must produce the expected schema; a backup must restore
   through the documented recovery procedure (this is the test that catches T2).
 
-- [ ] [#24](https://github.com/rons-space/Wanderer/issues/24) **T16: Correct the README** (Findings 5.3, 5.4, Medium)
+- [x] [#24](https://github.com/rons-space/Wanderer/issues/24) **T16: Correct the README** (Findings 5.3, 5.4, Medium)
   `npm run build` is the frontend bundle, not the production build (`npm run tauri build` is).
   Document the `%TEMP%` plaintext residue (T20), the `library.db` dependency for recovery (T2), the
   plaintext metadata index including GPS (Finding 1.10), and that the 8-character minimum is not
@@ -176,12 +182,12 @@ of this stage is additive and low-risk.
   `["nsis"]`, and a `release.yml` so releases are reproducible. Without this there is no channel to
   ship any of the fixes above to existing users.
 
-- [ ] [#26](https://github.com/rons-space/Wanderer/issues/26) **T18: Fix the migration chain** (Finding 2.4, **High**)
+- [x] [#26](https://github.com/rons-space/Wanderer/issues/26) **T18: Fix the migration chain** (Finding 2.4, **High**)
   Assign `version` in migrations 5 and 7-13 (`database.rs:317-321` and onwards); guard migration 15
   so it cannot delete every named person when no face embeddings exist (`database.rs:512-517`).
   Latent hard-startup-failure the next time anyone inserts a migration, hence this stage.
 
-- [ ] [#27](https://github.com/rons-space/Wanderer/issues/27) **T19: Repo hygiene** (Findings 7.5, 4.7, Medium)
+- [x] [#27](https://github.com/rons-space/Wanderer/issues/27) **T19: Repo hygiene** (Findings 7.5, 4.7, Medium)
   Delete one lockfile; `git rm` `src-tauri/2`, `src-tauri/build_log.txt`, `src-tauri/output.txt` and
   the unused 1,244 KB `version-RFB-320.onnx`; add `LICENSE` and `SECURITY.md`; gitignore `.env`.
 
