@@ -133,7 +133,7 @@ pub async fn run_upload_worker(
                 let mut encrypted_temp: Option<PathBuf> = None;
 
                 if should_encrypt {
-                    let maybe_key = security_runtime.lock().await.master_key;
+                    let maybe_key = security_runtime.lock().await.master_key.clone();
                     let key = match maybe_key {
                         Some(k) => k,
                         None => {

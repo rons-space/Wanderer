@@ -77,7 +77,7 @@ pub fn write_encrypted_backup(
     source_db: &Path,
     out_path: &Path,
     bundle: &SecurityBundle,
-    key: &[u8; 32],
+    key: &crate::security::MasterKey,
     app_version: &str,
 ) -> Result<()> {
     let header = BackupHeader {
@@ -281,7 +281,9 @@ mod tests {
         // The source database is gone from here on, which is the entire point.
         std::fs::remove_file(&db_path).unwrap();
 
-        (archive, contents, passphrase, recovery_key)
+        // Copied out of `Zeroizing` deliberately: the fixture has to outlive the
+        // bundle, exactly as the user's written-down copy does.
+        (archive, contents, passphrase, recovery_key.to_string())
     }
 
     #[test]

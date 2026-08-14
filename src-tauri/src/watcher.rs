@@ -216,7 +216,7 @@ async fn process_file(
     if thumbnail_needs_encryption {
         if let Some(thumb_str) = thumbnail_path.clone() {
             let thumb_path = PathBuf::from(&thumb_str);
-            let maybe_key = security_runtime.lock().await.master_key;
+            let maybe_key = security_runtime.lock().await.master_key.clone();
             if let Some(key) = maybe_key {
                 let encrypted_thumb = thumb_path.with_extension("wbenc");
                 match security::encrypt_file(&thumb_path, &encrypted_thumb, &key) {

@@ -27,6 +27,7 @@ use tauri::{Emitter, Manager, State};
 use telegram::TelegramService;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroizing;
 
 struct AppState {
     telegram: Arc<TelegramService>,
@@ -168,7 +169,7 @@ fn save_migration_status(db: &Database, status: &MigrationStatus) -> Result<(), 
 
 fn ensure_thumbnail_encrypted(
     thumb_path: &str,
-    key: &[u8; 32],
+    key: &security::MasterKey,
     roots: &[std::path::PathBuf],
 ) -> Result<Option<std::path::PathBuf>, String> {
     let path = std::path::Path::new(thumb_path);
@@ -212,7 +213,7 @@ async fn materialize_thumbnail_path_for_response(
         return Some(thumbnail_path);
     }
 
-    let key = state.security_runtime.lock().await.master_key?;
+    let key = state.security_runtime.lock().await.master_key.clone()?;
     let cache_dir = std::env::temp_dir().join("wanderer-thumb-cache");
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return None;
@@ -252,8 +253,10 @@ async fn materialize_media_items_for_response(
     items
 }
 
-async fn get_active_master_key(state: &State<'_, AppState>) -> Option<[u8; 32]> {
-    state.security_runtime.lock().await.master_key
+/// A clone rather than a borrow, because the guard cannot be held across the awaits
+/// that follow. The copy is a `MasterKey`, so it zeroizes when the caller drops it.
+async fn get_active_master_key(state: &State<'_, AppState>) -> Option<security::MasterKey> {
+    state.security_runtime.lock().await.master_key.clone()
 }
 
 async fn download_and_materialize_media(
@@ -373,6 +376,11 @@ async fn initialize_encryption(
     passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<InitializeEncryptionResponse, String> {
+    // Rebound rather than taken as `Zeroizing<String>` directly: a Tauri command
+    // parameter has to deserialize, and moving the `String` in here keeps the same
+    // heap buffer, so the secret is wiped when this returns. Whatever copies serde
+    // made while parsing the IPC payload are outside our reach either way.
+    let passphrase = Zeroizing::new(passphrase);
     {
         let db_guard = state.db.lock().await;
         let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -392,11 +400,17 @@ async fn initialize_encryption(
 
     state.security_runtime.lock().await.master_key = Some(master_key);
 
-    Ok(InitializeEncryptionResponse { recovery_key })
+    // The recovery key has to reach the user, who is expected to write it down, so
+    // this is the one copy that cannot be zeroized: past the serializer it belongs to
+    // the frontend.
+    Ok(InitializeEncryptionResponse {
+        recovery_key: recovery_key.to_string(),
+    })
 }
 
 #[tauri::command]
 async fn unlock_encryption(passphrase: String, state: State<'_, AppState>) -> Result<(), String> {
+    let passphrase = Zeroizing::new(passphrase);
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
     let bundle = load_security_bundle(db)?
@@ -424,6 +438,8 @@ async fn recover_encryption(
     new_passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let recovery_key = Zeroizing::new(recovery_key);
+    let new_passphrase = Zeroizing::new(new_passphrase);
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
     let bundle = load_security_bundle(db)?
@@ -442,6 +458,7 @@ async fn regenerate_recovery_key(
     passphrase: String,
     state: State<'_, AppState>,
 ) -> Result<RegenerateRecoveryResponse, String> {
+    let passphrase = Zeroizing::new(passphrase);
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
     let bundle = load_security_bundle(db)?
@@ -452,7 +469,9 @@ async fn regenerate_recovery_key(
     save_security_bundle(db, &next_bundle)?;
     drop(db_guard);
     state.security_runtime.lock().await.master_key = Some(key);
-    Ok(RegenerateRecoveryResponse { recovery_key })
+    Ok(RegenerateRecoveryResponse {
+        recovery_key: recovery_key.to_string(),
+    })
 }
 
 #[tauri::command]
@@ -553,6 +572,7 @@ async fn start_encryption_migration(
         .lock()
         .await
         .master_key
+        .clone()
         .ok_or_else(|| "Unlock encryption before starting migration".to_string())?;
 
     // Resolved once here and moved into the worker below, so every unlink the
@@ -2137,8 +2157,8 @@ async fn restore_backup_archive(
     recovery_key: Option<String>,
 ) -> Result<String, String> {
     let archive = std::path::PathBuf::from(&archive_path);
-    let passphrase = passphrase.filter(|p| !p.is_empty());
-    let recovery_key = recovery_key.filter(|k| !k.is_empty());
+    let passphrase = passphrase.filter(|p| !p.is_empty()).map(Zeroizing::new);
+    let recovery_key = recovery_key.filter(|k| !k.is_empty()).map(Zeroizing::new);
     if passphrase.is_none() && recovery_key.is_none() {
         return Err("A passphrase or a recovery key is required".to_string());
     }
@@ -2149,8 +2169,8 @@ async fn restore_backup_archive(
     // uses spawn_blocking too.
     tauri::async_runtime::spawn_blocking(move || {
         let secret = match (passphrase.as_deref(), recovery_key.as_deref()) {
-            (Some(p), _) => backup::BackupSecret::Passphrase(p),
-            (None, Some(k)) => backup::BackupSecret::RecoveryKey(k),
+            (Some(p), _) => backup::BackupSecret::Passphrase(p.as_str()),
+            (None, Some(k)) => backup::BackupSecret::RecoveryKey(k.as_str()),
             (None, None) => return Err("A passphrase or a recovery key is required".to_string()),
         };
         backup::restore_encrypted_backup(&archive, &out_path, secret)

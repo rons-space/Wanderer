@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const FILE_MAGIC: &[u8; 6] = b"WBENC1";
 const FILE_VERSION: u8 = 1;
@@ -63,9 +64,54 @@ pub struct MigrationStatus {
     pub last_error: Option<String>,
 }
 
+/// The 32 bytes that decrypt the entire library.
+///
+/// A newtype rather than a bare `[u8; 32]`, for two reasons. It is not `Copy`, so
+/// every duplicate of the key is a visible `.clone()` in the diff instead of an
+/// implicit memcpy that leaves a copy behind wherever it landed. And it zeroizes on
+/// drop, so a copy that does get made stops being readable in the process image, or in
+/// a crash dump or swap file, the moment it goes out of scope.
+///
+/// `expose` is deliberately awkward to say. Every call is a place where the raw key
+/// escapes into something that will not clear it.
+#[derive(Clone, ZeroizeOnDrop)]
+pub struct MasterKey([u8; 32]);
+
+impl MasterKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Constant-time, because comparing key material with a short-circuiting `==` is a
+/// habit worth not having, even where today's only callers are tests.
+impl PartialEq for MasterKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+}
+
+impl Eq for MasterKey {}
+
+/// Hand-written so that no log line, `dbg!` or `#[derive(Debug)]` on a struct that
+/// happens to hold a key can ever print the bytes.
+impl std::fmt::Debug for MasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MasterKey(<redacted>)")
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RuntimeState {
-    pub master_key: Option<[u8; 32]>,
+    pub master_key: Option<MasterKey>,
     pub migration: MigrationStatus,
     pub migration_worker_active: bool,
 }
@@ -81,13 +127,15 @@ impl SecurityBundle {
         }
     }
 
-    pub fn new_encrypted(passphrase: &str) -> Result<(Self, String, [u8; 32])> {
+    pub fn new_encrypted(passphrase: &str) -> Result<(Self, Zeroizing<String>, MasterKey)> {
         if passphrase.trim().len() < 8 {
             return Err(anyhow!("Passphrase must be at least 8 characters"));
         }
 
-        let mut master_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut master_key);
+        let mut key_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key_bytes);
+        let master_key = MasterKey::new(key_bytes);
+        key_bytes.zeroize();
 
         let passphrase_wrap = wrap_master_key_with_secret(passphrase.as_bytes(), &master_key)?;
         let recovery_key = generate_recovery_key();
@@ -114,7 +162,7 @@ impl SecurityBundle {
         ))
     }
 
-    pub fn unlock_with_passphrase(&self, passphrase: &str) -> Result<[u8; 32]> {
+    pub fn unlock_with_passphrase(&self, passphrase: &str) -> Result<MasterKey> {
         if self.mode != EncryptionMode::Encrypted {
             return Err(anyhow!("Encryption mode is not enabled"));
         }
@@ -130,7 +178,7 @@ impl SecurityBundle {
     /// Restoring a backup needs the key but has nowhere to persist a new wrap
     /// (the config table it would be written to is inside the artifact being
     /// restored), so this is deliberately separate from `recover_and_rewrap`.
-    pub fn unlock_with_recovery_key(&self, recovery_key: &str) -> Result<[u8; 32]> {
+    pub fn unlock_with_recovery_key(&self, recovery_key: &str) -> Result<MasterKey> {
         if self.mode != EncryptionMode::Encrypted {
             return Err(anyhow!("Encryption mode is not enabled"));
         }
@@ -150,7 +198,7 @@ impl SecurityBundle {
         &self,
         recovery_key: &str,
         new_passphrase: &str,
-    ) -> Result<(Self, [u8; 32])> {
+    ) -> Result<(Self, MasterKey)> {
         let master_key = self.unlock_with_recovery_key(recovery_key)?;
         let passphrase_wrap = wrap_master_key_with_secret(new_passphrase.as_bytes(), &master_key)?;
 
@@ -159,7 +207,10 @@ impl SecurityBundle {
         Ok((next, master_key))
     }
 
-    pub fn regenerate_recovery_key(&self, passphrase: &str) -> Result<(Self, String, [u8; 32])> {
+    pub fn regenerate_recovery_key(
+        &self,
+        passphrase: &str,
+    ) -> Result<(Self, Zeroizing<String>, MasterKey)> {
         let master_key = self.unlock_with_passphrase(passphrase)?;
         let new_recovery_key = generate_recovery_key();
         let wrap = wrap_master_key_with_secret(new_recovery_key.as_bytes(), &master_key)?;
@@ -183,16 +234,18 @@ fn argon2id_params() -> Result<Argon2<'static>> {
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
 }
 
-fn derive_secret_key(secret: &[u8], salt: &[u8; 16]) -> Result<[u8; 32]> {
-    let mut out = [0u8; 32];
+/// `Zeroizing` because this is the key that decrypts the master key: leaving it in a
+/// stack buffer is the same exposure as leaving the master key there.
+fn derive_secret_key(secret: &[u8], salt: &[u8; 16]) -> Result<Zeroizing<[u8; 32]>> {
+    let mut out = Zeroizing::new([0u8; 32]);
     let argon2 = argon2id_params()?;
     argon2
-        .hash_password_into(secret, salt, &mut out)
+        .hash_password_into(secret, salt, out.as_mut())
         .map_err(|e| anyhow!("Argon2 derivation failed: {}", e))?;
     Ok(out)
 }
 
-fn wrap_master_key_with_secret(secret: &[u8], master_key: &[u8; 32]) -> Result<WrappedMasterKey> {
+fn wrap_master_key_with_secret(secret: &[u8], master_key: &MasterKey) -> Result<WrappedMasterKey> {
     let mut salt = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let derived_key = derive_secret_key(secret, &salt)?;
@@ -200,9 +253,9 @@ fn wrap_master_key_with_secret(secret: &[u8], master_key: &[u8; 32]) -> Result<W
     let mut nonce = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(derived_key.as_ref()));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), master_key.as_slice())
+        .encrypt(Nonce::from_slice(&nonce), master_key.expose().as_slice())
         .map_err(|_| anyhow!("Failed to wrap master key"))?;
 
     Ok(WrappedMasterKey {
@@ -212,7 +265,7 @@ fn wrap_master_key_with_secret(secret: &[u8], master_key: &[u8; 32]) -> Result<W
     })
 }
 
-fn unwrap_master_key_with_secret(secret: &[u8], wrapped: &WrappedMasterKey) -> Result<[u8; 32]> {
+fn unwrap_master_key_with_secret(secret: &[u8], wrapped: &WrappedMasterKey) -> Result<MasterKey> {
     let salt_vec = B64
         .decode(&wrapped.salt_b64)
         .context("Invalid wrapped key salt encoding")?;
@@ -234,10 +287,14 @@ fn unwrap_master_key_with_secret(secret: &[u8], wrapped: &WrappedMasterKey) -> R
         .context("Invalid wrapped key ciphertext encoding")?;
 
     let derived_key = derive_secret_key(secret, &salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce_vec), ciphertext.as_ref())
-        .map_err(|_| anyhow!("Failed to unwrap key. Secret may be invalid"))?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(derived_key.as_ref()));
+    // The AEAD hands back an ordinary Vec, so the unwrapped key exists in an allocation
+    // nothing clears. Wrap it before anything else can fail and leave it behind.
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(Nonce::from_slice(&nonce_vec), ciphertext.as_ref())
+            .map_err(|_| anyhow!("Failed to unwrap key. Secret may be invalid"))?,
+    );
 
     if plaintext.len() != 32 {
         return Err(anyhow!("Invalid unwrapped master key length"));
@@ -245,7 +302,9 @@ fn unwrap_master_key_with_secret(secret: &[u8], wrapped: &WrappedMasterKey) -> R
 
     let mut out = [0u8; 32];
     out.copy_from_slice(&plaintext);
-    Ok(out)
+    let key = MasterKey::new(out);
+    out.zeroize();
+    Ok(key)
 }
 
 fn hash_recovery_key(recovery_key: &str) -> Result<String> {
@@ -266,7 +325,7 @@ fn verify_recovery_key(recovery_key: &str, verifier_phc: &str) -> Result<bool> {
         .is_ok())
 }
 
-fn generate_recovery_key() -> String {
+fn generate_recovery_key() -> Zeroizing<String> {
     let mut raw = [0u8; 20];
     rand::rngs::OsRng.fill_bytes(&mut raw);
     let hex = hex::encode(raw).to_uppercase();
@@ -274,7 +333,7 @@ fn generate_recovery_key() -> String {
     for chunk in hex.as_bytes().chunks(5) {
         groups.push(String::from_utf8_lossy(chunk).to_string());
     }
-    groups.join("-")
+    Zeroizing::new(groups.join("-"))
 }
 
 fn derive_chunk_nonce(base_nonce: &[u8; 12], chunk_idx: u32) -> [u8; 12] {
@@ -293,7 +352,7 @@ pub fn is_encrypted_file(path: &Path) -> Result<bool> {
     Ok(&magic == FILE_MAGIC)
 }
 
-pub fn encrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Result<()> {
+pub fn encrypt_file(input_path: &Path, output_path: &Path, key: &MasterKey) -> Result<()> {
     let input = File::open(input_path).with_context(|| {
         format!(
             "Failed to open input file for encryption: {}",
@@ -324,7 +383,7 @@ pub fn encrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Re
 pub fn encrypt_stream<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    key: &[u8; 32],
+    key: &MasterKey,
 ) -> Result<()> {
     let mut base_nonce = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut base_nonce);
@@ -334,7 +393,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     writer.write_all(&DEFAULT_CHUNK_SIZE.to_le_bytes())?;
     writer.write_all(&base_nonce)?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.expose()));
     let mut chunk_buf = vec![0u8; DEFAULT_CHUNK_SIZE as usize];
     let mut chunk_idx: u32 = 0;
 
@@ -366,7 +425,7 @@ pub fn encrypt_stream<R: Read, W: Write>(
     Ok(())
 }
 
-pub fn decrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Result<()> {
+pub fn decrypt_file(input_path: &Path, output_path: &Path, key: &MasterKey) -> Result<()> {
     let input = File::open(input_path).with_context(|| {
         format!(
             "Failed to open encrypted input file: {}",
@@ -392,7 +451,7 @@ pub fn decrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Re
 pub fn decrypt_stream<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
-    key: &[u8; 32],
+    key: &MasterKey,
 ) -> Result<()> {
     let mut magic = [0u8; 6];
     reader.read_exact(&mut magic)?;
@@ -419,7 +478,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
     let mut base_nonce = [0u8; 12];
     reader.read_exact(&mut base_nonce)?;
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key.expose()));
     let mut chunk_idx: u32 = 0;
     let mut len_buf = [0u8; 4];
 
@@ -475,7 +534,7 @@ pub fn decrypt_stream<R: Read, W: Write>(
 pub fn decrypt_file_if_needed(
     input_path: &Path,
     output_path: &Path,
-    key: Option<&[u8; 32]>,
+    key: Option<&MasterKey>,
 ) -> Result<bool> {
     if !is_encrypted_file(input_path)? {
         if let Some(parent) = output_path.parent() {
@@ -615,7 +674,7 @@ mod tests {
         let key = bundle
             .unlock_with_passphrase("correct horse battery staple")
             .expect("unlock");
-        assert_eq!(key.len(), 32);
+        assert_eq!(key.expose().len(), 32);
         assert!(bundle.unlock_with_passphrase("bad passphrase").is_err());
     }
 
@@ -646,7 +705,7 @@ mod tests {
 
     #[test]
     fn oversized_chunk_length_is_rejected_before_allocating() {
-        let key = [7u8; 32];
+        let key = MasterKey::new([7u8; 32]);
 
         // ~4 GiB declared. This must fail on the bound, not on the allocation.
         let hostile = header_with_chunk_len(DEFAULT_CHUNK_SIZE, u32::MAX);
@@ -686,23 +745,50 @@ mod tests {
             .collect();
         std::fs::write(&plain, &contents).expect("write");
 
-        let mut key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key);
+        let key = random_test_key();
 
         encrypt_file(&plain, &sealed, &key).expect("encrypt");
         assert!(is_encrypted_file(&sealed).expect("magic"));
         decrypt_file(&sealed, &out, &key).expect("decrypt");
         assert_eq!(std::fs::read(&out).expect("read"), contents);
 
-        let mut wrong_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut wrong_key);
+        let wrong_key = random_test_key();
         assert!(decrypt_file(&sealed, &dir.join("bad.bin"), &wrong_key).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `RuntimeState` derives `Debug` and holds the key, so anything that logs the
+    /// runtime state would print it if this newtype ever went back to a derive.
+    #[test]
+    fn debug_output_never_shows_key_bytes() {
+        let key = MasterKey::new([0xAB; 32]);
+        let rendered = format!("{:?} {:?}", key, Some(key.clone()));
+        assert!(!rendered.contains("171"), "key bytes leaked: {}", rendered);
+        assert!(!rendered.contains("ab"), "key bytes leaked: {}", rendered);
+        assert_eq!(
+            rendered,
+            "MasterKey(<redacted>) Some(MasterKey(<redacted>))"
+        );
+    }
+
+    /// Cloning is explicit precisely so that copies are visible, but a clone still
+    /// has to be the same key, and comparison has to be by value.
+    #[test]
+    fn a_cloned_key_equals_its_original_and_differs_from_another() {
+        let key = random_test_key();
+        assert_eq!(key.clone(), key);
+        assert_ne!(random_test_key(), key);
+    }
+
+    fn random_test_key() -> MasterKey {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        MasterKey::new(bytes)
+    }
+
     /// Two fixtures for the tamper tests: a multi-chunk `.wbenc` and its plaintext.
-    fn sealed_fixture(name: &str) -> (std::path::PathBuf, [u8; 32], Vec<u8>) {
+    fn sealed_fixture(name: &str) -> (std::path::PathBuf, MasterKey, Vec<u8>) {
         let dir =
             std::env::temp_dir().join(format!("wanderer-sec-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -716,8 +802,7 @@ mod tests {
             .collect();
         std::fs::write(&plain, &contents).expect("write");
 
-        let mut key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut key);
+        let key = random_test_key();
         encrypt_file(&plain, &sealed, &key).expect("encrypt");
 
         (sealed, key, contents)

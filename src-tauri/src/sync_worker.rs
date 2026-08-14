@@ -65,7 +65,7 @@ impl SyncWorker {
             }
         };
         let master_key = if encrypted_mode {
-            let maybe = self.security_runtime.lock().await.master_key;
+            let maybe = self.security_runtime.lock().await.master_key.clone();
             if maybe.is_none() {
                 debug!("SyncWorker: encryption enabled but vault locked; waiting for unlock.");
                 return Ok(());
@@ -301,7 +301,7 @@ impl SyncWorker {
         if encrypted_mode {
             if let Some(thumb_str) = thumbnail_path.clone() {
                 let thumb = std::path::PathBuf::from(&thumb_str);
-                let maybe_key = self.security_runtime.lock().await.master_key;
+                let maybe_key = self.security_runtime.lock().await.master_key.clone();
                 if let Some(key) = maybe_key {
                     let encrypted_thumb = thumb.with_extension("wbenc");
                     match security::encrypt_file(&thumb, &encrypted_thumb, &key) {
