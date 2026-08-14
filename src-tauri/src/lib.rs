@@ -819,14 +819,11 @@ async fn get_media(
     let db_guard = state.db.lock().await;
     let _db = db_guard.as_ref().ok_or("Database not initialized")?;
 
-    println!(
-        "Command: get_media called with limit={}, offset={}",
-        limit, offset
-    );
+    log::debug!("get_media: limit={}, offset={}", limit, offset);
     let result = _db.get_media(limit, offset).map_err(|e| e.to_string());
     match &result {
-        Ok(items) => println!("Command: get_media returning {} items", items.len()),
-        Err(e) => println!("Command: get_media failed: {}", e),
+        Ok(items) => log::debug!("get_media: returning {} items", items.len()),
+        Err(e) => log::warn!("get_media failed: {}", e),
     }
     let items = result?;
     drop(db_guard);
@@ -858,9 +855,13 @@ async fn search_fts(
     offset: i32,
     state: State<'_, AppState>,
 ) -> Result<Vec<database::MediaItem>, String> {
-    println!(
-        "Command: search_fts called with query='{}', has_location={:?}",
-        query, filters.has_location
+    // The query text is the user's own words about their own library, so only its
+    // shape is logged. It is the one command argument that is content rather than an
+    // identifier.
+    log::debug!(
+        "search_fts: {}-character query, has_location={:?}",
+        query.chars().count(),
+        filters.has_location
     );
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -869,8 +870,8 @@ async fn search_fts(
         .map_err(|e| e.to_string());
 
     match &result {
-        Ok(items) => println!("Command: search_fts returning {} items", items.len()),
-        Err(e) => println!("Command: search_fts failed: {}", e),
+        Ok(items) => log::debug!("search_fts: returning {} items", items.len()),
+        Err(e) => log::warn!("search_fts failed: {}", e),
     }
     let items = result?;
     drop(db_guard);
@@ -897,9 +898,10 @@ async fn add_media_to_album(
     media_id: i64,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    println!(
-        "Command: add_media_to_album called with album_id={}, media_id={}",
-        album_id, media_id
+    log::debug!(
+        "add_media_to_album: album_id={}, media_id={}",
+        album_id,
+        media_id
     );
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -914,9 +916,11 @@ async fn get_album_media(
     offset: i32,
     state: State<'_, AppState>,
 ) -> Result<Vec<database::MediaItem>, String> {
-    println!(
-        "Command: get_album_media called with album_id={}, limit={}, offset={}",
-        album_id, limit, offset
+    log::debug!(
+        "get_album_media: album_id={}, limit={}, offset={}",
+        album_id,
+        limit,
+        offset
     );
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -924,8 +928,8 @@ async fn get_album_media(
         .get_album_media(album_id, limit, offset)
         .map_err(|e| e.to_string());
     match &result {
-        Ok(items) => println!("Command: get_album_media returning {} items", items.len()),
-        Err(e) => println!("Command: get_album_media failed: {}", e),
+        Ok(items) => log::debug!("get_album_media: returning {} items", items.len()),
+        Err(e) => log::warn!("get_album_media failed: {}", e),
     }
     let items = result?;
     drop(db_guard);
@@ -1035,7 +1039,7 @@ pub fn run() {
                 let app_dir = match resolve_app_data_dir(&app_handle) {
                     Ok(dir) => dir,
                     Err(e) => {
-                        eprintln!("Failed to resolve app data directory: {}", e);
+                        log::error!("Failed to resolve app data directory: {}", e);
                         return;
                     }
                 };
@@ -1047,11 +1051,12 @@ pub fn run() {
                     Ok(db) => {
                         let arc = Arc::new(db);
                         *state.db.lock().await = Some(arc.clone());
-                        println!("Database initialized at {:?}", db_path);
+                        log::info!("Database initialized");
+                        log::debug!("Database path: {:?}", db_path);
                         Some(arc)
                     }
                     Err(e) => {
-                        eprintln!("Failed to initialize database: {}", e);
+                        log::error!("Failed to initialize database: {}", e);
                         None
                     }
                 };
@@ -1129,9 +1134,10 @@ pub fn run() {
                     ) {
                         Ok(w) => {
                             *state.watcher.lock().await = Some(w);
-                            println!("File Watcher started at {:?}", watch_path);
+                            log::info!("File watcher started");
+                            log::debug!("Watching {:?}", watch_path);
                         }
-                        Err(e) => eprintln!("Failed to start watcher: {}", e),
+                        Err(e) => log::error!("Failed to start watcher: {}", e),
                     }
 
                     // Start AI Worker
@@ -1147,7 +1153,7 @@ pub fn run() {
                     tokio::spawn(async move {
                         ai_worker.run(worker_cancel_clone).await;
                     });
-                    println!("AI Worker spawned");
+                    log::info!("AI worker spawned");
 
                     // Create cancellation token for graceful shutdown
                     let cancel_token = CancellationToken::new();
@@ -1462,7 +1468,7 @@ async fn get_favorites(
 
 #[tauri::command]
 async fn soft_delete_media(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    println!(">>> soft_delete_media CALLED for id={}", media_id);
+    log::debug!("soft_delete_media: media_id={}", media_id);
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
     db.soft_delete(media_id).map_err(|e| e.to_string())
@@ -1481,10 +1487,7 @@ async fn get_trash(
     offset: i32,
     state: State<'_, AppState>,
 ) -> Result<Vec<database::MediaItem>, String> {
-    println!(
-        ">>> get_trash CALLED with limit={}, offset={}",
-        limit, offset
-    );
+    log::debug!("get_trash: limit={}, offset={}", limit, offset);
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
     let items = db.get_trash(limit, offset).map_err(|e| e.to_string())?;
@@ -2002,10 +2005,7 @@ async fn empty_trash(
     delete_from_telegram: bool,
     state: State<'_, AppState>,
 ) -> Result<usize, String> {
-    println!(
-        ">>> empty_trash CALLED! delete_from_telegram={}",
-        delete_from_telegram
-    );
+    log::info!("empty_trash: delete_from_telegram={}", delete_from_telegram);
 
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -2013,11 +2013,10 @@ async fn empty_trash(
     // Delete all trashed items from local + DB
     let (deleted_count, telegram_ids) = db.empty_trash().map_err(|e| e.to_string())?;
 
-    println!(
-        "empty_trash: Deleted {} items locally. Telegram IDs to delete: {:?}, delete_from_telegram={}",
+    log::info!(
+        "empty_trash: deleted {} items locally, {} with a Telegram copy",
         deleted_count,
-        telegram_ids,
-        delete_from_telegram
+        telegram_ids.len()
     );
 
     // Optionally delete from Telegram
@@ -2029,28 +2028,24 @@ async fn empty_trash(
             .filter_map(|id| {
                 let parsed = id.parse::<i32>().ok();
                 if parsed.is_none() {
-                    println!("empty_trash: Failed to parse telegram_id '{}' as i32", id);
+                    log::warn!("empty_trash: unparseable telegram_id, skipping it");
                 }
                 parsed
             })
             .collect();
 
-        println!(
-            "empty_trash: Parsed {} message IDs for Telegram deletion: {:?}",
-            msg_ids.len(),
-            msg_ids
+        log::debug!(
+            "empty_trash: {} message IDs to delete from Telegram",
+            msg_ids.len()
         );
 
         if !msg_ids.is_empty() {
             match state.telegram.delete_messages(&msg_ids).await {
                 Ok(deleted) => {
-                    println!(
-                        "empty_trash: Successfully deleted {} messages from Telegram",
-                        deleted
-                    );
+                    log::info!("empty_trash: deleted {} messages from Telegram", deleted);
                 }
                 Err(e) => {
-                    println!("empty_trash: Failed to delete from Telegram: {}", e);
+                    log::warn!("empty_trash: failed to delete from Telegram: {}", e);
                 }
             }
         }

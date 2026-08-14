@@ -39,7 +39,7 @@ impl FaceDetector {
             .into_runnable()?;
 
         let priors = Self::generate_priors();
-        println!("FaceDetector: Generated {} priors/anchors", priors.len());
+        log::debug!("FaceDetector: generated {} priors/anchors", priors.len());
 
         Ok(Self { model, priors })
     }

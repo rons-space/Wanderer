@@ -152,8 +152,12 @@ impl TelegramService {
 
         let updates_handle = tokio::spawn(async move {
             while let Ok(update) = update_stream.next().await {
-                if let Update::NewMessage(message) = update {
-                    info!("New message: {:?}", message.text());
+                // Deliberately not logging the message: this is the user's own Saved
+                // Messages chat, so the text is their private correspondence and the
+                // backup payloads they store here. Only the arrival is interesting,
+                // and only while debugging.
+                if let Update::NewMessage(_) = update {
+                    log::debug!("Received a new Telegram message");
                 }
             }
         });
@@ -209,7 +213,9 @@ impl TelegramService {
 
         match client.sign_in(&token, code).await {
             Ok(user) => {
-                info!("Signed in as: {}", user.full_name());
+                // The account name is the user's real name; it belongs in the UI, not
+                // in a log file that gets attached to bug reports.
+                info!("Signed in to Telegram");
                 Ok(user.full_name())
             }
             // Error handling remains similar
@@ -401,11 +407,7 @@ impl TelegramService {
             return Ok(0);
         }
 
-        log::info!(
-            "Telegram: Attempting to delete {} messages with IDs: {:?}",
-            message_ids.len(),
-            message_ids
-        );
+        log::info!("Telegram: deleting {} messages", message_ids.len());
 
         let client_guard = self.client.lock().await;
         let client = client_guard.as_ref().ok_or("Client not connected")?;

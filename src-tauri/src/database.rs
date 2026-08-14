@@ -955,16 +955,16 @@ impl Database {
         }
 
         if max_score > THRESHOLD {
-            println!(
-                "Face matched to Person {} (score: {:.3})",
+            log::debug!(
+                "Face matched to person {} (score: {:.3})",
                 best_match.unwrap(),
                 max_score
             );
             return Ok(best_match);
         }
 
-        println!(
-            "No match found (max_score: {:.3}). Creating new person.",
+        log::debug!(
+            "No face match (max score {:.3}), creating a new person",
             max_score
         );
 
