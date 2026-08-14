@@ -2,6 +2,14 @@ import { useState, useCallback, useEffect } from "react";
 import { useLatestRequest } from "@/hooks/use-latest-request";
 import { MediaItem, SearchFilters, Tag } from "../types";
 import { api } from "../lib/api";
+import {
+    SEARCH_HISTORY_KEY,
+    addToHistory as pushHistory,
+    buildSearchFilters,
+    readSearchHistory,
+    removeFromHistory as dropFromHistory,
+    writeSearchHistory,
+} from "@/lib/search-history";
 import { useMediaActions } from "@/hooks/use-media-actions";
 import { MediaGrid } from "./MediaGrid";
 import { Input } from "./ui/input";
@@ -18,25 +26,6 @@ import {
 } from "./ui/select";
 import { Badge } from "./ui/badge";
 import { Search as SearchIcon, Heart, Star, Filter, X, Clock, Camera, MapPin, Sparkles } from "lucide-react";
-
-const SEARCH_HISTORY_KEY = "wanderer_search_history";
-const MAX_HISTORY_ITEMS = 10;
-
-function getSearchHistory(): string[] {
-    try {
-        const stored = localStorage.getItem(SEARCH_HISTORY_KEY);
-        if (!stored) return [];
-        const parsed = JSON.parse(stored);
-        if (!Array.isArray(parsed)) return [];
-        return parsed.filter((entry): entry is string => typeof entry === "string");
-    } catch {
-        return [];
-    }
-}
-
-function saveSearchHistory(history: string[]) {
-    localStorage.setItem(SEARCH_HISTORY_KEY, JSON.stringify(history.slice(0, MAX_HISTORY_ITEMS)));
-}
 
 export function Search() {
     const [items, setItems] = useState<MediaItem[]>([]);
@@ -79,7 +68,7 @@ export function Search() {
     }, []);
 
     useEffect(() => {
-        setSearchHistory(getSearchHistory());
+        setSearchHistory(readSearchHistory());
         loadTags();
 
         // Keep tags reasonably fresh while AI worker is processing.
@@ -103,16 +92,15 @@ export function Search() {
     }, [selectedTag]);
 
     const addToHistory = (searchQuery: string) => {
-        if (!searchQuery.trim()) return;
-        const newHistory = [searchQuery, ...searchHistory.filter(h => h !== searchQuery)].slice(0, MAX_HISTORY_ITEMS);
+        const newHistory = pushHistory(searchHistory, searchQuery);
         setSearchHistory(newHistory);
-        saveSearchHistory(newHistory);
+        writeSearchHistory(newHistory);
     };
 
     const removeFromHistory = (searchQuery: string) => {
-        const newHistory = searchHistory.filter(h => h !== searchQuery);
+        const newHistory = dropFromHistory(searchHistory, searchQuery);
         setSearchHistory(newHistory);
-        saveSearchHistory(newHistory);
+        writeSearchHistory(newHistory);
     };
 
     const clearHistory = () => {
@@ -120,14 +108,10 @@ export function Search() {
         localStorage.removeItem(SEARCH_HISTORY_KEY);
     };
 
-    const createFilters = useCallback((): SearchFilters => {
-        return {
-            favorites_only: favoritesOnly,
-            min_rating: parseInt(minRating) > 0 ? parseInt(minRating) : undefined,
-            camera_make: cameraMake.trim() || undefined,
-            has_location: hasLocation === "any" ? undefined : hasLocation === "yes",
-        };
-    }, [favoritesOnly, minRating, cameraMake, hasLocation]);
+    const createFilters = useCallback(
+        (): SearchFilters => buildSearchFilters({ favoritesOnly, minRating, cameraMake, hasLocation }),
+        [favoritesOnly, minRating, cameraMake, hasLocation],
+    );
 
     const performSearch = async (
         searchQuery: string,
