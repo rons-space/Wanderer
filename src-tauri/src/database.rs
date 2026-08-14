@@ -2839,53 +2839,12 @@ impl Database {
         Ok(items)
     }
 
-    /// Get albums that a specific media item belongs to
-    pub fn get_albums_for_media(&self, media_id: i64) -> Result<Vec<Album>> {
-        let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT a.id, a.name, a.created_at, \
-                    (SELECT m.thumbnail_path FROM album_media am2 \
-                     JOIN media m ON am2.media_id = m.id \
-                     WHERE am2.album_id = a.id \
-                       AND (m.is_deleted = 0 OR m.is_deleted IS NULL) \
-                       AND (m.is_archived = 0 OR m.is_archived IS NULL) \
-                     ORDER BY am2.added_at DESC LIMIT 1) as cover_thumbnail, \
-                    (SELECT m.file_path FROM album_media am2 \
-                     JOIN media m ON am2.media_id = m.id \
-                     WHERE am2.album_id = a.id \
-                       AND (m.is_deleted = 0 OR m.is_deleted IS NULL) \
-                       AND (m.is_archived = 0 OR m.is_archived IS NULL) \
-                     ORDER BY am2.added_at DESC LIMIT 1) as cover_file_path \
-             FROM albums a \
-             INNER JOIN album_media am ON a.id = am.album_id \
-             WHERE am.media_id = ?1",
-        )?;
-
-        let albums: Vec<Album> = stmt
-            .query_map([media_id], |row| {
-                let thumbnail_path: Option<String> = row.get(3)?;
-                let file_path: Option<String> = row.get(4)?;
-                let cover = thumbnail_path.or(file_path);
-
-                Ok(Album {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    created_at: row.get(2)?,
-                    cover_path: cover,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        Ok(albums)
-    }
-
     /// Album names for every media item that is in at least one album.
     ///
-    /// The sync manifest needs names and nothing else. Calling
-    /// `get_albums_for_media` per photo ran two correlated cover subqueries over the
-    /// whole library for each one, to build a cover path the manifest then threw
-    /// away. This is the same information in a single scan.
+    /// The sync manifest needs names and nothing else. Its previous per-photo query
+    /// ran two correlated cover subqueries over the whole library for each photo, to
+    /// build a cover path the manifest then threw away. This is the same information
+    /// in a single scan, and it was that query's only caller, so the query is gone.
     pub fn album_names_by_media(&self) -> Result<std::collections::HashMap<i64, Vec<String>>> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
@@ -3364,14 +3323,14 @@ mod tests {
         assert!(temp.db.get_media_by_id(b).unwrap().unwrap().is_cloud_only);
     }
 
-    /// The manifest export reads album membership in one pass. It has to see the
-    /// same names the per-photo query returned, for every photo in an album.
+    /// The manifest export reads album membership in one pass. It has to report every
+    /// album a photo belongs to, and nothing for a photo in none.
     #[test]
     fn album_names_are_read_in_one_pass() {
         let temp = TempDb::new();
         let a = insert_media_with_camera(&temp.db, "/library/a.jpg", "Canon");
         let b = insert_media_with_camera(&temp.db, "/library/b.jpg", "Canon");
-        let _lonely = insert_media_with_camera(&temp.db, "/library/c.jpg", "Canon");
+        let lonely = insert_media_with_camera(&temp.db, "/library/c.jpg", "Canon");
 
         let holiday = temp.db.create_album("Holiday").unwrap();
         let family = temp.db.create_album("Family").unwrap();
@@ -3387,16 +3346,9 @@ mod tests {
         assert_eq!(for_a, vec!["Family".to_string(), "Holiday".to_string()]);
         assert_eq!(by_media.get(&b).cloned().unwrap(), vec!["Holiday"]);
 
-        // Same names the per-photo query reports, which is what the export replaced.
-        let mut per_photo: Vec<String> = temp
-            .db
-            .get_albums_for_media(a)
-            .unwrap()
-            .into_iter()
-            .map(|album| album.name)
-            .collect();
-        per_photo.sort();
-        assert_eq!(per_photo, for_a);
+        // A photo in no album has no entry at all, rather than an empty one, which is
+        // what the export's lookup relies on to skip it.
+        assert!(by_media.get(&lonely).is_none());
     }
 
     /// A `MediaItem` with only the fields the clustering reads set.
