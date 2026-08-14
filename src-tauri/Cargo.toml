@@ -45,7 +45,6 @@ image_023 = { package = "image", version = "0.23.14", default-features = true }
 # unauthenticated WebSocket control channel (see the `mcp-bridge` feature below).
 tauri-plugin-mcp-bridge = { version = "0.7.0", optional = true }
 tauri-plugin-dialog = "2.5.0"
-tauri-plugin-fs = "2"
 mime_guess = "2.0.5"
 tract-onnx = "0.21.7"
 anyhow = "1.0.100"
