@@ -61,9 +61,6 @@ pub struct AppError {
     code: ErrorCode,
     /// Shown to the user. Only ever a message this codebase wrote.
     message: String,
-    /// The underlying library error. Logged, never serialized: this is where the SQL
-    /// text and the absolute paths live.
-    detail: Option<String>,
 }
 
 impl AppError {
@@ -75,20 +72,18 @@ impl AppError {
         Self {
             code,
             message: message.into(),
-            detail: None,
         }
     }
 
     /// An error whose cause came from a library and is not safe to display.
+    ///
+    /// The cause is logged and then dropped rather than carried along, because
+    /// carrying it is how it ends up serialized by the next person to add a field.
     fn opaque(code: ErrorCode, detail: impl fmt::Display) -> Self {
-        let detail = detail.to_string();
-        // Logged here, at the point of conversion, because this is the last place the
-        // real cause exists: the frontend gets the generic message instead.
         log::error!("{:?}: {}", code, detail);
         Self {
             code,
             message: code.generic_message().to_string(),
-            detail: Some(detail),
         }
     }
 
@@ -123,16 +118,16 @@ impl AppError {
         Self::new(ErrorCode::Internal, message)
     }
 
+    /// Test-only: production code sends the whole error to the frontend rather than
+    /// inspecting it, so an accessor that exists all the time is dead weight.
+    #[cfg(test)]
     pub fn code(&self) -> ErrorCode {
         self.code
     }
 
+    #[cfg(test)]
     pub fn message(&self) -> &str {
         &self.message
-    }
-
-    pub fn detail(&self) -> Option<&str> {
-        self.detail.as_deref()
     }
 }
 
@@ -146,8 +141,8 @@ impl std::error::Error for AppError {}
 
 /// Serialized as `{ "code": ..., "message": ... }`.
 ///
-/// `detail` is deliberately absent. Tauri sends whatever this produces straight to
-/// JavaScript, so anything included here is on screen and in any bug report screenshot.
+/// Two fields, both safe to display. Tauri sends whatever this produces straight to
+/// JavaScript, so anything added here is on screen and in any bug report screenshot.
 impl Serialize for AppError {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -222,9 +217,6 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for AppError {
     }
 }
 
-/// Result type for application operations
-pub type AppResult<T> = Result<T, AppError>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,10 +250,6 @@ mod tests {
             !json.to_string().contains("secret_column"),
             "the underlying error leaked into the payload: {}",
             json
-        );
-        assert!(
-            err.detail().expect("detail kept").contains("secret_column"),
-            "the cause has to survive for the log"
         );
     }
 
