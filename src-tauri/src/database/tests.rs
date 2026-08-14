@@ -312,8 +312,7 @@ fn cluster_pairwise(candidates: &[(MediaItem, String)], threshold: u32) -> Vec<V
         }
     }
 
-    let mut groups: std::collections::HashMap<usize, Vec<i64>> =
-        std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<usize, Vec<i64>> = std::collections::HashMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
         let r = root(&mut parent, index);
         groups.entry(r).or_default().push(candidate.0.id);
