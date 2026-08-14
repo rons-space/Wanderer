@@ -284,8 +284,15 @@ async fn download_and_materialize_media(
         .map_err(|e| format!("Failed to download from Telegram: {}", e))?;
 
     let maybe_key = get_active_master_key(state).await;
-    let result = security::decrypt_file_if_needed(&temp_path, final_path, maybe_key.as_ref())
-        .map_err(|e| e.to_string());
+    // `Unknown`: this downloads by message id, with no media row in hand, and an
+    // encrypted library can still contain pre-migration plaintext blobs.
+    let result = security::decrypt_file_if_needed(
+        &temp_path,
+        final_path,
+        maybe_key.as_ref(),
+        security::Expect::Unknown,
+    )
+    .map_err(|e| e.to_string());
 
     let _ = std::fs::remove_file(&temp_path);
     result.map(|_| ())
@@ -2455,8 +2462,16 @@ async fn download_for_view(
         };
 
         if needs_refresh {
-            security::decrypt_file_if_needed(&cache_blob_path, &materialized_path, Some(&key))
-                .map_err(|e| e.to_string())?;
+            // This app wrote `cache_blob_path` itself, in encrypted mode, so a
+            // missing header means the cache has been tampered with rather than
+            // that the blob is legitimately plaintext.
+            security::decrypt_file_if_needed(
+                &cache_blob_path,
+                &materialized_path,
+                Some(&key),
+                security::Expect::Encrypted,
+            )
+            .map_err(|e| e.to_string())?;
         }
         let _ = filetime::set_file_mtime(&materialized_path, filetime::FileTime::now());
         return Ok(materialized_path.to_string_lossy().to_string());

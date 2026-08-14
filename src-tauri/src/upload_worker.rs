@@ -173,7 +173,7 @@ pub async fn run_upload_worker(
                     }
 
                     // Last line of defence before bytes leave the machine: the
-                    // artifact must actually be a WBENC1 file. Without this,
+                    // artifact must actually carry a Wanderer magic. Without this,
                     // any future bug in the branch above sends plaintext and
                     // nothing notices.
                     let is_sealed = security::is_encrypted_file(std::path::Path::new(&upload_path))
