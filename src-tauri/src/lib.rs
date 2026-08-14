@@ -856,11 +856,28 @@ pub fn run() {
         }
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_mcp_bridge::init())
+        .plugin(tauri_plugin_fs::init());
+
+    // The MCP bridge is a development tool and must never reach a distributed
+    // build. Its WebSocket server has no authentication and exposes `execute_js`,
+    // so anyone who can reach the port can run arbitrary script in the webview and
+    // from there call every command registered below, including
+    // `unlock_encryption`, `get_all_config` and `permanent_delete_media`.
+    //
+    // Two gates, because either one alone is easy to defeat by accident: the
+    // dependency is an opt-in feature (see `Cargo.toml`), and registration is
+    // additionally restricted to debug builds. `localhost_only()` replaces the
+    // plugin's `0.0.0.0` default so that even in development it is not reachable
+    // from the local network.
+    #[cfg(all(debug_assertions, feature = "mcp-bridge"))]
+    let builder = builder.plugin(tauri_plugin_mcp_bridge::init_with_config(
+        tauri_plugin_mcp_bridge::Config::localhost_only(),
+    ));
+
+    builder
         .manage(AppState {
             telegram: telegram_service,
             db: Mutex::new(None),

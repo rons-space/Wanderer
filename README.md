@@ -308,6 +308,14 @@ npm install
 npm run tauri dev
 ```
 
+The MCP agent bridge (`tauri-plugin-mcp-bridge`) is **not** compiled in by default. It
+starts an unauthenticated WebSocket server that can run arbitrary script inside the app,
+so it is an opt-in, debug-only feature and is bound to localhost when enabled:
+
+```bash
+npm run tauri dev -- --features mcp-bridge
+```
+
 Production build:
 
 ```bash
