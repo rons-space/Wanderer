@@ -1,4 +1,3 @@
-use crate::cache::ThumbnailCache;
 use crate::database::Database;
 use crate::media_utils;
 use crate::security::{self, RuntimeState};
@@ -17,7 +16,6 @@ use tokio::sync::Mutex;
 pub struct FileWatcher {
     #[allow(dead_code)]
     watcher: RecommendedWatcher,
-    cache: ThumbnailCache,
 }
 
 impl FileWatcher {
@@ -26,7 +24,6 @@ impl FileWatcher {
         cache_dir: PathBuf,
         db: Arc<Database>,
         app_handle: tauri::AppHandle,
-        cache: ThumbnailCache,
         security_runtime: Arc<Mutex<RuntimeState>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (tx, mut rx) = mpsc::channel(100);
@@ -53,8 +50,6 @@ impl FileWatcher {
         let cache_dir_clone = cache_dir.clone();
         let db_clone = db.clone();
         let app_handle_scan = app_handle.clone();
-        let cache_for_scan = cache.clone();
-        let cache_for_event = cache.clone();
         let runtime_for_scan = security_runtime.clone();
         let runtime_for_event = security_runtime.clone();
 
@@ -71,7 +66,6 @@ impl FileWatcher {
                                 &cache_dir_clone,
                                 &db_clone,
                                 Some(&app_handle_scan),
-                                &cache_for_scan,
                                 &runtime_for_scan,
                             )
                             .await
@@ -99,7 +93,6 @@ impl FileWatcher {
                                     &cache_dir,
                                     &db,
                                     Some(&app_handle),
-                                    &cache_for_event,
                                     &runtime_for_event,
                                 )
                                 .await
@@ -114,7 +107,7 @@ impl FileWatcher {
             }
         });
 
-        Ok(Self { watcher, cache })
+        Ok(Self { watcher })
     }
 }
 
@@ -123,7 +116,6 @@ async fn process_file(
     cache_dir: &Path,
     db: &Arc<Database>,
     app_handle: Option<&tauri::AppHandle>,
-    cache: &ThumbnailCache,
     security_runtime: &Arc<Mutex<RuntimeState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 0. Ignore temp files
@@ -194,10 +186,7 @@ async fn process_file(
     let mut thumbnail_path = if is_video {
         // Use FFmpeg for video thumbnails
         match media_utils::generate_video_thumbnail(path, cache_dir, &hash, 300).await {
-            Ok(Some(thumb_path)) => {
-                cache.insert(hash.clone(), thumb_path.clone()).await;
-                Some(thumb_path.to_string_lossy().to_string())
-            }
+            Ok(Some(thumb_path)) => Some(thumb_path.to_string_lossy().to_string()),
             Ok(None) => None,
             Err(e) => {
                 warn!("Video thumbnail generation failed for {:?}: {}", path, e);
@@ -207,10 +196,7 @@ async fn process_file(
     } else {
         // Use image library for image thumbnails
         match media_utils::generate_thumbnail(path, cache_dir, &hash, 300).await {
-            Ok(Some(thumb_path)) => {
-                cache.insert(hash.clone(), thumb_path.clone()).await;
-                Some(thumb_path.to_string_lossy().to_string())
-            }
+            Ok(Some(thumb_path)) => Some(thumb_path.to_string_lossy().to_string()),
             Ok(None) => None,
             Err(e) => {
                 warn!("Thumbnail generation failed for {:?}: {}", path, e);
@@ -220,12 +206,17 @@ async fn process_file(
     };
 
     // Encrypt thumbnail at rest when security mode is enabled.
-    let security_mode = db
-        .get_config("security_mode")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unset".to_string());
-    if security_mode.eq_ignore_ascii_case("encrypted") {
+    // Fail closed: if the bundle cannot be read, assume encryption is required.
+    // The branch below deletes the plaintext thumbnail when it cannot seal it,
+    // so the worst case is a missing thumbnail rather than a plaintext one.
+    let thumbnail_needs_encryption = crate::encryption_required(&db).unwrap_or_else(|e| {
+        warn!(
+            "Cannot determine encryption state, treating thumbnail as encrypted: {}",
+            e
+        );
+        true
+    });
+    if thumbnail_needs_encryption {
         if let Some(thumb_str) = thumbnail_path.clone() {
             let thumb_path = PathBuf::from(&thumb_str);
             let maybe_key = security_runtime.lock().await.master_key;

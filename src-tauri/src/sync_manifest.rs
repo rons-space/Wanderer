@@ -38,6 +38,17 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// The filename used for the sync manifest in Telegram
 pub const MANIFEST_FILENAME: &str = "wanderer_sync_manifest.json";
 
+/// Largest manifest accepted from disk or from Telegram.
+///
+/// A manifest is untrusted input: it arrives from another device over Telegram
+/// Saved Messages, or from whatever path the frontend passes in. 32 MiB is far
+/// beyond a realistic library's metadata and keeps `read_to_string` from
+/// pulling an arbitrary file into memory.
+const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Largest number of entries accepted in either map.
+const MAX_MANIFEST_ENTRIES: usize = 1_000_000;
+
 /// Metadata for a single media item in the sync manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaMetadata {
@@ -98,11 +109,50 @@ impl SyncManifest {
         }
     }
 
-    /// Load a manifest from a JSON file
+    /// Load a manifest from a JSON file.
+    ///
+    /// Everything here is validation of untrusted input: the size is bounded
+    /// before the file is read, the format version is checked before the
+    /// contents are believed, and both maps are bounded so a hostile manifest
+    /// cannot drive unbounded work in the import loop.
     pub fn from_file(path: &Path) -> Result<Self, String> {
+        let metadata =
+            std::fs::metadata(path).map_err(|e| format!("Failed to read manifest file: {}", e))?;
+        if !metadata.is_file() {
+            return Err("Sync manifest is not a file".to_string());
+        }
+        if metadata.len() > MAX_MANIFEST_BYTES {
+            return Err(format!(
+                "Sync manifest is too large: {} bytes (maximum {})",
+                metadata.len(),
+                MAX_MANIFEST_BYTES
+            ));
+        }
+
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read manifest file: {}", e))?;
-        serde_json::from_str(&contents).map_err(|e| format!("Failed to parse manifest JSON: {}", e))
+        let manifest: Self = serde_json::from_str(&contents)
+            .map_err(|e| format!("Failed to parse manifest JSON: {}", e))?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Reject manifests this build cannot safely apply.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version > MANIFEST_VERSION {
+            return Err(format!(
+                "Sync manifest version {} is newer than this app supports ({}). Update Wander(er) first.",
+                self.version, MANIFEST_VERSION
+            ));
+        }
+        if self.media.len() > MAX_MANIFEST_ENTRIES || self.albums.len() > MAX_MANIFEST_ENTRIES {
+            return Err(format!(
+                "Sync manifest is implausibly large: {} media entries, {} album entries",
+                self.media.len(),
+                self.albums.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Save the manifest to a JSON file

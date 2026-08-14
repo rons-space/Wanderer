@@ -208,6 +208,9 @@ export const api = {
     getTagsForMedia: (mediaId: number) =>
         invoke<string[]>("get_tags_for_media", { mediaId }),
     // Config / Settings
+    // Keys prefixed `security_` are filtered out by the backend on both paths:
+    // they hold the wrapped master key and the DPAPI credential blob, and are
+    // managed by the dedicated security commands instead.
     getAllConfig: () =>
         invoke<Record<string, string>>("get_all_config"),
     setConfig: (key: string, value: string) =>

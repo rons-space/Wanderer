@@ -1,10 +1,11 @@
 mod ai;
-mod cache;
+mod backup;
 mod clip;
 mod database;
 mod errors;
 mod media_utils;
 mod metadata;
+mod paths;
 mod progress_stream;
 mod raw_support;
 mod security;
@@ -28,7 +29,6 @@ struct AppState {
     telegram: Arc<TelegramService>,
     db: Mutex<Option<Arc<Database>>>,
     watcher: Mutex<Option<watcher::FileWatcher>>,
-    cache: cache::ThumbnailCache,
     security_runtime: Arc<Mutex<RuntimeState>>,
     /// Face detector is optional - AI features gracefully degrade if model fails to load
     face_detector: Option<Arc<Mutex<ai::FaceDetector>>>,
@@ -41,6 +41,20 @@ const SECURITY_ONBOARDING_COMPLETE_KEY: &str = "security_onboarding_complete";
 const TELEGRAM_CREDS_KEY: &str = "security_telegram_credentials";
 const SECURITY_MIGRATION_STATUS_KEY: &str = "security_migration_status";
 const SECURITY_MIGRATION_PENDING_PREFIX: &str = "security_migration_pending_new_msg_";
+
+/// Prefix for every `config` row that holds security state.
+///
+/// `security_bundle_v1` carries the Argon2id salts and both wrapped copies of
+/// the master key, and `security_telegram_credentials` carries the DPAPI blob.
+/// These rows are written only by the dedicated security commands and must
+/// never be readable from the webview, which is one `execute_js` or one
+/// compromised dependency away from being attacker-controlled.
+const SECURITY_KEY_PREFIX: &str = "security_";
+
+/// True for config keys the webview may neither read nor write.
+fn is_security_key(key: &str) -> bool {
+    key.starts_with(SECURITY_KEY_PREFIX)
+}
 
 fn fallback_app_data_dir() -> Result<std::path::PathBuf, String> {
     let base = dirs::data_local_dir()
@@ -90,7 +104,24 @@ struct RegenerateRecoveryResponse {
     recovery_key: String,
 }
 
-fn load_security_bundle(db: &Database) -> Result<Option<SecurityBundle>, String> {
+/// The authoritative answer to "must this data be encrypted?".
+///
+/// Always derived from the `SecurityBundle`, never from the duplicated
+/// `security_mode` row: the two are written by separate, non-transactional
+/// statements, so a crash or a transient error between them leaves the bundle
+/// saying `encrypted` while the mode row is absent. Reading the mode row with
+/// `.ok().flatten().unwrap_or("unset")` then answered "not encrypted" and the
+/// caller uploaded the plaintext original.
+///
+/// Returns `Err` when the bundle cannot be read or parsed. Callers must fail
+/// closed on that: defer the work, never fall back to sending plaintext.
+pub(crate) fn encryption_required(db: &Database) -> Result<bool, String> {
+    Ok(load_security_bundle(db)?
+        .map(|b| b.mode == EncryptionMode::Encrypted)
+        .unwrap_or(false))
+}
+
+pub(crate) fn load_security_bundle(db: &Database) -> Result<Option<SecurityBundle>, String> {
     let raw = db
         .get_config(SECURITY_BUNDLE_KEY)
         .map_err(|e| e.to_string())?;
@@ -110,6 +141,9 @@ fn save_security_bundle(db: &Database, bundle: &SecurityBundle) -> Result<(), St
         EncryptionMode::Encrypted => "encrypted",
         EncryptionMode::Unencrypted => "unencrypted",
     };
+    // Kept only so an older build installed over this one still finds the row it
+    // expects. Nothing in this codebase reads it as a decision input any more:
+    // use `encryption_required`, which reads the bundle above.
     db.set_config(SECURITY_MODE_KEY, mode)
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -132,8 +166,20 @@ fn save_migration_status(db: &Database, status: &MigrationStatus) -> Result<(), 
 fn ensure_thumbnail_encrypted(
     thumb_path: &str,
     key: &[u8; 32],
+    roots: &[std::path::PathBuf],
 ) -> Result<Option<std::path::PathBuf>, String> {
     let path = std::path::Path::new(thumb_path);
+
+    // `thumbnail_path` is a text column, and this function deletes the file it
+    // reads, so a poisoned row would mean encrypting and then unlinking an
+    // arbitrary file.
+    if !paths::is_within_any(roots, path) {
+        return Err(format!(
+            "Refusing to encrypt a thumbnail outside the managed library: {}",
+            thumb_path
+        ));
+    }
+
     if !path.exists() {
         return Ok(None);
     }
@@ -249,16 +295,20 @@ async fn get_security_status_inner(
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let mode = db
-        .get_config(SECURITY_MODE_KEY)
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "unset".to_string());
-
     let bundle = load_security_bundle(db)?;
     let encryption_configured = bundle
         .as_ref()
         .map(|b| b.mode == EncryptionMode::Encrypted)
         .unwrap_or(false);
+
+    // Derived from the bundle, like everything else now. Reporting this from the
+    // `security_mode` row was how the UI could say "encrypted" while the workers
+    // read the same row and disagreed.
+    let mode = match bundle.as_ref().map(|b| &b.mode) {
+        Some(EncryptionMode::Encrypted) => "encrypted".to_string(),
+        Some(EncryptionMode::Unencrypted) => "unencrypted".to_string(),
+        None => "unset".to_string(),
+    };
     let encryption_locked = if encryption_configured {
         state.security_runtime.lock().await.master_key.is_none()
     } else {
@@ -478,7 +528,10 @@ async fn get_encryption_migration_status(
 }
 
 #[tauri::command]
-async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), String> {
+async fn start_encryption_migration(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let db = {
         let db_guard = state.db.lock().await;
         db_guard
@@ -499,6 +552,10 @@ async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), St
         .await
         .master_key
         .ok_or_else(|| "Unlock encryption before starting migration".to_string())?;
+
+    // Resolved once here and moved into the worker below, so every unlink the
+    // migration performs is confined to the managed library.
+    let managed_roots = paths::managed_roots(&resolve_app_data_dir(&app)?);
 
     let cloud_items = db
         .get_uploaded_unencrypted_media(1_000_000)
@@ -530,7 +587,7 @@ async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), St
 
     tokio::spawn(async move {
         for (media_id, thumb_path) in thumb_items {
-            let result = match ensure_thumbnail_encrypted(&thumb_path, &key) {
+            let result = match ensure_thumbnail_encrypted(&thumb_path, &key, &managed_roots) {
                 Ok(Some(new_path)) => {
                     let new_path_str = new_path.to_string_lossy().to_string();
                     if new_path_str != thumb_path {
@@ -562,7 +619,9 @@ async fn start_encryption_migration(state: State<'_, AppState>) -> Result<(), St
 
             let result: Result<(), String> = async {
                 if let Some(thumb_path) = thumbnail_path.as_deref() {
-                    if let Some(new_thumb) = ensure_thumbnail_encrypted(thumb_path, &key)? {
+                    if let Some(new_thumb) =
+                        ensure_thumbnail_encrypted(thumb_path, &key, &managed_roots)?
+                    {
                         let new_thumb_str = new_thumb.to_string_lossy().to_string();
                         if new_thumb_str != thumb_path {
                             db.update_thumbnail_path(media_id, &new_thumb_str)
@@ -841,9 +900,6 @@ pub fn run() {
     let telegram_service = Arc::new(TelegramService::new());
     let security_runtime = Arc::new(Mutex::new(RuntimeState::default()));
 
-    // Initialize Cache (Capacity 2000 items)
-    let thumbnail_cache = cache::ThumbnailCache::new(2000);
-
     // Initialize AI Face Detector - gracefully degrade if unavailable
     let face_detector: Option<Arc<Mutex<ai::FaceDetector>>> = match ai::FaceDetector::new() {
         Ok(fd) => {
@@ -856,24 +912,37 @@ pub fn run() {
         }
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_mcp_bridge::init())
+        .plugin(tauri_plugin_fs::init());
+
+    // The MCP bridge is a development tool and must never reach a distributed
+    // build. Its WebSocket server has no authentication and exposes `execute_js`,
+    // so anyone who can reach the port can run arbitrary script in the webview and
+    // from there call every command registered below, including
+    // `unlock_encryption`, `get_all_config` and `permanent_delete_media`.
+    //
+    // Two gates, because either one alone is easy to defeat by accident: the
+    // dependency is an opt-in feature (see `Cargo.toml`), and registration is
+    // additionally restricted to debug builds. `localhost_only()` replaces the
+    // plugin's `0.0.0.0` default so that even in development it is not reachable
+    // from the local network.
+    #[cfg(all(debug_assertions, feature = "mcp-bridge"))]
+    let builder = builder.plugin(tauri_plugin_mcp_bridge::init_with_config(
+        tauri_plugin_mcp_bridge::Config::localhost_only(),
+    ));
+
+    builder
         .manage(AppState {
             telegram: telegram_service,
             db: Mutex::new(None),
             watcher: Mutex::new(None),
-            cache: thumbnail_cache.clone(),
             security_runtime,
             face_detector: face_detector,
         })
         .setup(move |app| {
             let app_handle = app.handle().clone();
-
-            // Pass cache to logic
-            let setup_cache = thumbnail_cache.clone();
 
             tauri::async_runtime::spawn(async move {
                 // Initialize State with cache
@@ -992,7 +1061,6 @@ pub fn run() {
                         cache_dir,
                         db.clone(),
                         app_handle.clone(),
-                        setup_cache.clone(),
                         state.security_runtime.clone(),
                     ) {
                         Ok(w) => {
@@ -1040,7 +1108,6 @@ pub fn run() {
                         state.telegram.clone(),
                         app_dir.join("backup").to_string_lossy().to_string(),
                         app_handle.clone(),
-                        setup_cache.clone(),
                         state.security_runtime.clone(),
                     );
                     let sync_worker = Arc::new(sync_worker);
@@ -1177,6 +1244,8 @@ pub fn run() {
             // Backup
             get_backup_path,
             backup_database,
+            inspect_backup_archive,
+            restore_backup_archive,
             // Cloud-Only Mode
             remove_local_copy,
             download_local_copy,
@@ -1224,8 +1293,33 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
 
     let mut success_count = 0;
 
+    let managed = paths::managed_roots(&app_dir);
+    let mut rejected = 0usize;
+
     for file_path in files {
         let path = std::path::Path::new(&file_path);
+
+        // Imports are indexed by the watcher and uploaded to Telegram, so an
+        // unfiltered import is an exfiltration primitive: a compromised webview
+        // could import `id_rsa` and have it sent to the cloud. Only media the
+        // app can display is accepted.
+        if !path.is_file() || !paths::is_importable(path) {
+            rejected += 1;
+            log::warn!("Import refused for non-media path: {}", file_path);
+            continue;
+        }
+
+        // Copying a file that is already in the library onto itself is at best
+        // pointless and at worst destructive.
+        if paths::is_within_any(&managed, path) {
+            rejected += 1;
+            log::warn!(
+                "Import refused for a path already in the library: {}",
+                file_path
+            );
+            continue;
+        }
+
         if let Some(file_name) = path.file_name() {
             let dest_path = backup_dir.join(file_name);
 
@@ -1242,6 +1336,13 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
                 success_count += 1;
             }
         }
+    }
+
+    if rejected > 0 {
+        log::warn!(
+            "Import rejected {} path(s) that were not importable media",
+            rejected
+        );
     }
 
     Ok(success_count)
@@ -1382,30 +1483,38 @@ async fn export_media(
     let items = db.get_media_by_ids(&media_ids).map_err(|e| e.to_string())?;
     drop(db_guard);
 
-    let dest_path = Path::new(&destination);
-    if !dest_path.exists() {
-        std::fs::create_dir_all(dest_path).map_err(|e| e.to_string())?;
+    let dest_path = paths::normalize_lexically(Path::new(&destination));
+    if !dest_path.is_absolute() {
+        return Err("Export destination must be an absolute path".to_string());
     }
+    if !dest_path.exists() {
+        std::fs::create_dir_all(&dest_path).map_err(|e| e.to_string())?;
+    }
+    let dest_root = paths::resolve(&dest_path);
 
     let mut exported = 0;
     for item in &items {
         let source = Path::new(&item.file_path);
         let source_hint = Path::new(&item.file_path);
 
-        // Create Year/Month folder structure
-        let (year, month) = if let Some(date_taken) = &item.date_taken {
-            // Parse date_taken string (format: "2026-01-15 12:00:00")
-            let parts: Vec<&str> = date_taken.split('-').collect();
-            if parts.len() >= 2 {
-                (parts[0].to_string(), parts[1].to_string())
-            } else {
-                let now = OffsetDateTime::now_utc();
-                (now.year().to_string(), format!("{:02}", now.month() as u8))
-            }
-        } else {
-            let now = OffsetDateTime::now_utc();
-            (now.year().to_string(), format!("{:02}", now.month() as u8))
-        };
+        // Create Year/Month folder structure.
+        //
+        // `date_taken` comes from the photo's EXIF, so it is attacker-supplied
+        // text being used as two path components. Anything that is not a plain
+        // number falls back to today rather than steering the write.
+        let now = OffsetDateTime::now_utc();
+        let fallback = (now.year().to_string(), format!("{:02}", now.month() as u8));
+        let (year, month) = item
+            .date_taken
+            .as_deref()
+            .and_then(|date_taken| {
+                // Format: "2026-01-15 12:00:00"
+                let mut parts = date_taken.split('-');
+                let year = paths::sanitize_date_fragment(parts.next()?, 4)?;
+                let month = paths::sanitize_date_fragment(parts.next()?, 2)?;
+                Some((year, month))
+            })
+            .unwrap_or(fallback);
 
         let folder = dest_path.join(&year).join(&month);
         if !folder.exists() {
@@ -1440,6 +1549,10 @@ async fn export_media(
         } else {
             dest_file
         };
+
+        // Belt and braces: whatever the pieces above produced, the write must
+        // land under the directory the user chose.
+        let final_dest = paths::confine(&dest_root, &final_dest)?;
 
         if source.exists() {
             std::fs::copy(source, &final_dest).map_err(|e| e.to_string())?;
@@ -1680,12 +1793,17 @@ async fn get_all_config(
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.get_all_config().map_err(|e| e.to_string())
+    let mut config = db.get_all_config().map_err(|e| e.to_string())?;
+    // Mirrors the guard in `set_config`. This command returned the entire config
+    // table, so every `MediaGrid` mount handed the wrapped master key and the
+    // DPAPI credential blob to JavaScript purely to read `timeline_grouping`.
+    config.retain(|key, _| !is_security_key(key));
+    Ok(config)
 }
 
 #[tauri::command]
 async fn set_config(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
-    if key.starts_with("security_") {
+    if is_security_key(&key) {
         return Err("Security settings are managed by dedicated security commands".to_string());
     }
     let db_guard = state.db.lock().await;
@@ -1876,9 +1994,18 @@ async fn backup_database(
         return Err("Database file not found".to_string());
     }
 
-    // Determine backup destination
+    // Determine backup destination. A caller-supplied destination must be an
+    // existing directory the user already has: this command creates a file with
+    // a name it chooses itself, and has no business creating directory trees at
+    // arbitrary locations on the disk.
     let backup_path = if let Some(dest) = destination {
-        let dest_path = Path::new(&dest);
+        let dest_path = paths::normalize_lexically(Path::new(&dest));
+        if !dest_path.is_dir() {
+            return Err(format!(
+                "Backup destination is not an existing directory: {}",
+                dest_path.display()
+            ));
+        }
         let filename = format!(
             "library_backup_{}.db",
             time::OffsetDateTime::now_utc().unix_timestamp()
@@ -1903,22 +2030,38 @@ async fn backup_database(
 
     let mut final_backup_path = backup_path.clone();
 
-    // Encrypt database backup artifact when encryption mode is enabled.
-    let security_mode = {
+    // The authoritative encryption state is the bundle, not the `security_mode`
+    // row, and a read failure must not silently downgrade the backup to
+    // plaintext, so this fails closed rather than defaulting to "unset".
+    let bundle = {
         let db_guard = state.db.lock().await;
         let db = db_guard.as_ref().ok_or("Database not initialized")?;
-        db.get_config(SECURITY_MODE_KEY)
-            .map_err(|e| e.to_string())?
-            .unwrap_or_else(|| "unset".to_string())
+        load_security_bundle(db)?
     };
-    if security_mode == "encrypted" {
-        let key = get_active_master_key(&state)
-            .await
-            .ok_or_else(|| "Encryption vault is locked. Unlock to create encrypted backup.".to_string())?;
-        let encrypted_path = backup_path.with_extension("db.wbenc");
-        security::encrypt_file(&backup_path, &encrypted_path, &key).map_err(|e| e.to_string())?;
+    let encrypted_mode = bundle
+        .as_ref()
+        .map(|b| b.mode == EncryptionMode::Encrypted)
+        .unwrap_or(false);
+
+    if encrypted_mode {
+        let bundle = bundle.ok_or("Security bundle missing")?;
+        let key = get_active_master_key(&state).await.ok_or_else(|| {
+            "Encryption vault is locked. Unlock to create encrypted backup.".to_string()
+        })?;
+        // The archive carries the wrapped master key in its plaintext header, so
+        // the passphrase and the recovery key can open it on a machine that has
+        // lost `library.db`. See `backup.rs`.
+        let archive_path = backup_path.with_extension("wbak");
+        backup::write_encrypted_backup(
+            &backup_path,
+            &archive_path,
+            &bundle,
+            &key,
+            app.package_info().version.to_string().as_str(),
+        )
+        .map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(&backup_path);
-        final_backup_path = encrypted_path;
+        final_backup_path = archive_path;
     }
 
     let backup_path_str = final_backup_path.to_string_lossy().to_string();
@@ -1939,8 +2082,75 @@ async fn backup_database(
     Ok(backup_path_str)
 }
 
+/// Metadata about a backup archive, readable without any secret.
+#[derive(serde::Serialize)]
+struct BackupArchiveInfo {
+    format_version: u8,
+    created_at: i64,
+    app_version: String,
+    source_file: String,
+    encrypted: bool,
+    has_passphrase_wrap: bool,
+    has_recovery_wrap: bool,
+}
+
 #[tauri::command]
-async fn remove_local_copy(media_id: i64, state: State<'_, AppState>) -> Result<(), String> {
+async fn inspect_backup_archive(archive_path: String) -> Result<BackupArchiveInfo, String> {
+    let path = std::path::PathBuf::from(&archive_path);
+    let header = backup::read_header(&path).map_err(|e| e.to_string())?;
+    Ok(BackupArchiveInfo {
+        format_version: header.format_version,
+        created_at: header.created_at,
+        app_version: header.app_version,
+        source_file: header.source_file,
+        encrypted: header.bundle.mode == EncryptionMode::Encrypted,
+        has_passphrase_wrap: header.bundle.passphrase_wrap.is_some(),
+        has_recovery_wrap: header.bundle.recovery.is_some(),
+    })
+}
+
+/// Decrypt a backup archive to a plaintext `library.db` next to it.
+///
+/// This deliberately does not overwrite the live database: the app holds it
+/// open, and a disaster restore is done with the app closed. It returns the path
+/// of the restored file for the caller to put in place.
+#[tauri::command]
+async fn restore_backup_archive(
+    archive_path: String,
+    passphrase: Option<String>,
+    recovery_key: Option<String>,
+) -> Result<String, String> {
+    let archive = std::path::PathBuf::from(&archive_path);
+    let passphrase = passphrase.filter(|p| !p.is_empty());
+    let recovery_key = recovery_key.filter(|k| !k.is_empty());
+    if passphrase.is_none() && recovery_key.is_none() {
+        return Err("A passphrase or a recovery key is required".to_string());
+    }
+
+    let out_path = archive.with_extension("restored.db");
+    // Argon2id at 64 MiB plus a full-file decrypt is far too much work for the
+    // async runtime; every other heavy path in this file that gets this right
+    // uses spawn_blocking too.
+    tauri::async_runtime::spawn_blocking(move || {
+        let secret = match (passphrase.as_deref(), recovery_key.as_deref()) {
+            (Some(p), _) => backup::BackupSecret::Passphrase(p),
+            (None, Some(k)) => backup::BackupSecret::RecoveryKey(k),
+            (None, None) => return Err("A passphrase or a recovery key is required".to_string()),
+        };
+        backup::restore_encrypted_backup(&archive, &out_path, secret)
+            .map(|_| out_path.to_string_lossy().to_string())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn remove_local_copy(
+    media_id: i64,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     // Get the media item to find the file path
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
@@ -1960,8 +2170,17 @@ async fn remove_local_copy(media_id: i64, state: State<'_, AppState>) -> Result<
         return Err("Media is already cloud-only".to_string());
     }
 
-    // Delete the local file (but keep the thumbnail)
+    // Delete the local file (but keep the thumbnail). `file_path` is a plain
+    // text column, so it is confined to the managed library before any unlink.
+    let app_data = resolve_app_data_dir(&app)?;
+    let roots = paths::managed_roots(&app_data);
     let file_path = std::path::Path::new(&media.file_path);
+    if !paths::is_within_any(&roots, file_path) {
+        return Err(format!(
+            "Refusing to delete a file outside the managed library: {}",
+            media.file_path
+        ));
+    }
     if file_path.exists() {
         std::fs::remove_file(file_path).map_err(|e| format!("Failed to delete file: {}", e))?;
     }
@@ -2110,10 +2329,7 @@ async fn download_for_view(
     let encrypted_mode = {
         let db_guard = state.db.lock().await;
         let db = db_guard.as_ref().ok_or("Database not initialized")?;
-        db.get_config(SECURITY_MODE_KEY)
-            .map_err(|e| e.to_string())?
-            .map(|v| v.eq_ignore_ascii_case("encrypted"))
-            .unwrap_or(false)
+        encryption_required(db)?
     };
 
     // Determine filename
@@ -2542,4 +2758,42 @@ async fn index_pending_clip(
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_keys_are_recognised() {
+        // Every key the security commands write must be caught by the prefix,
+        // on both the read and the write path.
+        for key in [
+            SECURITY_BUNDLE_KEY,
+            SECURITY_MODE_KEY,
+            SECURITY_ONBOARDING_COMPLETE_KEY,
+            TELEGRAM_CREDS_KEY,
+            SECURITY_MIGRATION_STATUS_KEY,
+        ] {
+            assert!(is_security_key(key), "{key} must be treated as security state");
+        }
+        assert!(is_security_key(&format!("{SECURITY_MIGRATION_PENDING_PREFIX}42")));
+    }
+
+    #[test]
+    fn ordinary_config_keys_are_not_filtered() {
+        // The six keys the frontend actually reads, plus the one the backend
+        // writes for itself, must survive the filter.
+        for key in [
+            "cache_size_mb",
+            "view_cache_max_size_mb",
+            "view_cache_retention_hours",
+            "ai_face_enabled",
+            "ai_tags_enabled",
+            "timeline_grouping",
+            "device_id",
+        ] {
+            assert!(!is_security_key(key), "{key} must remain readable");
+        }
+    }
 }

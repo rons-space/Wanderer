@@ -47,7 +47,7 @@ const DEFAULT_CONFIG: AppConfig = {
 };
 
 const ABOUT_LINKS = {
-    github: "https://github.com/ronimuliawan/wanderbackup-rust",
+    github: "https://github.com/rons-space/Wanderer",
     telegramChannel: "", // Set your public channel URL (e.g. https://t.me/your_channel)
     supportGroup: "", // Set your support group URL (e.g. https://t.me/your_group)
     donate: "", // Set your donation URL (e.g. https://buymeacoffee.com/yourname)
@@ -953,6 +953,26 @@ export function Settings() {
                                 <p className="text-xs text-muted-foreground">
                                     Backups include all metadata (albums, favorites, face data) but not the actual photos.
                                 </p>
+
+                                {securityStatus?.securityMode === "encrypted" && (
+                                    <Alert>
+                                        <AlertTitle>Keep your recovery key and your library.db</AlertTitle>
+                                        <AlertDescription className="space-y-2">
+                                            <p>
+                                                In encrypted mode the backup is written as a <code>.wbak</code> archive,
+                                                which carries the recovery-key-wrapped master key alongside the encrypted
+                                                database. You can open it on a new machine with your recovery key or your
+                                                passphrase, so store one of them somewhere you will still have it if this
+                                                computer is lost.
+                                            </p>
+                                            <p>
+                                                Older <code>.db.wbenc</code> backups cannot be restored. They were encrypted
+                                                with a key whose only copy stayed in <code>library.db</code>. If you have one,
+                                                keep your current <code>library.db</code> safe and take a fresh backup now.
+                                            </p>
+                                        </AlertDescription>
+                                    </Alert>
+                                )}
                             </CardContent>
                         </Card>
                     </TabsContent>

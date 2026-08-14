@@ -140,11 +140,12 @@ impl SecurityBundle {
         unwrap_master_key_with_secret(passphrase.as_bytes(), wrapped)
     }
 
-    pub fn recover_and_rewrap(
-        &self,
-        recovery_key: &str,
-        new_passphrase: &str,
-    ) -> Result<(Self, [u8; 32])> {
+    /// Unwrap the master key with the recovery key, without rewrapping anything.
+    ///
+    /// Restoring a backup needs the key but has nowhere to persist a new wrap
+    /// (the config table it would be written to is inside the artifact being
+    /// restored), so this is deliberately separate from `recover_and_rewrap`.
+    pub fn unlock_with_recovery_key(&self, recovery_key: &str) -> Result<[u8; 32]> {
         if self.mode != EncryptionMode::Encrypted {
             return Err(anyhow!("Encryption mode is not enabled"));
         }
@@ -157,7 +158,15 @@ impl SecurityBundle {
             return Err(anyhow!("Invalid recovery key"));
         }
 
-        let master_key = unwrap_master_key_with_secret(recovery_key.as_bytes(), &recovery.wrap)?;
+        unwrap_master_key_with_secret(recovery_key.as_bytes(), &recovery.wrap)
+    }
+
+    pub fn recover_and_rewrap(
+        &self,
+        recovery_key: &str,
+        new_passphrase: &str,
+    ) -> Result<(Self, [u8; 32])> {
+        let master_key = self.unlock_with_recovery_key(recovery_key)?;
         let passphrase_wrap = wrap_master_key_with_secret(new_passphrase.as_bytes(), &master_key)?;
 
         let mut next = self.clone();
@@ -322,6 +331,19 @@ pub fn encrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Re
     })?;
     let mut writer = BufWriter::new(output);
 
+    encrypt_stream(&mut reader, &mut writer, key)
+}
+
+/// Write a `WBENC1` stream for everything `reader` yields.
+///
+/// Split out of `encrypt_file` so a backup envelope can prepend its plaintext
+/// header and then hand the same writer to the encryptor, keeping the artifact a
+/// single self-contained file.
+pub fn encrypt_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key: &[u8; 32],
+) -> Result<()> {
     let mut base_nonce = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut base_nonce);
 
@@ -371,6 +393,25 @@ pub fn decrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Re
     })?;
     let mut reader = BufReader::new(input);
 
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let output = File::create(output_path)
+        .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
+    let mut writer = BufWriter::new(output);
+
+    decrypt_stream(&mut reader, &mut writer, key)
+}
+
+/// Read a `WBENC1` stream from `reader`, writing the plaintext to `writer`.
+///
+/// The counterpart to `encrypt_stream`: a backup envelope consumes its header
+/// first and then passes the still-positioned reader here.
+pub fn decrypt_stream<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    key: &[u8; 32],
+) -> Result<()> {
     let mut magic = [0u8; 6];
     reader.read_exact(&mut magic)?;
     if &magic != FILE_MAGIC {
@@ -396,13 +437,6 @@ pub fn decrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Re
     let mut base_nonce = [0u8; 12];
     reader.read_exact(&mut base_nonce)?;
 
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let output = File::create(output_path)
-        .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
-    let mut writer = BufWriter::new(output);
-
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut chunk_idx: u32 = 0;
     let mut len_buf = [0u8; 4];
@@ -414,9 +448,19 @@ pub fn decrypt_file(input_path: &Path, output_path: &Path, key: &[u8; 32]) -> Re
             Err(e) => return Err(e.into()),
         }
 
+        // A chunk is at most `chunk_size` of plaintext plus the 16 byte GCM tag,
+        // and the header's `chunk_size` was bounded above. Without the upper
+        // bound this length is attacker-controlled and unauthenticated: a
+        // declared 0xFFFFFFFF allocates ~4 GiB per chunk before a single tag is
+        // verified, so a corrupt or hostile file is an out-of-memory abort.
         let ct_len = u32::from_le_bytes(len_buf) as usize;
-        if ct_len < 16 {
-            return Err(anyhow!("Invalid encrypted chunk length"));
+        let max_ct_len = chunk_size as usize + 16;
+        if !(16..=max_ct_len).contains(&ct_len) {
+            return Err(anyhow!(
+                "Invalid encrypted chunk length: {} (expected 16..={})",
+                ct_len,
+                max_ct_len
+            ));
         }
 
         let mut ciphertext = vec![0u8; ct_len];
@@ -591,5 +635,85 @@ mod tests {
             .expect("unlock");
         assert_eq!(key.len(), 32);
         assert!(bundle.unlock_with_passphrase("bad passphrase").is_err());
+    }
+
+    #[test]
+    fn recovery_key_unlocks_without_rewrapping() {
+        let (bundle, recovery_key, key) =
+            SecurityBundle::new_encrypted("correct horse battery staple").expect("bundle");
+        assert_eq!(
+            bundle.unlock_with_recovery_key(&recovery_key).expect("unlock"),
+            key
+        );
+        assert!(bundle.unlock_with_recovery_key("WRONG-KEY").is_err());
+    }
+
+    /// Build a `WBENC1` header followed by a single chunk length, with no chunk
+    /// body: enough to exercise the length validation without a real key.
+    fn header_with_chunk_len(chunk_size: u32, ct_len: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(FILE_MAGIC);
+        buf.push(FILE_VERSION);
+        buf.extend_from_slice(&chunk_size.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 12]);
+        buf.extend_from_slice(&ct_len.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn oversized_chunk_length_is_rejected_before_allocating() {
+        let key = [7u8; 32];
+
+        // ~4 GiB declared. This must fail on the bound, not on the allocation.
+        let hostile = header_with_chunk_len(DEFAULT_CHUNK_SIZE, u32::MAX);
+        let err = decrypt_stream(&mut hostile.as_slice(), &mut Vec::new(), &key)
+            .expect_err("oversized chunk must be rejected");
+        assert!(err.to_string().contains("Invalid encrypted chunk length"));
+
+        // One byte past the legitimate maximum is still rejected.
+        let over = header_with_chunk_len(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE + 17);
+        assert!(decrypt_stream(&mut over.as_slice(), &mut Vec::new(), &key).is_err());
+
+        // Under the tag length was already rejected and still is.
+        let under = header_with_chunk_len(DEFAULT_CHUNK_SIZE, 15);
+        assert!(decrypt_stream(&mut under.as_slice(), &mut Vec::new(), &key).is_err());
+
+        // A length at the maximum passes validation and fails later, on the
+        // truncated body, which proves the bound itself is not too tight.
+        let at_max = header_with_chunk_len(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE + 16);
+        let err = decrypt_stream(&mut at_max.as_slice(), &mut Vec::new(), &key)
+            .expect_err("truncated body must fail");
+        assert!(!err.to_string().contains("Invalid encrypted chunk length"));
+    }
+
+    /// Guards the split of `encrypt_file` and `decrypt_file` into stream
+    /// functions: the file-level wrappers must still round-trip byte-for-byte,
+    /// across more than one chunk.
+    #[test]
+    fn encrypt_file_decrypt_file_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("wanderer-sec-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let plain = dir.join("plain.bin");
+        let sealed = dir.join("sealed.wbenc");
+        let out = dir.join("out.bin");
+
+        let contents: Vec<u8> = (0..(DEFAULT_CHUNK_SIZE as usize + 4096))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&plain, &contents).expect("write");
+
+        let mut key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+
+        encrypt_file(&plain, &sealed, &key).expect("encrypt");
+        assert!(is_encrypted_file(&sealed).expect("magic"));
+        decrypt_file(&sealed, &out, &key).expect("decrypt");
+        assert_eq!(std::fs::read(&out).expect("read"), contents);
+
+        let mut wrong_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut wrong_key);
+        assert!(decrypt_file(&sealed, &dir.join("bad.bin"), &wrong_key).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

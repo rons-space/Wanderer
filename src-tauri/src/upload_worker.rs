@@ -112,12 +112,21 @@ pub async fn run_upload_worker(
                 let progress_handle = app_handle.clone();
                 let progress_id = item.id;
                 let progress_path = item.file_path.clone();
-                let security_mode = db
-                    .get_config("security_mode")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "unset".to_string());
-                let should_encrypt = security_mode == "encrypted";
+                // Fail closed: if the security bundle cannot be read we do not
+                // know whether this file must be encrypted, and uploading the
+                // plaintext original to Telegram is not an acceptable default.
+                let should_encrypt = match crate::encryption_required(&db) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(
+                            "Cannot determine encryption state, deferring upload of {}: {}",
+                            item.file_path, e
+                        );
+                        let _ = db.update_queue_status(item.id, "pending", None);
+                        sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
                 let mut upload_path = item.file_path.clone();
                 let mut encrypted_temp: Option<PathBuf> = None;
 
@@ -159,6 +168,24 @@ pub async fn run_upload_worker(
                             let _ = db.update_queue_status(item.id, "failed", Some(&err_msg));
                             continue;
                         }
+                    }
+
+                    // Last line of defence before bytes leave the machine: the
+                    // artifact must actually be a WBENC1 file. Without this,
+                    // any future bug in the branch above sends plaintext and
+                    // nothing notices.
+                    let is_sealed = security::is_encrypted_file(std::path::Path::new(&upload_path))
+                        .unwrap_or(false);
+                    if !is_sealed {
+                        let err_msg =
+                            "Refusing to upload: encrypted artifact failed its magic check"
+                                .to_string();
+                        error!("{} ({})", err_msg, upload_path);
+                        if let Some(tmp) = encrypted_temp.take() {
+                            let _ = std::fs::remove_file(tmp);
+                        }
+                        let _ = db.update_queue_status(item.id, "failed", Some(&err_msg));
+                        continue;
                     }
                 }
 
