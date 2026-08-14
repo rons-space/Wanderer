@@ -14,13 +14,7 @@
       "identifier": "fs:allow-exists",
       "allow": [
         {
-          "path": "$APPDATA/**"
-        },
-        {
-          "path": "$LOCALAPPDATA/**"
-        },
-        {
-          "path": "C:\\**"
+          "path": "$APPLOCALDATA/**"
         }
       ]
     },
@@ -28,13 +22,7 @@
       "identifier": "fs:allow-read",
       "allow": [
         {
-          "path": "$APPDATA/**"
-        },
-        {
-          "path": "$LOCALAPPDATA/**"
-        },
-        {
-          "path": "C:\\**"
+          "path": "$APPLOCALDATA/**"
         }
       ]
     },
