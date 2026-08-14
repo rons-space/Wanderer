@@ -166,12 +166,22 @@ impl SyncWorker {
                         // blobs uploaded before encryption was turned on, until the
                         // migration reaches them, and sync has no per-media row here to
                         // tell the two apart.
-                        match security::decrypt_file_if_needed(
-                            &temp_path_buf,
-                            &decrypt_tmp,
-                            master_key.as_ref(),
-                            security::Expect::Unknown,
-                        ) {
+                        // Whole-file crypto on a media blob, so off the runtime.
+                        let decrypt_src = temp_path_buf.clone();
+                        let decrypt_dst = decrypt_tmp.clone();
+                        let decrypt_key = master_key.clone();
+                        let decrypted = tokio::task::spawn_blocking(move || {
+                            security::decrypt_file_if_needed(
+                                &decrypt_src,
+                                &decrypt_dst,
+                                decrypt_key.as_ref(),
+                                security::Expect::Unknown,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("Decrypt task failed: {}", e)));
+
+                        match decrypted {
                             Ok(_) => {
                                 let _ = fs::remove_file(&temp_path_buf);
                                 decrypt_tmp
@@ -203,7 +213,17 @@ impl SyncWorker {
                     }
                 } else {
                     // File exists locally. Ensure DB has the Telegram ID.
-                    match media_utils::hash_file_streaming(&final_path_buf) {
+                    // Blake3 over the whole file, which for a video is gigabytes.
+                    let hash_path = final_path_buf.clone();
+                    let hashed = tokio::task::spawn_blocking(move || {
+                        media_utils::hash_file_streaming(&hash_path)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(std::io::Error::other(format!("Hash task failed: {}", e)))
+                    });
+
+                    match hashed {
                         Ok(hash) => {
                             match self.db.media_exists_by_hash(&hash) {
                                 Ok(true) => {
@@ -260,8 +280,11 @@ impl SyncWorker {
         let app_handle_clone = self.app_handle.clone();
         let final_path_str = final_path.to_string_lossy().to_string();
 
-        // 1. Hash (the temp file) using streaming hasher
-        let hash = media_utils::hash_file_streaming(temp_path)?;
+        // 1. Hash (the temp file) using streaming hasher, off the runtime.
+        let hash = {
+            let path = temp_path.to_path_buf();
+            tokio::task::spawn_blocking(move || media_utils::hash_file_streaming(&path)).await??
+        };
 
         // 2. Check if hash exists in DB (Dedupe)
         // If it exists, we might still want to keep the file or delete it?
@@ -309,7 +332,15 @@ impl SyncWorker {
                 let maybe_key = self.security_runtime.lock().await.master_key.clone();
                 if let Some(key) = maybe_key {
                     let encrypted_thumb = thumb.with_extension("wbenc");
-                    match security::encrypt_file(&thumb, &encrypted_thumb, &key) {
+                    let encrypt_src = thumb.clone();
+                    let encrypt_dst = encrypted_thumb.clone();
+                    let encrypted = tokio::task::spawn_blocking(move || {
+                        security::encrypt_file(&encrypt_src, &encrypt_dst, &key)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("Encrypt task failed: {}", e)));
+
+                    match encrypted {
                         Ok(_) => {
                             let _ = fs::remove_file(&thumb);
                             thumbnail_path = Some(encrypted_thumb.to_string_lossy().to_string());

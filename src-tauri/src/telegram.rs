@@ -101,6 +101,21 @@ impl TelegramService {
         self.client.lock().await.is_some()
     }
 
+    /// A handle to the connected client, cloned out of the mutex.
+    ///
+    /// `Client` is an `Arc` inside, so this costs a refcount. Working through the
+    /// guard instead meant every method held the mutex for its whole body, and an
+    /// upload of a 4GB video serialised every other Telegram operation behind it:
+    /// no progress query, no download, and a logout that could not proceed until the
+    /// transfer finished.
+    async fn client(&self) -> Result<Client, String> {
+        self.client
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "Client not connected".to_string())
+    }
+
     /// Connect, unsealing the stored session first.
     ///
     /// `master_key` is what the vault currently holds. On Windows it is unused, since
@@ -184,8 +199,7 @@ impl TelegramService {
             self.connect(app_data_dir, master_key).await?;
         }
 
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
         let api_hash = self
             .credentials
             .lock()
@@ -201,10 +215,7 @@ impl TelegramService {
     }
 
     pub async fn sign_in(&self, code: &str) -> Result<String, String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or("Client not connected".to_string())?;
+        let client = self.client().await?;
 
         let mut token_guard = self.pending_token.lock().await;
         let token = token_guard
@@ -230,10 +241,7 @@ impl TelegramService {
     }
 
     pub async fn get_me(&self) -> Result<String, String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or("Client not connected".to_string())?;
+        let client = self.client().await?;
 
         match client.get_me().await {
             Ok(me) => Ok(me.full_name()),
@@ -243,17 +251,13 @@ impl TelegramService {
 
     #[allow(dead_code)]
     pub async fn is_authorized(&self) -> bool {
-        let client_guard = self.client.lock().await;
-        if let Some(client) = client_guard.as_ref() {
-            client.is_authorized().await.unwrap_or(false)
-        } else {
-            false
+        match self.client().await {
+            Ok(client) => client.is_authorized().await.unwrap_or(false),
+            Err(_) => false,
         }
     }
     pub async fn upload_file(&self, path: &str) -> Result<(), String> {
-        let client_guard = self.client.lock().await;
-        // Check connection
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // Upload logic
         // We reuse the client instance
@@ -291,10 +295,7 @@ impl TelegramService {
         use tokio::fs::File;
         use tokio::io::BufReader;
 
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or_else(|| UploadError::Other("Client not connected".to_string()))?;
+        let client = self.client().await.map_err(UploadError::Other)?;
 
         // Get file metadata
         let file = File::open(path)
@@ -361,8 +362,7 @@ impl TelegramService {
         _offset_id: i32,
         limit: usize,
     ) -> Result<Vec<grammers_client::message::Message>, String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         let me = client.get_me().await.map_err(|e| e.to_string())?;
         let peer = me.to_ref().ok_or("Could not get peer error")?;
@@ -383,8 +383,7 @@ impl TelegramService {
         message: &grammers_client::message::Message,
         path: &str,
     ) -> Result<(), String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // Check if message has media
         if let Some(media) = message.media() {
@@ -409,8 +408,7 @@ impl TelegramService {
 
         log::info!("Telegram: deleting {} messages", message_ids.len());
 
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // For Saved Messages (self-chat), we use messages::DeleteMessages with revoke=true
         // This works for private chats including Saved Messages
@@ -542,8 +540,7 @@ impl TelegramService {
     /// Download a file by message ID
     /// Fetches the message from saved messages and downloads its media to the specified path
     pub async fn download_by_message_id(&self, message_id: i32, path: &str) -> Result<(), String> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let client = self.client().await?;
 
         // Get the "me" user for Saved Messages
         let me = client.get_me().await.map_err(|e| e.to_string())?;
@@ -574,19 +571,19 @@ impl TelegramService {
     }
 
     pub async fn logout(&self, app_data_dir: PathBuf) -> Result<(), String> {
-        // 1. Graceful Sign Out
-        {
-            let mut client_guard = self.client.lock().await;
-            if let Some(client) = client_guard.as_ref() {
-                info!("Attempting graceful sign out...");
-                match client.sign_out().await {
-                    Ok(_) => info!("Signed out from Telegram successfully"),
-                    Err(e) => log::error!("Failed to sign out gracefully: {}", e),
-                }
+        // 1. Take the client out of the slot before signing out, rather than holding
+        // the lock across the network call. Emptying the slot is what stops new work
+        // from starting; holding the mutex only stopped anything else from finding out
+        // that logout was in progress.
+        let client = self.client.lock().await.take();
+
+        // 2. Graceful Sign Out
+        if let Some(client) = client {
+            info!("Attempting graceful sign out...");
+            match client.sign_out().await {
+                Ok(_) => info!("Signed out from Telegram successfully"),
+                Err(e) => log::error!("Failed to sign out gracefully: {}", e),
             }
-            // 2. Disconnect (Drop Client) - inside the same lock or re-acquire?
-            // Better to keep it locked or just set to None immediately.
-            *client_guard = None;
         }
         info!("Client disconnected");
 

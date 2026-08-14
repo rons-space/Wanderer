@@ -31,6 +31,17 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+/// Shared state behind every command.
+///
+/// Two rules keep the mutexes here from deadlocking or serialising the application:
+///
+/// 1. `db` is a slot, not a lock over database work. `Database` is `Sync` and does its
+///    own locking, so the guard exists only long enough to clone the `Arc` out of it.
+///    Holding it across an `.await` blocks all 74 commands behind whatever that await
+///    is waiting for, which in the worst case was a Telegram transfer.
+/// 2. Where two of these are needed at once, take `db` first and `security_runtime`
+///    second. Both orders were in use, which is a deadlock waiting for the two paths
+///    to run concurrently.
 struct AppState {
     telegram: Arc<TelegramService>,
     db: Mutex<Option<Arc<Database>>>,
@@ -200,9 +211,14 @@ fn ensure_thumbnail_encrypted(
     Ok(Some(encrypted_path))
 }
 
-async fn materialize_thumbnail_path_for_response(
+/// Decrypt one thumbnail into the cache, returning the path the UI should load.
+///
+/// Synchronous and free of any lock: every caller runs it inside `spawn_blocking`,
+/// because decrypting a thumbnail reads and writes a file and is repeated for every
+/// item in a response.
+fn materialize_thumbnail_path(
     thumbnail_path: Option<String>,
-    state: &State<'_, AppState>,
+    key: Option<&security::MasterKey>,
 ) -> Option<String> {
     let thumbnail_path = thumbnail_path?;
     let src = std::path::PathBuf::from(&thumbnail_path);
@@ -215,7 +231,7 @@ async fn materialize_thumbnail_path_for_response(
         return Some(thumbnail_path);
     }
 
-    let key = state.security_runtime.lock().await.master_key.clone()?;
+    let key = key?;
     let cache_dir = paths::thumb_cache_dir();
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return None;
@@ -237,20 +253,47 @@ async fn materialize_thumbnail_path_for_response(
         true
     };
 
-    if needs_refresh && security::decrypt_file(&src, &output, &key).is_err() {
+    if needs_refresh && security::decrypt_file(&src, &output, key).is_err() {
         return None;
     }
 
     Some(output.to_string_lossy().to_string())
 }
 
+/// Prepare a response's thumbnails, off the async runtime.
+///
+/// Every media-returning command ends here, and for an encrypted library this decrypts
+/// one file per item. Doing that inline stalled the runtime for the length of a whole
+/// page of thumbnails, which is why a scroll could freeze unrelated commands. The page
+/// is handed to a single blocking task rather than one task per item, since the work is
+/// short and the spawns would cost more than the decryptions.
 async fn materialize_media_items_for_response(
     mut items: Vec<database::MediaItem>,
     state: &State<'_, AppState>,
 ) -> Vec<database::MediaItem> {
-    for item in &mut items {
-        item.thumbnail_path =
-            materialize_thumbnail_path_for_response(item.thumbnail_path.clone(), state).await;
+    let key = get_active_master_key(state).await;
+    let thumbnails: Vec<Option<String>> = items
+        .iter()
+        .map(|item| item.thumbnail_path.clone())
+        .collect();
+
+    let materialized = tokio::task::spawn_blocking(move || {
+        thumbnails
+            .into_iter()
+            .map(|path| materialize_thumbnail_path(path, key.as_ref()))
+            .collect::<Vec<_>>()
+    })
+    .await;
+
+    match materialized {
+        Ok(paths) => {
+            for (item, path) in items.iter_mut().zip(paths) {
+                item.thumbnail_path = path;
+            }
+        }
+        // A panic in the blocking task must not take the response with it: the items
+        // are still correct, they just point at paths the UI may not be able to read.
+        Err(e) => log::error!("Thumbnail materialization task failed: {}", e),
     }
     items
 }
@@ -287,24 +330,37 @@ async fn download_and_materialize_media(
 
     let maybe_key = get_active_master_key(state).await;
     // `Unknown`: this downloads by message id, with no media row in hand, and an
-    // encrypted library can still contain pre-migration plaintext blobs.
-    let result = security::decrypt_file_if_needed(
-        &temp_path,
-        final_path,
-        maybe_key.as_ref(),
-        security::Expect::Unknown,
-    )
+    // encrypted library can still contain pre-migration plaintext blobs. Decrypting a
+    // media file is whole-file crypto, so it runs on a blocking thread.
+    let decrypt_src = temp_path.clone();
+    let decrypt_dst = final_path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        security::decrypt_file_if_needed(
+            &decrypt_src,
+            &decrypt_dst,
+            maybe_key.as_ref(),
+            security::Expect::Unknown,
+        )
+    })
+    .await
+    .map_err(|e| format!("Decrypt task failed: {}", e))?
     .map_err(|e| e.to_string());
 
-    let _ = std::fs::remove_file(&temp_path);
+    let _ = tokio::fs::remove_file(&temp_path).await;
     result.map(|_| ())
 }
 
 async fn get_security_status_inner(
     state: &State<'_, AppState>,
 ) -> Result<SecurityStatusResponse, String> {
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    // Cloned out of the slot: this function locks `security_runtime` twice below, and
+    // holding the database guard across those awaits is the ordering hazard described
+    // on `AppState`.
+    let db = {
+        let db_guard = state.db.lock().await;
+        db_guard.as_ref().ok_or("Database not initialized")?.clone()
+    };
+    let db = db.as_ref();
 
     let onboarding_complete = db
         .get_config(SECURITY_ONBOARDING_COMPLETE_KEY)
@@ -365,17 +421,19 @@ async fn get_security_status(state: State<'_, AppState>) -> Result<SecurityStatu
 
 #[tauri::command]
 async fn initialize_unencrypted_mode(state: State<'_, AppState>) -> Result<(), String> {
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    if let Some(bundle) = load_security_bundle(db)? {
-        if bundle.mode == EncryptionMode::Encrypted {
-            return Err(
-                "Encryption is already enabled and cannot be downgraded in-place".to_string(),
-            );
+    {
+        let db_guard = state.db.lock().await;
+        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        if let Some(bundle) = load_security_bundle(db)? {
+            if bundle.mode == EncryptionMode::Encrypted {
+                return Err(
+                    "Encryption is already enabled and cannot be downgraded in-place".to_string(),
+                );
+            }
         }
+        let bundle = SecurityBundle::unencrypted();
+        save_security_bundle(db, &bundle)?;
     }
-    let bundle = SecurityBundle::unencrypted();
-    save_security_bundle(db, &bundle)?;
     state.security_runtime.lock().await.master_key = None;
     Ok(())
 }
@@ -403,9 +461,11 @@ async fn initialize_encryption(
     let (bundle, recovery_key, master_key) =
         SecurityBundle::new_encrypted(&passphrase).map_err(|e| e.to_string())?;
 
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    save_security_bundle(db, &bundle)?;
+    {
+        let db_guard = state.db.lock().await;
+        let db = db_guard.as_ref().ok_or("Database not initialized")?;
+        save_security_bundle(db, &bundle)?;
+    }
 
     state.security_runtime.lock().await.master_key = Some(master_key);
 
@@ -763,7 +823,18 @@ async fn start_encryption_migration(
                     let temp_dir = paths::migration_staging_dir();
                     std::fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
                     let temp_path = temp_dir.join(format!("media_{}_enc.wbenc", media_id));
-                    security::encrypt_file(source, &temp_path, &key).map_err(|e| e.to_string())?;
+                    // Encrypting the original is whole-file crypto on a media file, and
+                    // this worker shares the runtime with every command the user is
+                    // still issuing while the migration runs.
+                    let encrypt_src = source.to_path_buf();
+                    let encrypt_dst = temp_path.clone();
+                    let encrypt_key = key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        security::encrypt_file(&encrypt_src, &encrypt_dst, &encrypt_key)
+                    })
+                    .await
+                    .map_err(|e| format!("Encrypt task failed: {}", e))?
+                    .map_err(|e| e.to_string())?;
 
                     let temp_path_str = temp_path.to_string_lossy().to_string();
                     let upload_res = telegram
@@ -1493,8 +1564,9 @@ async fn import_files(files: Vec<String>, app: tauri::AppHandle) -> Result<usize
                 continue;
             }
 
-            // Copy the file
-            if let Err(e) = std::fs::copy(path, &dest_path) {
+            // Copy the file. `tokio::fs::copy` runs it on a blocking thread, which
+            // matters here: these are media files and the loop can be hundreds long.
+            if let Err(e) = tokio::fs::copy(path, &dest_path).await {
                 log::error!("Failed to copy file {:?} to {:?}: {}", path, dest_path, e);
             } else {
                 success_count += 1;
@@ -1717,7 +1789,9 @@ async fn export_media(
         let final_dest = paths::confine(&dest_root, &final_dest)?;
 
         if source.exists() {
-            std::fs::copy(source, &final_dest).map_err(|e| e.to_string())?;
+            tokio::fs::copy(source, &final_dest)
+                .await
+                .map_err(|e| e.to_string())?;
             exported += 1;
             continue;
         }
@@ -2421,11 +2495,15 @@ async fn download_local_copy(
     if download_path.exists() {
         let _ = std::fs::remove_file(&download_path);
     }
-    match std::fs::rename(&staged_path, &download_path) {
+    match tokio::fs::rename(&staged_path, &download_path).await {
         Ok(_) => {}
+        // Across filesystems rename fails and the media has to be copied, which for a
+        // restored video is gigabytes of work.
         Err(_) => {
-            std::fs::copy(&staged_path, &download_path).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(&staged_path);
+            tokio::fs::copy(&staged_path, &download_path)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = tokio::fs::remove_file(&staged_path).await;
         }
     }
 
@@ -2527,20 +2605,31 @@ async fn download_for_view(
             let downloaded_is_encrypted =
                 security::is_encrypted_file(&raw_download_path).map_err(|e| e.to_string())?;
 
-            let write_result = if downloaded_is_encrypted {
-                match std::fs::rename(&raw_download_path, &cache_blob_path) {
+            let write_result: Result<(), String> = if downloaded_is_encrypted {
+                match tokio::fs::rename(&raw_download_path, &cache_blob_path).await {
                     Ok(_) => Ok(()),
+                    // Rename fails across devices, so the staging directory and the
+                    // cache may not share a filesystem. Copying a media file is worth
+                    // getting off the runtime.
                     Err(_) => {
-                        std::fs::copy(&raw_download_path, &cache_blob_path)
+                        tokio::fs::copy(&raw_download_path, &cache_blob_path)
+                            .await
                             .map_err(|e| e.to_string())?;
-                        let _ = std::fs::remove_file(&raw_download_path);
+                        let _ = tokio::fs::remove_file(&raw_download_path).await;
                         Ok(())
                     }
                 }
             } else {
-                security::encrypt_file(&raw_download_path, &cache_blob_path, &key)
-                    .map_err(|e| e.to_string())?;
-                let _ = std::fs::remove_file(&raw_download_path);
+                let encrypt_src = raw_download_path.clone();
+                let encrypt_dst = cache_blob_path.clone();
+                let encrypt_key = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    security::encrypt_file(&encrypt_src, &encrypt_dst, &encrypt_key)
+                })
+                .await
+                .map_err(|e| format!("Encrypt task failed: {}", e))?
+                .map_err(|e| e.to_string())?;
+                let _ = tokio::fs::remove_file(&raw_download_path).await;
                 Ok(())
             };
 
@@ -2579,12 +2668,19 @@ async fn download_for_view(
             // This app wrote `cache_blob_path` itself, in encrypted mode, so a
             // missing header means the cache has been tampered with rather than
             // that the blob is legitimately plaintext.
-            security::decrypt_file_if_needed(
-                &cache_blob_path,
-                &materialized_path,
-                Some(&key),
-                security::Expect::Encrypted,
-            )
+            let decrypt_src = cache_blob_path.clone();
+            let decrypt_dst = materialized_path.clone();
+            let decrypt_key = key.clone();
+            tokio::task::spawn_blocking(move || {
+                security::decrypt_file_if_needed(
+                    &decrypt_src,
+                    &decrypt_dst,
+                    Some(&decrypt_key),
+                    security::Expect::Encrypted,
+                )
+            })
+            .await
+            .map_err(|e| format!("Decrypt task failed: {}", e))?
             .map_err(|e| e.to_string())?;
         }
         let _ = filetime::set_file_mtime(&materialized_path, filetime::FileTime::now());
@@ -2787,7 +2883,13 @@ async fn check_clip_models(app: tauri::AppHandle) -> Result<bool, String> {
         return Ok(false);
     }
 
-    match clip::ensure_models_loaded(&models_dir) {
+    // Loading ONNX sessions reads hundreds of megabytes and builds the graph, which
+    // is several seconds of pure blocking work.
+    let loaded = tokio::task::spawn_blocking(move || clip::ensure_models_loaded(&models_dir))
+        .await
+        .map_err(|e| format!("CLIP model load task failed: {}", e))?;
+
+    match loaded {
         Ok(_) => Ok(true),
         Err(e) => {
             log::warn!("CLIP models found but failed to initialize: {}", e);
@@ -2829,27 +2931,36 @@ async fn semantic_search(
     let app_dir = resolve_app_data_dir(&app)?;
     let models_dir = app_dir.join("models");
 
-    // Ensure models loaded
-    clip::ensure_models_loaded(&models_dir).map_err(|e| e.to_string())?;
-
-    // Encode Query
-    let query_embedding = clip::encode_text(&query).map_err(|e| e.to_string())?;
+    // Model load and text encoding are both ONNX work.
+    let query_embedding = tokio::task::spawn_blocking(move || {
+        clip::ensure_models_loaded(&models_dir)?;
+        clip::encode_text(&query)
+    })
+    .await
+    .map_err(|e| format!("CLIP query task failed: {}", e))?
+    .map_err(|e| e.to_string())?;
 
     // Get all embeddings from DB
     // NOTE: For large datasets, this should be optimized or moved to an indexing structure (FAISS/Granne)
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = {
+        let db_guard = state.db.lock().await;
+        db_guard.as_ref().ok_or("Database not initialized")?.clone()
+    };
 
     let all_embeddings = db.get_all_clip_embeddings().map_err(|e| e.to_string())?;
 
-    // Compute Similarities
-    let mut scores: Vec<(i64, f32)> = all_embeddings
-        .iter()
-        .map(|(id, emb)| (*id, clip::cosine_similarity(&query_embedding, emb)))
-        .collect();
-
-    // Sort by score (descending)
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Scoring is a dot product against every embedding in the library, so it grows
+    // with the library and belongs off the runtime along with the sort.
+    let scores: Vec<(i64, f32)> = tokio::task::spawn_blocking(move || {
+        let mut scores: Vec<(i64, f32)> = all_embeddings
+            .iter()
+            .map(|(id, emb)| (*id, clip::cosine_similarity(&query_embedding, emb)))
+            .collect();
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores
+    })
+    .await
+    .map_err(|e| format!("CLIP scoring task failed: {}", e))?;
 
     // Get Top-K IDs
     let top_ids: Vec<i64> = scores
@@ -2875,7 +2986,6 @@ async fn semantic_search(
             .unwrap_or(usize::MAX)
     });
 
-    drop(db_guard);
     Ok(materialize_media_items_for_response(items, &state).await)
 }
 
@@ -2893,35 +3003,57 @@ async fn index_pending_clip(
         return Err("CLIP models not available".to_string());
     }
 
-    // Ensure loaded
-    clip::ensure_models_loaded(&models_dir).map_err(|e| e.to_string())?;
-
-    let db_guard = state.db.lock().await;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    let db = {
+        let db_guard = state.db.lock().await;
+        db_guard.as_ref().ok_or("Database not initialized")?.clone()
+    };
 
     let pending = db
         .get_pending_clip_items(limit)
         .map_err(|e| e.to_string())?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    // Model load plus one inference per image, on a blocking thread and with no lock
+    // held. This used to run on the runtime while holding the database mutex, so
+    // indexing a batch froze the interface and every other command with it.
+    let encoded = tokio::task::spawn_blocking(move || {
+        clip::ensure_models_loaded(&models_dir)?;
+
+        let results: Vec<(i64, String, Option<Vec<f32>>)> = pending
+            .into_iter()
+            .map(|(id, path_str)| {
+                let path = std::path::Path::new(&path_str);
+                if !path.exists() {
+                    return (id, path_str, None);
+                }
+                match clip::encode_image(path) {
+                    Ok(embedding) => (id, path_str, Some(embedding)),
+                    Err(e) => {
+                        log::error!("Failed to encode media {}: {}", id, e);
+                        (id, path_str, None)
+                    }
+                }
+            })
+            .collect();
+        Ok::<_, String>(results)
+    })
+    .await
+    .map_err(|e| format!("CLIP indexing task failed: {}", e))?
+    .map_err(|e| e.to_string())?;
+
     let mut count = 0;
-
-    for (id, path_str) in pending {
-        let path = std::path::Path::new(&path_str);
-        if !path.exists() {
-            let _ = db.mark_clip_failed(id);
-            continue;
-        }
-
-        // Encode
-        match clip::encode_image(path) {
-            Ok(embedding) => {
+    for (id, _path, embedding) in encoded {
+        match embedding {
+            Some(embedding) => {
                 if let Err(e) = db.store_clip_embedding(id, &embedding) {
-                    log::error!("Failed to store embedding for {}: {}", path_str, e);
+                    log::error!("Failed to store the embedding for media {}: {}", id, e);
                 } else {
                     count += 1;
                 }
             }
-            Err(e) => {
-                log::error!("Failed to encode image {}: {}", path_str, e);
+            None => {
                 let _ = db.mark_clip_failed(id);
             }
         }
