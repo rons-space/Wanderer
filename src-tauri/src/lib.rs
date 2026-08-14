@@ -2037,11 +2037,91 @@ async fn get_all_config(
     Ok(config)
 }
 
+/// What a settings value is allowed to be.
+enum ConfigDomain {
+    /// `true` or `false`, in any case, stored lowercased.
+    Bool,
+    /// One of a fixed set of strings.
+    Choice(&'static [&'static str]),
+    /// A whole number in an inclusive range.
+    Integer { min: i64, max: i64 },
+}
+
+/// Every config key the frontend may write, with the domain of its value.
+///
+/// This replaces a `security_` denylist, which stopped script in the webview from
+/// overwriting the key material but left every other row writable: the AI opt-ins that
+/// decide whether the user's photos are analysed, the cache sizes that decide how much
+/// plaintext is kept on disk, and any key at all, including ones no code reads, since
+/// an unknown key was simply inserted. Anything the backend writes for itself
+/// (`device_id`, the per-media sync markers, the security rows) goes through
+/// `Database::set_config` directly and is not reachable from here.
+const WRITABLE_CONFIG: &[(&str, ConfigDomain)] = &[
+    (
+        "cache_size_mb",
+        ConfigDomain::Integer {
+            min: 100,
+            max: 1_000_000,
+        },
+    ),
+    (
+        "view_cache_max_size_mb",
+        ConfigDomain::Integer {
+            min: 100,
+            max: 1_000_000,
+        },
+    ),
+    (
+        "view_cache_retention_hours",
+        ConfigDomain::Integer { min: 1, max: 8760 },
+    ),
+    ("ai_face_enabled", ConfigDomain::Bool),
+    ("ai_tags_enabled", ConfigDomain::Bool),
+    (
+        "timeline_grouping",
+        ConfigDomain::Choice(&["day", "month", "year"]),
+    ),
+];
+
+/// Check a settings write and return the value to store.
+///
+/// Returns the normalized form rather than the input, so `"TRUE"` and `"true"` cannot
+/// both end up in the table and disagree with the `eq_ignore_ascii_case` readers.
+fn validate_config_write(key: &str, value: &str) -> Result<String, String> {
+    let Some((_, domain)) = WRITABLE_CONFIG.iter().find(|(name, _)| *name == key) else {
+        return Err(format!("'{}' is not a writable setting", key));
+    };
+
+    match domain {
+        ConfigDomain::Bool => match value.to_ascii_lowercase().as_str() {
+            "true" => Ok("true".to_string()),
+            "false" => Ok("false".to_string()),
+            _ => Err(format!("'{}' must be true or false", key)),
+        },
+        ConfigDomain::Choice(allowed) => {
+            let lowered = value.to_ascii_lowercase();
+            if allowed.contains(&lowered.as_str()) {
+                Ok(lowered)
+            } else {
+                Err(format!("'{}' must be one of {}", key, allowed.join(", ")))
+            }
+        }
+        ConfigDomain::Integer { min, max } => {
+            let parsed: i64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{}' must be a whole number", key))?;
+            if parsed < *min || parsed > *max {
+                return Err(format!("'{}' must be between {} and {}", key, min, max));
+            }
+            Ok(parsed.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 async fn set_config(key: String, value: String, state: State<'_, AppState>) -> Result<(), String> {
-    if is_security_key(&key) {
-        return Err("Security settings are managed by dedicated security commands".to_string());
-    }
+    let value = validate_config_write(&key, &value)?;
     let db_guard = state.db.lock().await;
     let db = db_guard.as_ref().ok_or("Database not initialized")?;
     db.set_config(&key, &value).map_err(|e| e.to_string())
@@ -2962,12 +3042,11 @@ async fn semantic_search(
     .await
     .map_err(|e| format!("CLIP scoring task failed: {}", e))?;
 
-    // Get Top-K IDs
-    let top_ids: Vec<i64> = scores
-        .iter()
-        .take(limit as usize)
-        .map(|(id, _)| *id)
-        .collect();
+    // Get Top-K IDs. `limit` arrives from the frontend as a signed integer, and
+    // `-1i32 as usize` is 18446744073709551615, so a negative limit asked for every
+    // media item in the library rather than none.
+    let top_k = limit.clamp(0, 1000) as usize;
+    let top_ids: Vec<i64> = scores.iter().take(top_k).map(|(id, _)| *id).collect();
 
     // Fetch Media Items
     if top_ids.is_empty() {
@@ -3102,5 +3181,57 @@ mod tests {
         ] {
             assert!(!is_security_key(key), "{key} must remain readable");
         }
+    }
+
+    #[test]
+    fn the_settings_the_ui_writes_are_all_writable() {
+        // Everything Settings.tsx can save has to pass, or the allowlist has quietly
+        // broken a control the user can see.
+        for (key, value) in [
+            ("cache_size_mb", "5000"),
+            ("view_cache_max_size_mb", "2000"),
+            ("view_cache_retention_hours", "24"),
+            ("ai_face_enabled", "false"),
+            ("ai_tags_enabled", "true"),
+            ("timeline_grouping", "month"),
+        ] {
+            assert_eq!(validate_config_write(key, value), Ok(value.to_string()));
+        }
+    }
+
+    #[test]
+    fn unknown_and_security_keys_are_refused() {
+        // The denylist this replaces let both of these through.
+        assert!(validate_config_write("something_invented", "1").is_err());
+        assert!(validate_config_write(SECURITY_BUNDLE_KEY, "{}").is_err());
+        assert!(validate_config_write("device_id", "attacker-chosen").is_err());
+    }
+
+    #[test]
+    fn values_outside_their_domain_are_refused() {
+        assert!(validate_config_write("ai_face_enabled", "yes").is_err());
+        assert!(validate_config_write("timeline_grouping", "century").is_err());
+        assert!(validate_config_write("cache_size_mb", "-1").is_err());
+        assert!(validate_config_write("cache_size_mb", "999999999").is_err());
+        assert!(validate_config_write("cache_size_mb", "5000; DROP TABLE media").is_err());
+        assert!(validate_config_write("view_cache_retention_hours", "0").is_err());
+    }
+
+    /// Readers compare with `eq_ignore_ascii_case`, so a stored `"TRUE"` would work by
+    /// luck. Normalizing keeps one spelling in the table.
+    #[test]
+    fn accepted_values_are_normalized() {
+        assert_eq!(
+            validate_config_write("ai_tags_enabled", "TRUE"),
+            Ok("true".to_string())
+        );
+        assert_eq!(
+            validate_config_write("timeline_grouping", "Year"),
+            Ok("year".to_string())
+        );
+        assert_eq!(
+            validate_config_write("cache_size_mb", " 5000 "),
+            Ok("5000".to_string())
+        );
     }
 }
