@@ -87,6 +87,16 @@ pub struct MigrationStatus {
     pub succeeded: i64,
     pub failed: i64,
     pub last_error: Option<String>,
+    /// Telegram message IDs whose plaintext copy could not be confirmed deleted.
+    ///
+    /// This is the one part of the migration that cannot be redone by running it
+    /// again: the media is already re-uploaded encrypted, and what is left behind is
+    /// an unencrypted copy in the cloud. Kept here because this whole struct is
+    /// persisted and shown in Settings, so the backlog is durable and visible rather
+    /// than a line in a log file. `serde(default)` so a status written before this
+    /// field existed still loads.
+    #[serde(default)]
+    pub unpurged_plaintext: Vec<i32>,
 }
 
 /// The 32 bytes that decrypt the entire library.

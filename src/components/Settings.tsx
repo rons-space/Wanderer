@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { api } from "../lib/api";
+import { api, MigrationStatus } from "../lib/api";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from "./ui/card";
 import { Label } from "./ui/label";
 import { Input } from "./ui/input";
@@ -76,26 +76,13 @@ export function Settings() {
         encryptionConfigured: boolean;
         encryptionLocked: boolean;
         telegramCredentialsConfigured: boolean;
-        migration: {
-            running: boolean;
-            total: number;
-            processed: number;
-            succeeded: number;
-            failed: number;
-            lastError?: string | null;
-        };
+        migration: MigrationStatus;
     } | null>(null);
     const [securityPassphrase, setSecurityPassphrase] = useState("");
     const [securityPassphraseConfirm, setSecurityPassphraseConfirm] = useState("");
     const [generatedRecoveryKey, setGeneratedRecoveryKey] = useState<string | null>(null);
-    const [migrationStatus, setMigrationStatus] = useState<{
-        running: boolean;
-        total: number;
-        processed: number;
-        succeeded: number;
-        failed: number;
-        lastError?: string | null;
-    } | null>(null);
+    const [migrationStatus, setMigrationStatus] = useState<MigrationStatus | null>(null);
+    const [isRetryingPurge, setIsRetryingPurge] = useState(false);
 
     // CLIP State
     const [clipInstalled, setClipInstalled] = useState(false);
@@ -537,6 +524,39 @@ export function Settings() {
                                             <p>Succeeded: {migrationStatus?.succeeded ?? 0}</p>
                                             <p>Failed: {migrationStatus?.failed ?? 0}</p>
                                         </div>
+                                        {(migrationStatus?.unpurgedPlaintext?.length ?? 0) > 0 && (
+                                            <Alert variant="destructive">
+                                                <AlertTitle>Unencrypted copies still in Telegram</AlertTitle>
+                                                <AlertDescription className="space-y-2 text-xs">
+                                                    <p>
+                                                        {migrationStatus?.unpurgedPlaintext.length} item(s) were
+                                                        re-uploaded encrypted, but their original unencrypted copy
+                                                        could not be confirmed deleted from Telegram.
+                                                    </p>
+                                                    <Button
+                                                        variant="outline"
+                                                        size="sm"
+                                                        disabled={isRetryingPurge}
+                                                        onClick={async () => {
+                                                            setIsRetryingPurge(true);
+                                                            try {
+                                                                const purged = await api.retryPlaintextPurge();
+                                                                toast.success(
+                                                                    `Deleted ${purged} unencrypted copies`
+                                                                );
+                                                            } catch (e) {
+                                                                toast.error(`Purge retry failed: ${e}`);
+                                                            } finally {
+                                                                setIsRetryingPurge(false);
+                                                                await loadMigrationStatus();
+                                                            }
+                                                        }}
+                                                    >
+                                                        {isRetryingPurge ? "Deleting..." : "Retry deletion"}
+                                                    </Button>
+                                                </AlertDescription>
+                                            </Alert>
+                                        )}
                                         {migrationStatus?.lastError && (
                                             <Alert>
                                                 <AlertTitle>Last Migration Error</AlertTitle>

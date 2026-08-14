@@ -439,6 +439,106 @@ impl TelegramService {
         }
     }
 
+    /// Delete messages and confirm they are gone.
+    ///
+    /// `delete_messages` reports what Telegram said it did, which is not the same
+    /// question. This is used where the copy being deleted is *plaintext the user
+    /// asked to stop storing*, so the answer has to come from asking for the message
+    /// back and finding nothing. Rate limits are waited out rather than treated as
+    /// failure, because a FLOOD_WAIT here means the plaintext is simply still there.
+    ///
+    /// Returns the message IDs that survived, so the caller can record them; an empty
+    /// vector is the only outcome that means the plaintext is gone.
+    pub async fn purge_messages(&self, message_ids: &[i32]) -> Result<Vec<i32>, String> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Three tries and a five minute ceiling on any single wait. Telegram can name
+        // a wait of hours, which is not something to block a migration worker on; the
+        // ids go to the backlog instead and the user can retry from Settings.
+        const MAX_ATTEMPTS: usize = 3;
+        const MAX_FLOOD_WAIT_SECS: u64 = 300;
+
+        let mut last_error = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.delete_messages(message_ids).await {
+                Ok(_) => {
+                    last_error = None;
+                    break;
+                }
+                Err(e) => {
+                    let wait = parse_flood_wait(&e);
+                    last_error = Some(e);
+                    match wait {
+                        Some(secs) if secs <= MAX_FLOOD_WAIT_SECS && attempt < MAX_ATTEMPTS => {
+                            log::warn!(
+                                "Telegram rate limited the plaintext purge, retrying in {}s",
+                                secs
+                            );
+                            // Outside the client lock: `delete_messages` released it
+                            // when it returned, and nothing else should stall on this.
+                            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+
+        // Verified even when the delete errored. A FLOOD_WAIT can arrive after the
+        // server already applied the deletion, and the surviving-ids answer is what
+        // the caller actually needs.
+        match self.surviving_messages(message_ids).await {
+            Ok(surviving) => {
+                if surviving.is_empty() {
+                    log::info!(
+                        "Purged {} plaintext messages from Telegram",
+                        message_ids.len()
+                    );
+                } else {
+                    log::error!(
+                        "{} of {} plaintext messages are still in Telegram after the purge",
+                        surviving.len(),
+                        message_ids.len()
+                    );
+                }
+                Ok(surviving)
+            }
+            // The deletion may well have worked, but nothing here can say so, and
+            // claiming the plaintext is gone when it might not be is the failure
+            // this is meant to prevent.
+            Err(verify_error) => Err(match last_error {
+                Some(delete_error) => {
+                    format!("{}; verification failed: {}", delete_error, verify_error)
+                }
+                None => format!("Could not verify the purge: {}", verify_error),
+            }),
+        }
+    }
+
+    /// Which of `message_ids` Telegram still has.
+    async fn surviving_messages(&self, message_ids: &[i32]) -> Result<Vec<i32>, String> {
+        let client_guard = self.client.lock().await;
+        let client = client_guard.as_ref().ok_or("Client not connected")?;
+        let me = client.get_me().await.map_err(|e| e.to_string())?;
+        let peer = me
+            .to_ref()
+            .ok_or("Could not resolve the Saved Messages peer")?;
+
+        // `get_messages_by_id` answers positionally, `None` where the message is gone.
+        let fetched = client
+            .get_messages_by_id(peer, message_ids)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(message_ids
+            .iter()
+            .zip(fetched)
+            .filter_map(|(id, message)| message.map(|_| *id))
+            .collect())
+    }
+
     /// Download a file by message ID
     /// Fetches the message from saved messages and downloads its media to the specified path
     pub async fn download_by_message_id(&self, message_id: i32, path: &str) -> Result<(), String> {

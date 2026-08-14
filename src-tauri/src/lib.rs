@@ -598,6 +598,49 @@ async fn get_encryption_migration_status(
     }
 }
 
+/// Retry deleting the plaintext copies the migration could not confirm gone.
+///
+/// Returns how many are confirmed deleted by this attempt. The backlog is the only
+/// record that unencrypted media is still in the cloud, so it is rewritten from what
+/// survived rather than simply cleared.
+#[tauri::command]
+async fn retry_plaintext_purge(state: State<'_, AppState>) -> Result<usize, String> {
+    let pending = state
+        .security_runtime
+        .lock()
+        .await
+        .migration
+        .unpurged_plaintext
+        .clone();
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    if !state.telegram.is_connected().await {
+        return Err("Connect to Telegram before retrying the purge".to_string());
+    }
+
+    let surviving = state.telegram.purge_messages(&pending).await?;
+    let purged = pending.len() - surviving.len();
+
+    let status = {
+        let mut guard = state.security_runtime.lock().await;
+        // Ids that were not part of this attempt are left alone: a migration running
+        // alongside this may have added one since the list was copied.
+        guard
+            .migration
+            .unpurged_plaintext
+            .retain(|id| surviving.contains(id) || !pending.contains(id));
+        guard.migration.clone()
+    };
+
+    let db_guard = state.db.lock().await;
+    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    save_migration_status(db, &status)?;
+
+    log::info!("Retried the plaintext purge: {} confirmed deleted", purged);
+    Ok(purged)
+}
+
 #[tauri::command]
 async fn start_encryption_migration(
     state: State<'_, AppState>,
@@ -646,6 +689,9 @@ async fn start_encryption_migration(
             succeeded: 0,
             failed: 0,
             last_error: None,
+            // Carried across runs: an unpurged plaintext copy is not something a
+            // fresh migration pass fixes, so starting over must not forget it.
+            unpurged_plaintext: runtime.migration.unpurged_plaintext.clone(),
         };
         let _ = save_migration_status(&db, &runtime.migration);
     }
@@ -686,7 +732,9 @@ async fn start_encryption_migration(
         for (media_id, file_path, previous_tg_id, thumbnail_path) in cloud_items {
             let pending_key = format!("{}{}", pending_prefix, media_id);
 
-            let result: Result<(), String> = async {
+            // `Ok(Some(id))` means the media itself migrated but the old plaintext
+            // message is still in Telegram.
+            let result: Result<Option<i32>, String> = async {
                 if let Some(thumb_path) = thumbnail_path.as_deref() {
                     if let Some(new_thumb) =
                         ensure_thumbnail_encrypted(thumb_path, &key, &managed_roots)?
@@ -734,21 +782,49 @@ async fn start_encryption_migration(
                 db.mark_media_encrypted_by_id(media_id)
                     .map_err(|e| e.to_string())?;
 
+                // The old message holds the unencrypted original. Deleting it is the
+                // point of the migration, so its result is checked rather than
+                // discarded, and an id that survives is handed back to be recorded.
+                let mut unpurged = None;
                 if let Ok(old_id) = previous_tg_id.parse::<i32>() {
                     if old_id != new_msg_id {
-                        let _ = telegram.delete_messages(&[old_id]).await;
+                        match telegram.purge_messages(&[old_id]).await {
+                            Ok(surviving) if surviving.is_empty() => {}
+                            Ok(_) => {
+                                log::error!(
+                                    "Plaintext copy of media {} is still in Telegram",
+                                    media_id
+                                );
+                                unpurged = Some(old_id);
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Could not confirm the plaintext purge for media {}: {}",
+                                    media_id,
+                                    e
+                                );
+                                unpurged = Some(old_id);
+                            }
+                        }
                     }
                 }
 
                 let _ = db.remove_config(&pending_key);
-                Ok(())
+                Ok(unpurged)
             }
             .await;
 
             let mut state_guard = runtime.lock().await;
             state_guard.migration.processed += 1;
             match result {
-                Ok(_) => state_guard.migration.succeeded += 1,
+                Ok(unpurged) => {
+                    state_guard.migration.succeeded += 1;
+                    if let Some(id) = unpurged {
+                        if !state_guard.migration.unpurged_plaintext.contains(&id) {
+                            state_guard.migration.unpurged_plaintext.push(id);
+                        }
+                    }
+                }
                 Err(err) => {
                     state_guard.migration.failed += 1;
                     state_guard.migration.last_error = Some(err);
@@ -1267,6 +1343,7 @@ pub fn run() {
             set_telegram_api_credentials,
             clear_telegram_api_credentials,
             get_encryption_migration_status,
+            retry_plaintext_purge,
             start_encryption_migration,
             login_request_code,
             login_sign_in,
