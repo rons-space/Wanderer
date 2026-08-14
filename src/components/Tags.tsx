@@ -36,6 +36,7 @@ export function Tags() {
             const media = await api.getMediaByTag(tag, 100, 0);
             setTagMedia(media);
         } catch (e) {
+            console.error("Failed to load photos for this tag:", e);
             toast.error("Failed to load photos for this tag");
         }
     };

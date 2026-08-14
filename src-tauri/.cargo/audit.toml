@@ -1,0 +1,27 @@
+# Advisories that a lockfile update cannot clear today. Each entry says why it is
+# still here and what would remove it, so this list can be re-read rather than
+# re-derived. Everything not listed here is expected to be fixable by
+# `cargo update`, and CI fails when it is not.
+[advisories]
+ignore = [
+    # quick-xml quadratic attribute parsing and unbounded namespace allocation.
+    # Reached only through tauri -> plist, which parses bundle metadata that ships
+    # with the application rather than anything a user or a peer supplies. No tauri
+    # 2.9.x release accepts quick-xml 0.41, so this clears when Tauri updates plist.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # tract-nnef integer overflow to out-of-bounds read on model load. The fix is
+    # tract 0.21.16+, but every 0.21.16+ release caps `time` below 0.3.42 while
+    # RUSTSEC-2026-0009 needs 0.3.47, so taking this one would reintroduce that one.
+    # Mitigated instead by verifying a pinned SHA-256 before any model is parsed
+    # (issue #22), and cleared properly by moving to tract 0.23 (issue #81).
+    "RUSTSEC-2026-0217",
+
+    # transpose buffer overflow, reached through img_hash 3.2.0, which has been
+    # unmaintained since 2020. The maintained fork, image_hasher, is a drop-in for
+    # the API used here, but perceptual hashes are persisted in library.db and a
+    # change in hash output would silently break duplicate detection for existing
+    # libraries, so the swap needs its own change with a migration (issue #82).
+    "RUSTSEC-2023-0080",
+]

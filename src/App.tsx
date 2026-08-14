@@ -45,7 +45,7 @@ function App() {
       const status = await api.getSecurityStatus();
       setSecurityStatus(status);
       setSecurityLoading(false);
-    } catch (e: any) {
+    } catch (e) {
       const message = String(e);
       if (message.includes("Database not initialized")) {
         setTimeout(() => {
