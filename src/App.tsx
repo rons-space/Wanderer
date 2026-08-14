@@ -2,12 +2,16 @@ import { Layout } from "./components/Layout";
 import { Gallery } from "./components/Gallery";
 import { Albums } from "./components/Albums";
 import { Search } from "./components/Search";
-import { Settings } from "./components/Settings";
+
 import { Favorites } from "./components/Favorites";
 import { Trash } from "./components/Trash";
 import { Archive } from "./components/Archive";
 import { UploadQueue } from "./components/UploadQueue";
-import { MapView } from "./components/MapView";
+// Lazily imported. Leaflet and its cluster plugin are the largest thing in the
+// bundle by a distance, and Settings is the largest single component; most
+// sessions open neither.
+const MapView = lazy(() => import("./components/MapView").then((m) => ({ default: m.MapView })));
+const Settings = lazy(() => import("./components/Settings").then((m) => ({ default: m.Settings })));
 import { DuplicateReview } from "./components/DuplicateReview";
 import { People } from "./components/People";
 import { Tags } from "./components/Tags";
@@ -15,6 +19,13 @@ import { SmartAlbums } from "./components/SmartAlbums";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Onboarding } from "./components/Onboarding";
 import "./App.css";
+
+/** Shown while a lazily imported view's chunk is fetched. */
+function ViewLoading() {
+  return (
+    <div className="text-muted-foreground flex h-full items-center justify-center">Loading...</div>
+  );
+}
 
 /** Human names for the views, used when a per-view boundary reports a crash. */
 const VIEW_LABELS: Record<string, string> = {
@@ -33,7 +44,7 @@ const VIEW_LABELS: Record<string, string> = {
   settings: "Settings",
 };
 
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { api, hasErrorCode } from "./lib/api";
 
 import { Toaster } from "@/components/ui/sonner";
@@ -122,13 +133,21 @@ function App() {
               {view === 'trash' && <Trash />}
               {view === 'archive' && <Archive />}
               {view === 'uploads' && <UploadQueue />}
-              {view === 'map' && <MapView />}
+              {view === 'map' && (
+                <Suspense fallback={<ViewLoading />}>
+                  <MapView />
+                </Suspense>
+              )}
               {view === 'duplicates' && <DuplicateReview />}
               {view === 'people' && <People />}
               {view === 'tags' && <Tags />}
               {view === 'smart-albums' && <SmartAlbums />}
               {view === 'search' && <Search />}
-              {view === 'settings' && <Settings />}
+              {view === 'settings' && (
+                <Suspense fallback={<ViewLoading />}>
+                  <Settings />
+                </Suspense>
+              )}
             </div>
           </ErrorBoundary>
         </Layout>
