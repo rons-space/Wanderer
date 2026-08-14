@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { api } from "@/lib/api";
+import { api, errorMessage } from "@/lib/api";
 import { TelegramLoginForm, useTelegramLogin } from "./TelegramLogin";
 import { EnableEncryption, RecoveryKeyPanel } from "./EnableEncryption";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -71,16 +71,6 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
         }
     };
 
-    const toErrorMessage = (err: unknown): string => {
-        const raw =
-            typeof err === "string"
-                ? err
-                : err instanceof Error
-                    ? err.message
-                    : String(err);
-        return raw.startsWith("Error:") ? raw.slice(6).trim() : raw;
-    };
-
     const handleChooseMode = async () => {
         if (mode === "unencrypted" && !acceptUnencryptedRisk) {
             toast.error("Please acknowledge the unencrypted mode warning.");
@@ -94,7 +84,7 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
                     setStep("byok");
                 });
             } catch (e) {
-                toast.error(`Failed to set unencrypted mode: ${toErrorMessage(e)}`);
+                toast.error(`Failed to set unencrypted mode: ${errorMessage(e)}`);
             }
             return;
         }
@@ -125,7 +115,7 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
                 setStep("telegram");
             });
         } catch (e) {
-            toast.error(`Failed to save credentials: ${toErrorMessage(e)}`);
+            toast.error(`Failed to save credentials: ${errorMessage(e)}`);
         }
     };
 
@@ -144,7 +134,7 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
                 await onReady();
             });
         } catch (e) {
-            toast.error(`Failed to complete onboarding: ${toErrorMessage(e)}`);
+            toast.error(`Failed to complete onboarding: ${errorMessage(e)}`);
         }
     };
 
@@ -159,7 +149,7 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
                 await onReady();
             });
         } catch (e) {
-            toast.error(`Unlock failed: ${toErrorMessage(e)}`);
+            toast.error(`Unlock failed: ${errorMessage(e)}`);
         }
     };
 
@@ -184,7 +174,7 @@ export function Onboarding({ status, onReady }: OnboardingProps) {
                 setResetRecoveryKey(recoveryKey);
             });
         } catch (e) {
-            toast.error(`Recovery failed: ${toErrorMessage(e)}`);
+            toast.error(`Recovery failed: ${errorMessage(e)}`);
         }
     };
 

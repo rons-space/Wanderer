@@ -18,98 +18,22 @@ import {
 import { api, errorMessage } from "@/lib/api";
 import type { MediaActions } from "@/hooks/use-media-actions";
 import { handleImageError } from "@/lib/placeholder";
+import {
+    buildDisplayRows,
+    describeItem,
+    findRowIndexAtOffset,
+    firstItemIndexFromRow,
+    formatDateKey,
+    getDateKey,
+    getTimelineTimestamp,
+    measureRows,
+    withLoadingCell,
+    type DisplayRow,
+    type TimelineGrouping,
+} from "@/lib/timeline";
 import { toast } from "sonner";
 import { useTheme, type ThemeVariant } from "@/contexts/ThemeContext";
 import { Play, Heart, Star, Trash2, Archive, ArchiveRestore, Download, Cloud, Share2, Calendar } from "lucide-react";
-
-// --- Date Separator Helpers ---
-type TimelineGrouping = 'day' | 'month' | 'year';
-type SeparatorRow = {
-    type: 'separator';
-    dateKey: string;
-    label: string;
-    firstItemIndex: number;
-};
-type ItemsRow = {
-    type: 'items';
-    dateKey: string;
-    startIndex: number;
-    count: number;
-};
-type DisplayRow = SeparatorRow | ItemsRow;
-
-const getDateKey = (timestamp: number, grouping: TimelineGrouping): string => {
-    const date = new Date(timestamp * 1000);
-    switch (grouping) {
-        case 'year':
-            return date.getFullYear().toString();
-        case 'month':
-            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-        case 'day':
-        default:
-            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-    }
-};
-
-const formatDateKey = (dateKey: string, grouping: TimelineGrouping): string => {
-    const parts = dateKey.split('-');
-    const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-
-    switch (grouping) {
-        case 'year':
-            return parts[0];
-        case 'month':
-            return `${monthNames[parseInt(parts[1]) - 1]} ${parts[0]}`;
-        case 'day':
-        default:
-            return `${monthNames[parseInt(parts[1]) - 1]} ${parseInt(parts[2])}, ${parts[0]}`;
-    }
-};
-
-const parseDateTakenToTimestamp = (dateTaken?: string): number | null => {
-    if (!dateTaken) {
-        return null;
-    }
-
-    // Support "YYYY-MM-DD HH:mm:ss" and "YYYY:MM:DD HH:mm:ss" variants.
-    const normalized = dateTaken
-        .trim()
-        .replace(/^(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3")
-        .replace(" ", "T");
-    const parsed = Date.parse(normalized);
-    if (Number.isNaN(parsed)) {
-        return null;
-    }
-
-    return Math.floor(parsed / 1000);
-};
-
-const getTimelineTimestamp = (item: MediaItem): number => {
-    return parseDateTakenToTimestamp(item.date_taken) ?? item.created_at;
-};
-
-/**
- * What a screen reader announces for a cell. The filename is the only thing
- * that distinguishes one photo from another to a non-sighted user, so it leads,
- * and the rest of the badges the cell draws are spelled out after it.
- */
-const describeItem = (item: MediaItem): string => {
-    const name = item.file_path.split(/[\\/]/).pop() || `Media ${item.id}`;
-    const kind = item.mime_type?.startsWith("video") ? "Video" : "Photo";
-    const notes: string[] = [];
-
-    if (item.is_favorite) {
-        notes.push("favorite");
-    }
-    if (item.rating > 0) {
-        notes.push(`rated ${item.rating} of 5`);
-    }
-    if (item.is_cloud_only) {
-        notes.push("cloud only");
-    }
-
-    return notes.length > 0 ? `${kind} ${name}, ${notes.join(", ")}` : `${kind} ${name}`;
-};
 
 // --- Custom AutoSizer ---
 const useResizeObserver = (ref: React.RefObject<HTMLElement | null>) => {
@@ -203,84 +127,20 @@ const VirtualGrid = ({
     // Buffer for smooth scrolling
     const OVERSCAN = 3;
 
-    const rowsWithLoading = useMemo<DisplayRow[]>(() => {
-        if (!isNextPageLoading) {
-            return rows;
-        }
-
-        if (rows.length === 0) {
-            return [{ type: 'items', dateKey: '', startIndex: items.length, count: 1 }];
-        }
-
-        const nextRows = [...rows];
-        const lastRow = nextRows[nextRows.length - 1];
-
-        if (lastRow.type === 'items' && lastRow.count < columnCount) {
-            nextRows[nextRows.length - 1] = {
-                ...lastRow,
-                count: lastRow.count + 1,
-            };
-            return nextRows;
-        }
-
-        nextRows.push({
-            type: 'items',
-            dateKey: lastRow.dateKey,
-            startIndex: items.length,
-            count: 1,
-        });
-        return nextRows;
-    }, [rows, isNextPageLoading, items.length, columnCount]);
-
-    const rowHeights = useMemo(
-        () => rowsWithLoading.map((row) => (row.type === 'separator' ? SEPARATOR_ROW_HEIGHT : ITEM_ROW_HEIGHT)),
-        [rowsWithLoading, ITEM_ROW_HEIGHT]
+    const rowsWithLoading = useMemo<DisplayRow[]>(
+        () => (isNextPageLoading ? withLoadingCell(rows, items.length, columnCount) : rows),
+        [rows, isNextPageLoading, items.length, columnCount],
     );
 
-    const rowOffsets = useMemo(() => {
-        const offsets: number[] = [];
-        let offset = 0;
-
-        for (const rowHeight of rowHeights) {
-            offsets.push(offset);
-            offset += rowHeight;
-        }
-
-        return offsets;
-    }, [rowHeights]);
-
-    const totalHeight = rowHeights.length > 0
-        ? rowOffsets[rowOffsets.length - 1] + rowHeights[rowHeights.length - 1]
-        : 0;
-
-    const findRowIndexAtOffset = (offset: number): number => {
-        if (rowHeights.length === 0) {
-            return -1;
-        }
-
-        let low = 0;
-        let high = rowHeights.length - 1;
-
-        while (low <= high) {
-            const mid = Math.floor((low + high) / 2);
-            const rowStart = rowOffsets[mid];
-            const rowEnd = rowStart + rowHeights[mid];
-
-            if (offset < rowStart) {
-                high = mid - 1;
-            } else if (offset >= rowEnd) {
-                low = mid + 1;
-            } else {
-                return mid;
-            }
-        }
-
-        return Math.max(0, Math.min(rowHeights.length - 1, low));
-    };
+    const layout = useMemo(
+        () => measureRows(rowsWithLoading, SEPARATOR_ROW_HEIGHT, ITEM_ROW_HEIGHT),
+        [rowsWithLoading, ITEM_ROW_HEIGHT]
+    );
+    const totalHeight = layout.totalHeight;
 
     // Calculate visible range
-    const rawVisibleStart = findRowIndexAtOffset(scrollTop);
-    const rawVisibleEnd = findRowIndexAtOffset(scrollTop + height);
+    const rawVisibleStart = findRowIndexAtOffset(layout, scrollTop);
+    const rawVisibleEnd = findRowIndexAtOffset(layout, scrollTop + height);
     const visibleRowStart = rawVisibleStart === -1 ? 0 : Math.max(0, rawVisibleStart - OVERSCAN);
     const visibleRowEnd = rawVisibleEnd === -1 ? -1 : Math.min(rowsWithLoading.length - 1, rawVisibleEnd + OVERSCAN);
 
@@ -328,24 +188,8 @@ const VirtualGrid = ({
 
             setScrollTop(pending.scrollTop);
 
-            const visibleRowIndex = findRowIndexAtOffset(pending.scrollTop);
-            let visibleItemIndex: number | undefined;
-
-            if (visibleRowIndex >= 0) {
-                for (let index = visibleRowIndex; index < rowsWithLoading.length; index += 1) {
-                    const row = rowsWithLoading[index];
-
-                    if (row.type === 'separator') {
-                        visibleItemIndex = row.firstItemIndex;
-                        break;
-                    }
-
-                    if (items.length > 0) {
-                        visibleItemIndex = Math.min(row.startIndex, items.length - 1);
-                    }
-                    break;
-                }
-            }
+            const visibleRowIndex = findRowIndexAtOffset(layout, pending.scrollTop);
+            const visibleItemIndex = firstItemIndexFromRow(rowsWithLoading, visibleRowIndex, items.length);
 
             onScroll(pending.scrollTop, pending.clientHeight, pending.scrollHeight, visibleItemIndex);
         });
@@ -362,8 +206,8 @@ const VirtualGrid = ({
             <div style={{ height: totalHeight, width: "100%", position: "relative" }}>
                 {visibleRows.map((rowIndex) => {
                     const row = rowsWithLoading[rowIndex];
-                    const rowTop = rowOffsets[rowIndex];
-                    const rowHeight = rowHeights[rowIndex];
+                    const rowTop = layout.offsets[rowIndex];
+                    const rowHeight = layout.heights[rowIndex];
 
                     if (row.type === 'separator') {
                         return (
@@ -806,48 +650,10 @@ export function MediaGrid({ items, hasNextPage, isNextPageLoading, loadNextPage,
     // columnWidth = (contentWidth - (columnCount - 1) * gap) / columnCount
     const columnWidth = Math.floor((contentWidth - ((columnCount - 1) * GAP)) / columnCount);
 
-    const displayRows = useMemo<DisplayRow[]>(() => {
-        if (items.length === 0 || columnCount <= 0) {
-            return [];
-        }
-
-        const rows: DisplayRow[] = [];
-        let index = 0;
-
-        while (index < items.length) {
-            const dateKey = getDateKey(getTimelineTimestamp(items[index]), timelineGrouping);
-            rows.push({
-                type: 'separator',
-                dateKey,
-                label: formatDateKey(dateKey, timelineGrouping),
-                firstItemIndex: index,
-            });
-
-            let groupEnd = index + 1;
-            while (
-                groupEnd < items.length &&
-                getDateKey(getTimelineTimestamp(items[groupEnd]), timelineGrouping) === dateKey
-            ) {
-                groupEnd += 1;
-            }
-
-            let rowStart = index;
-            while (rowStart < groupEnd) {
-                const count = Math.min(columnCount, groupEnd - rowStart);
-                rows.push({
-                    type: 'items',
-                    dateKey,
-                    startIndex: rowStart,
-                    count,
-                });
-                rowStart += count;
-            }
-
-            index = groupEnd;
-        }
-
-        return rows;
-    }, [items, timelineGrouping, columnCount]);
+    const displayRows = useMemo<DisplayRow[]>(
+        () => buildDisplayRows(items, timelineGrouping, columnCount),
+        [items, timelineGrouping, columnCount],
+    );
 
     // Stable identity: VirtualGrid depends on this in an effect to break the
     // no-overflow deadlock, and a fresh function each render would re-run it.

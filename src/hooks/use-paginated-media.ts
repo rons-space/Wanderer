@@ -27,6 +27,10 @@ export const DEFAULT_PAGE_SIZE = 100;
  * refresh, differing only in which API they called. Three of those copies appended
  * pages without checking for ids they already held, which is where the duplicate
  * React keys came from when a page boundary shifted under an insert.
+ *
+ * `fetcher` has to be stable, normally a `useCallback`. Changing it re-reads the
+ * first page, which is what switching album or tab wants; an inline arrow would
+ * make that happen on every render and never stop.
  */
 export function usePaginatedMedia(
     fetcher: MediaFetcher,

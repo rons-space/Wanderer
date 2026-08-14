@@ -41,7 +41,14 @@ export function asAppError(error: unknown): AppError | null {
 
 /** The message to show for a rejection, whatever shape it arrived in. */
 export function errorMessage(error: unknown): string {
-    return asAppError(error)?.message ?? String(error);
+    const raw =
+        asAppError(error)?.message ?? (error instanceof Error ? error.message : String(error));
+
+    // A rejection that never reached the AppError shape, a panic in a command or
+    // a throw from the webview side, stringifies with an "Error:" prefix. Inside
+    // a toast that already begins "Failed to save credentials" that prefix is
+    // noise, so it comes off here rather than at each of the call sites.
+    return raw.startsWith("Error:") ? raw.slice(6).trim() : raw;
 }
 
 export function hasErrorCode(error: unknown, code: ErrorCode): boolean {
