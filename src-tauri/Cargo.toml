@@ -40,7 +40,9 @@ image = "0.24"
 # Add an explicit 0.23 image dependency with codecs enabled so perceptual
 # hash decoding works for JPEG/PNG.
 image_023 = { package = "image", version = "0.23.14", default-features = true }
-tauri-plugin-mcp-bridge = "0.7.0"
+# Optional, and deliberately not a default feature: the bridge opens an
+# unauthenticated WebSocket control channel (see the `mcp-bridge` feature below).
+tauri-plugin-mcp-bridge = { version = "0.7.0", optional = true }
 tauri-plugin-dialog = "2.5.0"
 tauri-plugin-fs = "2"
 mime_guess = "2.0.5"
@@ -62,3 +64,15 @@ base64 = "0.22.1"
 rand = "0.8.5"
 windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
 hex = "0.4.3"
+
+[features]
+default = []
+# Development-only agent bridge. `tauri-plugin-mcp-bridge` starts an
+# unauthenticated WebSocket server that can inject and run arbitrary JavaScript
+# in the webview, which in this app means the full IPC command surface,
+# including `unlock_encryption` and `get_all_config`. It must never be compiled
+# into a distributed build, so it is opt-in and additionally gated on
+# `debug_assertions` at the registration site in `lib.rs`.
+#
+#   npm run tauri dev -- --features mcp-bridge
+mcp-bridge = ["dep:tauri-plugin-mcp-bridge"]
